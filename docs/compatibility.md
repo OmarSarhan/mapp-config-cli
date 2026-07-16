@@ -1,0 +1,107 @@
+# Compatibility
+
+The CLI and the MAPP configuration service are released separately. Safe
+operation therefore depends on an explicit API contract rather than matching
+repository commits.
+
+## Initial compatibility line
+
+| CLI release | Python | API version | Contract version | Status |
+| --- | --- | --- | --- | --- |
+| `0.1.x` | `3.11+` | `1.0` | `1.x` | Initial supported extraction |
+
+The server reports its XYZ version, rules version, capabilities, instance ID,
+workspace key, and current revision. The client does not import XYZ source or
+encode a particular XYZ checkout.
+
+Until the first stable CLI release, minor `0.x` releases may contain breaking
+client-side changes. Review the changelog before upgrading.
+
+## Compatibility checks
+
+`config-cli init` records:
+
+- the normalized endpoint;
+- the remote instance ID;
+- the server contract version;
+- whether non-loopback HTTP was explicitly permitted for a development profile.
+
+`config-cli describe` compares stored identity with the live service and
+reports client/server compatibility. A state-changing request must fail closed
+when:
+
+- the endpoint reports a different instance ID;
+- the API or contract version is unsupported;
+- the server contract does not advertise the command required by the
+  invocation;
+- the workspace revision differs from a proposal's base revision.
+
+Do not override these checks to finish a change. Reinitialize a profile only
+after independently confirming that the target replacement is intentional.
+
+## Versioning policy
+
+The CLI package follows semantic versioning:
+
+- patch releases fix behavior without intentionally changing supported command
+  syntax or contracts;
+- minor releases add backward-compatible commands or add support for a new
+  server contract;
+- major releases may remove commands or drop a server contract.
+
+During the pre-1.0 period, a minor release may be breaking and must call that
+out in [CHANGELOG.md](../CHANGELOG.md).
+
+The server's `contractVersion` governs request and response compatibility.
+Workspace `rulesVersion` and `xyzVersion` describe server-owned behavior; they
+do not need to match the CLI version.
+
+API and contract versions must use one to three numeric components such as
+`1`, `1.0`, or `1.0.2`, with only well-formed optional pre-release/build
+suffixes. Empty components, leading-zero components, extra components, and
+arbitrary suffixes are rejected rather than interpreted as a compatible major
+version. Release builds also verify that package metadata and the runtime
+`--version` value are identical.
+
+## Server-owned behavior
+
+The connected server is authoritative for:
+
+- workspace schema and JSON Pointer locations;
+- validation rules and remediation text;
+- layer/database catalog metadata;
+- safe SVG assets;
+- SQL-expression capabilities;
+- XYZ-version-specific styles and rendering behavior;
+- default/named/composite locale selection and XYZ-specific merge behavior;
+- proposal validation, revision checks, application, reload, and visual tests.
+
+Use `schema`, `rules`, `examples`, and capability endpoints at runtime. Do not
+copy those rules into client code or assume every server exposes the same
+optional capabilities.
+
+## Upgrade procedure
+
+1. Read both client and server release notes.
+2. Upgrade a non-production CLI installation.
+3. Run `describe`, `auth status`, `schema`, and `rules`.
+4. Exercise inspection and proposal creation against a test instance.
+5. Confirm revision conflicts fail closed.
+6. Confirm an approved proposal can be applied with `--confirm`.
+7. Verify XYZ status and a representative visual test.
+8. Retain the previous reviewed CLI artifact for rollback.
+
+If a server is newer than the supported contract range, upgrade the CLI before
+making changes. If the CLI is newer than the server, use a client release that
+still lists that contract as supported.
+
+## Cross-repository contract testing
+
+The platform repository should publish or export a versioned OpenAPI contract.
+This repository should pin a reviewed copy for automated contract tests. CI
+should verify request methods, paths, bodies, response schemas, error details,
+capabilities, exit-code mapping, revision conflicts, and instance mismatch
+handling.
+
+Compatibility is not established solely because authentication or one read
+command succeeds.
