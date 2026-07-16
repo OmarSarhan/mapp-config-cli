@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools==75.6.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mapp-config-cli"
+version = "0.1.0"
+description = "Safe, JSON-first remote client for the MAPP workspace configuration API"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  {name = "MAPP project contributors"},
+]
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Utilities",
+]
+
+[project.scripts]
+config-cli = "mapp_config_cli.cli:entrypoint"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["mapp_config_cli"]

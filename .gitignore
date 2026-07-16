@@ -1,0 +1,46 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Environments and local tooling
+.venv/
+venv/
+env/
+.tox/
+.nox/
+.python-version
+
+# Packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.token
+credentials.json
+profiles.json
+.config-cli/
+
+# Test and visual artifacts
+artifacts/
+test-results/
+*.log
