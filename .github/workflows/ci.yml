@@ -37,11 +37,28 @@ jobs:
       - name: Install project and test tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
-          python -m pip install build==1.2.2.post1 twine==6.1.0
+          python -m pip install -e ".[dev]"
+
+      - name: Install completion shells
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends fish zsh
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
+
+      - name: Validate generated shell completions
+        shell: bash
+        run: |
+          config-cli completion bash > /tmp/config-cli.bash
+          config-cli completion zsh > /tmp/_config-cli
+          config-cli completion fish > /tmp/config-cli.fish
+          bash -n /tmp/config-cli.bash
+          zsh -n /tmp/_config-cli
+          fish -n /tmp/config-cli.fish
+
+      - name: Type-check source
+        run: python -m mypy src
 
       - name: Build distributions
         run: python -m build

@@ -38,6 +38,8 @@ Thumbs.db
 *.token
 credentials.json
 profiles.json
+checks.json
+.state.lock
 .config-cli/
 
 # Test and visual artifacts
