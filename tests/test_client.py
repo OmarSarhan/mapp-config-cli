@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import threading
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 from mapp_config_cli.client import (
     ApiClient,
@@ -57,6 +59,35 @@ class EndpointTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_localhost_subdomain_uses_configured_transport_hostname(self):
+        client = ApiClient("http://config.localhost:3000")
+        with patch.object(
+            client.opener,
+            "open",
+            side_effect=urllib.error.URLError("synthetic stop"),
+        ) as mocked_open:
+            with self.assertRaises(CliError):
+                client.request("/api/public/identity", authenticated=False)
+
+        request = mocked_open.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "http://config.localhost:3000/api/public/identity",
+        )
+        self.assertIsNone(request.get_header("Host"))
+
+    def test_request_id_header_is_preserved_as_response_metadata(self):
+        routes = {
+            ("GET", "/ok"): (
+                200,
+                {"value": True},
+                {"X-Request-ID": "request-123"},
+            ),
+        }
+        with JsonServer(routes) as server:
+            result = ApiClient(server.endpoint, "token").request("/ok")
+        self.assertEqual("request-123", result["meta"]["requestId"])
+
     def test_rejects_redirect_without_forwarding_authorization(self):
         received: list[str | None] = []
 

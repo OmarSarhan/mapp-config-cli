@@ -10,6 +10,7 @@ EXIT_CONFLICT = 4
 EXIT_CONNECTIVITY = 5
 EXIT_VISUAL = 6
 EXIT_AUTHENTICATION = 7
+EXIT_INTERRUPTED = 130
 
 
 SENSITIVE_KEYS = {
@@ -66,3 +67,8 @@ class CliError(Exception):
         if self._safe_details not in (None, {}, []):
             payload["details"] = self._safe_details
         return payload
+
+    @property
+    def safe_details(self) -> Any:
+        """Return recursively redacted details for safe error enrichment."""
+        return self._safe_details

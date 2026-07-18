@@ -213,6 +213,23 @@ def _read_bounded(stream) -> bytes:
     return body
 
 
+def _with_response_metadata(
+    payload: dict[str, Any],
+    headers: Any,
+) -> dict[str, Any]:
+    request_id = None
+    if headers is not None:
+        request_id = headers.get("X-Request-ID") or headers.get("X-Correlation-ID")
+    if not isinstance(request_id, str) or not request_id.strip():
+        return payload
+    result = dict(payload)
+    meta = result.get("meta")
+    meta = dict(meta) if isinstance(meta, dict) else {}
+    meta.setdefault("requestId", request_id.strip())
+    result["meta"] = meta
+    return result
+
+
 def _http_exit(status: int, details: Any, failure_code: int | None) -> int:
     if status in {401, 403}:
         return EXIT_AUTHENTICATION
@@ -246,16 +263,6 @@ class ApiClient:
             urllib.request.HTTPSHandler(context=context),
         )
 
-    def _transport_endpoint(self) -> tuple[str, str | None]:
-        parsed = urllib.parse.urlsplit(self.endpoint)
-        if parsed.scheme == "http" and parsed.hostname and parsed.hostname.endswith(".localhost"):
-            port = f":{parsed.port}" if parsed.port else ""
-            transport = urllib.parse.urlunsplit(
-                parsed._replace(netloc=f"127.0.0.1{port}")
-            )
-            return transport, parsed.netloc
-        return self.endpoint, None
-
     def request(
         self,
         path: str,
@@ -267,13 +274,10 @@ class ApiClient:
     ) -> dict[str, Any]:
         if not path.startswith("/"):
             raise CliError("API path must start with '/'.", error_code="client.invalid_path")
-        transport_endpoint, host_header = self._transport_endpoint()
         headers = {
             "Accept": "application/json",
             "User-Agent": f"mapp-config-cli/{__version__}",
         }
-        if host_header:
-            headers["Host"] = host_header
         if authenticated:
             if not self.token:
                 raise CliError(
@@ -294,7 +298,7 @@ class ApiClient:
                 ) from exc
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
-            transport_endpoint + path,
+            self.endpoint + path,
             data=body,
             headers=headers,
             method=method,
@@ -303,10 +307,13 @@ class ApiClient:
             with self.opener.open(request, timeout=self.timeout) as response:
                 response_body = _read_bounded(response)
                 return _scrub_secret(
-                    _response_json(
-                        response_body,
-                        status=response.status,
-                        content_type=response.headers.get("Content-Type"),
+                    _with_response_metadata(
+                        _response_json(
+                            response_body,
+                            status=response.status,
+                            content_type=response.headers.get("Content-Type"),
+                        ),
+                        response.headers,
                     ),
                     self.token if authenticated else None,
                 )
@@ -332,14 +339,94 @@ class ApiClient:
                         "responseBytes": len(response_body),
                     }
                 details = _scrub_secret(details, self.token)
+                if isinstance(details, dict):
+                    details = _with_response_metadata(details, exc.headers)
+                message = (
+                    details.get("error")
+                    if isinstance(details, dict) and isinstance(details.get("error"), str)
+                    else f"Configuration service returned HTTP {exc.code}."
+                )
+                server_code = (
+                    details.get("code")
+                    if isinstance(details, dict)
+                    and isinstance(details.get("code"), str)
+                    and details["code"].startswith("derived_layer.")
+                    else None
+                )
+                raise CliError(
+                    str(_scrub_secret(message, self.token)),
+                    _http_exit(exc.code, details, failure_code),
+                    details=details,
+                    http_status=exc.code,
+                    error_code=server_code or "api.http_error",
+                ) from exc
+            finally:
+                exc.close()
+        except CliError:
+            raise
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
+            raise CliError(
+                f"Unable to reach configuration endpoint: {exc}",
+                EXIT_CONNECTIVITY,
+                error_code="api.unreachable",
+            ) from exc
+        except OSError as exc:
+            raise CliError(
+                f"Configuration request failed: {exc}",
+                EXIT_CONNECTIVITY,
+                error_code="api.transport_error",
+            ) from exc
+
+    def request_bytes(
+        self,
+        path: str,
+        *,
+        authenticated: bool = True,
+    ) -> tuple[bytes, str | None]:
+        if not path.startswith("/"):
+            raise CliError("API path must start with '/'.", error_code="client.invalid_path")
+        headers = {
+            "Accept": "*/*",
+            "User-Agent": f"mapp-config-cli/{__version__}",
+        }
+        if authenticated:
+            if not self.token:
+                raise CliError(
+                    "No bearer token is available.",
+                    EXIT_AUTHENTICATION,
+                    error_code="auth.credential_missing",
+                )
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(
+            self.endpoint + path,
+            headers=headers,
+            method="GET",
+        )
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                return _read_bounded(response), response.headers.get("Content-Type")
+        except urllib.error.HTTPError as exc:
+            try:
+                response_body = _read_bounded(exc)
+                try:
+                    details: Any = json.loads(
+                        response_body.decode("utf-8"),
+                        parse_constant=_reject_constant,
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    details = {
+                        "contentType": exc.headers.get("Content-Type"),
+                        "responseBytes": len(response_body),
+                    }
+                details = _scrub_secret(details, self.token if authenticated else None)
                 message = (
                     details.get("error")
                     if isinstance(details, dict) and isinstance(details.get("error"), str)
                     else f"Configuration service returned HTTP {exc.code}."
                 )
                 raise CliError(
-                    str(_scrub_secret(message, self.token)),
-                    _http_exit(exc.code, details, failure_code),
+                    str(_scrub_secret(message, self.token if authenticated else None)),
+                    _http_exit(exc.code, details, None),
                     details=details,
                     http_status=exc.code,
                     error_code="api.http_error",
