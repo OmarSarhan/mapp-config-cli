@@ -7,7 +7,8 @@ approved proposal without needing shell or filesystem access to the server.
 
 This repository contains only the client. The XYZ application, PostgreSQL
 database, configuration dashboard, validation rules, browser runner, and
-deployment configuration belong in the separate MAPP platform repository.
+deployment configuration belong in the separate
+[MAPP Platform](https://github.com/OmarSarhan/mapp-platform) repository.
 
 This directory is repository-ready source, not proof of a
 history-preserving Git split. Before publishing it, repeat the extraction from
@@ -19,7 +20,8 @@ history for credentials and generated state.
 The supported mutation workflow is deliberately narrow:
 
 1. Inspect the selected remote instance and its current workspace revision.
-2. Create the smallest possible proposal against that exact revision.
+2. Check the smallest possible operation set against that exact revision, then
+   create the proposal from the returned fingerprint.
 3. Present the proposal ID, explanation, focused diff, warnings, and available
    evidence to the approver.
 4. Apply only after a separate, explicit approval.
@@ -29,8 +31,14 @@ There are no direct workspace-save commands. A proposal cannot be silently
 rebased if the remote workspace changes. Applying a proposal requires both its
 ID and `--confirm`.
 
-Pre-approval visual commands render the current live workspace only. They are
-baseline evidence and do not render an unapplied proposal candidate.
+Top-level visual commands render the current live workspace and provide
+baseline evidence. Proposal-bound `preview-plan`, `preview-test`, and
+`preview-screenshot` commands render an integrity-checked pending candidate in
+an isolated runtime; they never apply it or change the live workspace.
+Each candidate preview is scoped to one layer and one map view. Large or mixed
+proposals therefore require a diff-derived coverage checklist and separate
+readable previews for every changed visual layer and distinct geographic view;
+one zoomed-out screenshot must not be presented as complete evidence.
 
 The CLI preserves structured partial outcomes. A failed visual check can still
 include its plan, report, and authenticated artifact paths. An apply request
@@ -57,8 +65,7 @@ For development:
 ```sh
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install -e .
-python -m pip install build twine
+python -m pip install -e ".[dev]"
 ```
 
 See [Installation](docs/installation.md) for upgrades, token files, and
@@ -66,19 +73,30 @@ non-interactive environments.
 
 ## Quick start
 
-Create a CLI token in the remote configuration dashboard. Put it in a private
-file rather than passing it on the command line:
+Create a CLI token in the remote configuration dashboard, then run the guided
+setup. It asks for the profile name, service URL, and token; token entry is
+hidden:
 
 ```sh
-install -m 0600 /dev/null ~/.config/mapp-config-cli/production.token
-${EDITOR:-vi} ~/.config/mapp-config-cli/production.token
-config-cli init https://config.example.com \
-  --profile production \
-  --token-file ~/.config/mapp-config-cli/production.token
+config-cli setup
+config-cli auth device
 ```
 
-Initialization copies the token into the CLI's private mode-`0600` credential
-store. Remove the transfer file afterward if it is no longer needed.
+Setup verifies the remote service before saving the profile, verifies live
+workspace access afterward, and rolls the local change back if that final
+check fails. It writes the token only to the CLI's private mode-`0600`
+credential store and never echoes it. For automation, use `config-cli
+init` with a private token file instead; see [Installation](docs/installation.md).
+`auth device` replaces that bootstrap credential with a browser-approved,
+thirty-day agent token scoped to inspect, propose, and visual work by default;
+apply and reload remain separate grants. After `auth status` confirms the
+replacement, revoke the bootstrap token in the remote dashboard.
+
+Agents can inspect deployed action schemas with `config-cli capabilities
+list`, correlate responses through `meta.requestId`, and inspect durable
+visual, reload, and apply outcomes with `config-cli operations show|wait`.
+Global `--input`, `--extract`, and `--out` options support JSON file/stdin
+workflows without fragile shell quoting.
 
 Inspect the bound instance:
 
@@ -88,14 +106,16 @@ config-cli --profile production workspace get
 config-cli --profile production layers get "Bus Stops"
 ```
 
-Use the revision returned by `describe` or `workspace get` when creating the
-proposal:
+Use the revision returned by `describe` or `workspace get` to check the exact
+operations, then create from the returned fingerprint:
 
 ```sh
-config-cli --profile production proposals create \
+config-cli --profile production proposals check \
   --base-revision WORKSPACE_REVISION \
   --set '/locale/layers/Bus Stops/style/default/icon/fillColor="#2563eb"' \
   --explanation 'Changes only the default Bus Stops point fill to blue.'
+config-cli --profile production proposals create \
+  --from-check CHECK_FINGERPRINT
 ```
 
 Review the returned proposal. After an approver explicitly accepts that
@@ -108,6 +128,11 @@ config-cli --profile production visual-test --layer "Bus Stops"
 ```
 
 The original request to make a change is not approval to apply its proposal.
+For an explicitly approved standalone XYZ reload, use
+`config-cli --profile production reload-xyz --confirm`; the existing
+`xyz reload --confirm` spelling remains available. This is an
+operator/recovery action, not an extra step after a successful proposal apply,
+which already requests and waits for the associated reload.
 
 ## Documentation
 
@@ -144,10 +169,31 @@ empty default; a sole named alternative is never selected automatically.
 
 ## Development
 
+For isolated development, open this repository directory (not its parent split
+workspace) in a separate VS Code window and choose **Dev Containers: Reopen in
+Container**. The container installs this package in editable mode and reaches a
+locally running platform at `http://config.localhost:3000`. It has no platform
+source/state mounts, shared Docker network, or Docker socket; HTTP is the only
+integration boundary. The `MAPP_PLATFORM_URL` environment variable is provided
+as a convenience, but profiles remain the CLI's authoritative endpoint setup.
+At container start, the development hook replaces any stale Docker
+`host-gateway` entry with the IPv4 address used by `host.docker.internal`
+(falling back to the native Linux default gateway). This preserves the
+`config.localhost` Host header required by Caddy while avoiding Docker Desktop
+selecting an unreachable IPv6 gateway.
+
+Start the platform in its own dev container first, then initialize a local
+profile from this container:
+
+```sh
+config-cli init "$MAPP_PLATFORM_URL" --profile local
+```
+
 Run the local quality checks before proposing a change:
 
 ```sh
 python -m unittest discover -s tests -v
+python -m mypy src
 python -m build
 python -m twine check dist/*
 ```

@@ -5,7 +5,8 @@
 - Python 3.11 or newer
 - Network access to the remote MAPP configuration endpoint
 - A bearer token created by an administrator in the configuration dashboard
-- HTTPS for every non-loopback endpoint
+- HTTPS for every production or Internet-reachable endpoint; plain HTTP is a
+  development-only exception
 
 The CLI does not need Docker, PostgreSQL tools, a checkout of XYZ, or access to
 the remote server's filesystem.
@@ -51,24 +52,33 @@ config-cli --version
 For development:
 
 ```sh
-python -m pip install -e .
-python -m pip install build twine
+python -m pip install -e ".[dev]"
 python -m unittest discover -s tests -v
+python -m mypy src
 ```
 
 ## Create a profile
 
 Create a token in the configuration dashboard under **Access & audit**. The
-token is displayed once. Store it in a file readable only by its owner:
+token is displayed once. For an interactive terminal, use the guided setup:
+
+```sh
+config-cli setup
+```
+
+The wizard collects the profile name, service URL, and token. Token entry is
+hidden, and only non-secret profile and compatibility details are printed.
+The remote identity and authenticated contract are verified before anything
+is saved. After saving, setup verifies live workspace access and returns the
+workspace key, revision, actor, scopes, versions, and compatibility under
+`verification`.
+
+For automation, place the token in a file readable only by its owner and use
+the non-interactive `init` command:
 
 ```sh
 install -m 0600 /dev/null ~/.config/mapp-config-cli/production.token
 ${EDITOR:-vi} ~/.config/mapp-config-cli/production.token
-```
-
-Initialize the profile:
-
-```sh
 config-cli init https://config.example.com \
   --profile production \
   --token-file ~/.config/mapp-config-cli/production.token

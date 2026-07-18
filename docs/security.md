@@ -22,26 +22,36 @@ the server filesystem. Do not add those privileges as a shortcut.
 
 ## Endpoint security
 
-Use HTTPS for every non-loopback endpoint. The client must validate
-certificates with the operating system trust store and must not send an
-authorization header across an HTTP redirect. Profiles are bound to the
-instance ID observed at initialization; state-changing requests must fail if
-the live instance ID or supported contract no longer matches.
+Use HTTPS for every production or Internet-reachable endpoint. The client must
+validate certificates with the operating system trust store and must not send
+an authorization header across an HTTP redirect. Plain HTTP is limited to
+loopback, `.localhost`, or an explicitly approved isolated development host.
+Profiles are bound to the instance ID observed at initialization;
+state-changing requests must fail if the live instance ID or supported
+contract no longer matches.
 
 An endpoint must be an origin URL. Reject embedded usernames or passwords,
 unexpected paths, queries, and fragments. Review the endpoint printed by
 `describe` before every change workflow.
 
 `--allow-http` exists only for trusted development endpoints and is unnecessary
-for loopback hosts. It permits plain HTTP; it does not disable HTTPS
-certificate verification. Never use it for a remote production system.
+for loopback or `.localhost` hosts. It permits plain HTTP; it does not disable
+HTTPS certificate verification. Never use it for a remote production system.
 
 ## Token handling
 
-Create a dedicated CLI token in the configuration dashboard. The current
-platform reports a single `full` CLI scope; it cannot yet issue a restricted
-inspect/propose-only token. Prefer separate tokens for separate hosts and
-environments, and treat each as full workspace-configuration authority.
+Prefer `config-cli auth device` for agent access. It requests an expiring token
+with `inspect`, `propose`, and `visual` scopes by default; `apply` and `reload`
+are separate explicit grants. Existing dashboard-created `full` tokens remain
+compatible for human operators and migration, but carry more authority than a
+proposal-generating agent needs. Prefer separate tokens for separate hosts and
+environments.
+
+For a human-operated terminal, prefer `config-cli setup`: it reads the token
+with hidden input, verifies the target, and never includes the token in its
+JSON result. For scripts and CI, use `config-cli init --token-file PATH`.
+Use `config-cli auth replace` for rotation: the new token is verified before
+an atomic credential switch, so failure preserves the old credential.
 
 - Store token files with mode `0600`.
 - Keep the containing directory private.
@@ -53,11 +63,20 @@ environments, and treat each as full workspace-configuration authority.
 - Never commit credentials, `.env` files, profiles, captured HTTP traffic, or
   test fixtures containing real secrets.
 - Never print authorization headers or token values in diagnostics.
+- Treat request and operation IDs as safe correlation data, but keep operation
+  results and visual artifacts access-controlled.
 - Revoke a token immediately if its host, output, or logs may be compromised.
 - Remove expired and unused tokens through the dashboard.
 
 Profile removal deletes local material but does not revoke the server-side
 token.
+
+Successful proposal checks cache their exact operations, which may contain
+sensitive SQL, in private mode-`0600` `checks.json`. The cache is bounded and
+target-bound; protect it like other CLI credential/configuration state.
+Files supplied through `--input` may also contain workspace or SQL material;
+keep them private, reject symlinks, and remove temporary inputs according to
+the same retention policy.
 
 Profile mutations are serialized with a private mode-`0600` state lock.
 Profiles publish immutable credential references only after target
@@ -67,9 +86,15 @@ readable and migrate on a later profile save. Do not hand-edit the state files.
 
 ## Approval boundary
 
-Proposals are the only supported mutation path. They must include an explicit
-base revision and contain the smallest possible operation set. The original
-change request does not authorize application.
+Proposals are the only supported mutation path. They must be bound to a checked
+workspace revision—normally by creating from the target-bound fingerprint
+returned by `proposals check`—and contain the smallest possible operation set.
+The original change request does not authorize application.
+
+When a service limitation forces replacement of a parent array to add one
+entry, review the complete old and candidate arrays. Confirm that every
+existing element and its order are preserved, and present the smaller semantic
+addition separately from the transport-level replacement.
 
 Applying requires:
 

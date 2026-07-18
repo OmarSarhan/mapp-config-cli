@@ -19,7 +19,7 @@ client-side changes. Review the changelog before upgrading.
 
 ## Compatibility checks
 
-`config-cli init` records:
+`config-cli setup` and `config-cli init` record:
 
 - the normalized endpoint;
 - the remote instance ID;
@@ -79,6 +79,17 @@ The connected server is authoritative for:
 Use `schema`, `rules`, `examples`, and capability endpoints at runtime. Do not
 copy those rules into client code or assume every server exposes the same
 optional capabilities.
+
+Capability matching is exact at the CLI command boundary. A server action ID
+or route that resembles a command does not satisfy a differently named
+contract command. For example, an advertised proposal visual-test action is
+not sufficient if the selected client requires the explicit
+`proposals preview-test` contract command. Treat `capability.missing` as an
+unsupported operation and do not bypass the named client command.
+
+Layer inspection requires the server's `layers effective` capability. A CLI
+must fail closed when that capability is absent rather than reimplementing XYZ
+locale composition or assuming `/api/layers` exists on an older `1.x` server.
 
 ## Upgrade procedure
 

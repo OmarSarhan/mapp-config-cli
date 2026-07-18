@@ -20,14 +20,14 @@ Python 3.11 or newer is required:
 ```sh
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install -e .
-python -m pip install build twine
+python -m pip install -e ".[dev]"
 ```
 
 Run the checks:
 
 ```sh
 python -m unittest discover -s tests -v
+python -m mypy src
 python -m build
 python -m twine check dist/*
 ```
