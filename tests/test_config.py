@@ -264,6 +264,306 @@ class ConfigPermissionTests(unittest.TestCase):
             ).removesuffix(".example.com")
             self.assertEqual(token, f"shared-token-{marker}")
 
+    def test_failed_token_publish_preserves_old_credential(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            old = store.save_profile(
+                Profile("production", "https://config.example.com", "instance", "1.0"),
+                "old-token",
+            )
+            write_json = store._write_json
+
+            def interrupt_profile_publish(path, data):
+                if path == store.profiles_path:
+                    raise CliError("simulated interruption")
+                return write_json(path, data)
+
+            with patch.object(store, "_write_json", side_effect=interrupt_profile_publish):
+                with self.assertRaises(CliError):
+                    store.replace_token(old, "new-token")
+
+            profile, token = store.connection("production")
+            self.assertEqual(profile, old)
+            self.assertEqual(token, "old-token")
+
+    def test_profile_save_can_be_rolled_back_without_overwriting_newer_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            previous = store.save_profile(
+                Profile("production", "https://old.example.com", "old", "1.0"),
+                "old-token",
+            )
+            saved = store.save_profile_transaction(
+                Profile("production", "https://new.example.com", "new", "1.0"),
+                "new-token",
+                expected_profile=previous,
+            )
+            self.assertTrue(store.rollback_profile_save(saved))
+            profile, token = store.connection("production")
+            self.assertEqual(profile, previous)
+            self.assertEqual(token, "old-token")
+
+            newer = store.save_profile(
+                Profile("production", "https://newer.example.com", "newer", "1.0"),
+                "newer-token",
+            )
+            self.assertFalse(store.rollback_profile_save(saved))
+            self.assertEqual(store.connection("production"), (newer, "newer-token"))
+
+    def test_profile_install_rejects_a_concurrent_target_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            observed = store.save_profile(
+                Profile("production", "https://old.example.com", "old", "1.0"),
+                "old-token",
+            )
+            concurrent = store.save_profile(
+                Profile(
+                    "production",
+                    "https://concurrent.example.com",
+                    "concurrent",
+                    "1.0",
+                ),
+                "concurrent-token",
+            )
+
+            with self.assertRaises(CliError) as raised:
+                store.save_profile_transaction(
+                    Profile("production", "https://new.example.com", "new", "1.0"),
+                    "new-token",
+                    expected_profile=observed,
+                )
+
+            self.assertEqual(raised.exception.error_code, "profile.changed")
+            self.assertEqual(
+                store.connection("production"),
+                (concurrent, "concurrent-token"),
+            )
+
+    def test_rollback_restores_pruned_credential_and_preserves_active_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            previous = store.save_profile(
+                Profile("production", "https://old.example.com", "old", "1.0"),
+                "old-token",
+            )
+            saved = store.save_profile_transaction(
+                Profile("production", "https://new.example.com", "new", "1.0"),
+                "new-token",
+                expected_profile=previous,
+            )
+            store.save_profile(
+                Profile("staging", "https://staging.example.com", "staging", "1.0"),
+                "staging-token",
+            )
+
+            self.assertTrue(store.rollback_profile_save(saved))
+            self.assertEqual(
+                store.connection("production"),
+                (previous, "old-token"),
+            )
+            self.assertEqual(store.list_profiles()["active"], "staging")
+
+    def test_successful_token_rotations_remove_superseded_local_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            profile = store.save_profile(
+                Profile("production", "https://config.example.com", "instance", "1.0"),
+                "token-0",
+            )
+
+            for index in range(1, 4):
+                profile = store.replace_token(profile, f"token-{index}")
+
+            self.assertEqual(
+                store.credentials_document(),
+                {profile.credential_id: "token-3"},
+            )
+
+    def test_post_commit_cleanup_failure_does_not_report_install_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            previous = store.save_profile(
+                Profile("production", "https://old.example.com", "old", "1.0"),
+                "old-token",
+            )
+            write_json = store._write_json
+            credential_writes = 0
+
+            def fail_cleanup(path, data):
+                nonlocal credential_writes
+                if path == store.credentials_path:
+                    credential_writes += 1
+                    if credential_writes == 2:
+                        raise CliError("simulated cleanup failure")
+                return write_json(path, data)
+
+            with patch.object(store, "_write_json", side_effect=fail_cleanup):
+                saved = store.save_profile_transaction(
+                    Profile("production", "https://new.example.com", "new", "1.0"),
+                    "new-token",
+                    expected_profile=previous,
+                )
+
+            self.assertEqual(
+                store.connection("production"),
+                (saved.installed, "new-token"),
+            )
+
+    def test_malformed_check_cache_prevents_profile_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            profile = store.save_profile(
+                Profile("production", "https://config.example.com", "instance", "1.0"),
+                "token",
+            )
+            store.checks_path.write_text("{broken", encoding="utf-8")
+            os.chmod(store.checks_path, 0o600)
+
+            with self.assertRaises(CliError) as raised:
+                store.remove_profile("production")
+
+            self.assertEqual(raised.exception.error_code, "config.invalid_json")
+            self.assertEqual(store.connection("production"), (profile, "token"))
+
+    def test_checked_operations_cache_is_private_and_target_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            profile = store.save_profile(
+                Profile("production", "https://config.example.com", "instance", "1.0"),
+                "token",
+            )
+            fingerprint = "c" * 64
+            store.save_check(profile, {
+                "checkFingerprint": fingerprint,
+                "originalRevision": "rev-1",
+                "operations": [{"op": "set", "path": "/title", "value": "Safe"}],
+            })
+            loaded = store.load_check(profile, fingerprint)
+            self.assertEqual(loaded["revision"], "rev-1")
+            self.assertEqual(stat.S_IMODE(store.checks_path.stat().st_mode), 0o600)
+
+    def test_checked_operations_cache_is_scoped_by_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            production = store.save_profile(
+                Profile(
+                    "production",
+                    "https://config.example.com",
+                    "production-instance",
+                    "1.0",
+                ),
+                "production-token",
+            )
+            staging = store.save_profile(
+                Profile(
+                    "staging",
+                    "https://staging-config.example.com",
+                    "staging-instance",
+                    "1.0",
+                ),
+                "staging-token",
+            )
+            fingerprint = "d" * 64
+            store.save_check(
+                production,
+                {
+                    "checkFingerprint": fingerprint,
+                    "originalRevision": "production-revision",
+                    "operations": [
+                        {"op": "set", "path": "/title", "value": "Production"}
+                    ],
+                },
+            )
+            store.save_check(
+                staging,
+                {
+                    "checkFingerprint": fingerprint,
+                    "originalRevision": "staging-revision",
+                    "operations": [
+                        {"op": "set", "path": "/title", "value": "Staging"}
+                    ],
+                },
+            )
+
+            production_check = store.load_check(production, fingerprint)
+            staging_check = store.load_check(staging, fingerprint)
+            self.assertEqual(production_check["revision"], "production-revision")
+            self.assertEqual(production_check["endpoint"], production.endpoint)
+            self.assertEqual(staging_check["revision"], "staging-revision")
+            self.assertEqual(staging_check["endpoint"], staging.endpoint)
+            stored_checks = json.loads(store.checks_path.read_text())["checks"]
+            self.assertEqual(
+                set(stored_checks),
+                {f"production:{fingerprint}", f"staging:{fingerprint}"},
+            )
+
+    def test_checked_operations_cache_reads_legacy_fingerprint_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            profile = store.save_profile(
+                Profile(
+                    "production",
+                    "https://config.example.com",
+                    "production-instance",
+                    "1.0",
+                ),
+                "token",
+            )
+            fingerprint = "e" * 64
+            store._write_json(
+                store.checks_path,
+                {
+                    "checks": {
+                        fingerprint: {
+                            "profile": profile.name,
+                            "endpoint": profile.endpoint,
+                            "instanceId": profile.instance_id,
+                            "revision": "legacy-revision",
+                            "operations": [
+                                {"op": "set", "path": "/title", "value": "Legacy"}
+                            ],
+                            "explanation": "Created by the previous cache format.",
+                        }
+                    }
+                },
+            )
+
+            loaded = store.load_check(profile, fingerprint)
+            self.assertEqual(loaded["revision"], "legacy-revision")
+            self.assertEqual(loaded["profile"], profile.name)
+
+    def test_configuration_status_validates_all_private_state_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            profile = store.save_profile(
+                Profile("production", "https://config.example.com", "instance", "1.0"),
+                "token",
+            )
+            store.save_check(
+                profile,
+                {
+                    "checkFingerprint": "f" * 64,
+                    "originalRevision": "revision",
+                    "operations": [],
+                },
+            )
+
+            status = store.configuration_status()
+            self.assertEqual(
+                set(status),
+                {"profilesFile", "credentialsFile", "checksFile", "lockFile"},
+            )
+            for file_status in status.values():
+                self.assertTrue(file_status["exists"])
+                self.assertTrue(file_status["private"])
+                self.assertEqual(file_status["mode"], "0600")
+
+            os.chmod(store.checks_path, 0o644)
+            with self.assertRaises(CliError) as raised:
+                store.configuration_status()
+            self.assertEqual(raised.exception.error_code, "config.insecure_permissions")
+
     def test_config_home_honors_explicit_then_xdg(self):
         with patch.dict(
             os.environ,

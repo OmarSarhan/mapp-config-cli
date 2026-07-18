@@ -42,6 +42,8 @@ PROFILE_NAME = re.compile(r"[A-Za-z0-9._-]+")
 GENERATED_CREDENTIAL = re.compile(
     r"credential:([A-Za-z0-9._-]+):[0-9a-f]{32}"
 )
+CHECK_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
+_PROFILE_UNCHECKED = object()
 
 
 def config_home() -> Path:
@@ -197,11 +199,22 @@ class Profile:
         return value
 
 
+@dataclass(frozen=True)
+class ProfileSave:
+    """Private transaction state needed to undo a verified profile install."""
+
+    installed: Profile
+    previous: Profile | None
+    previous_token: str | None
+    previous_active: str | None
+
+
 class ConfigStore:
     def __init__(self, root: Path | None = None):
         self.root = root or config_home()
         self.profiles_path = self.root / "profiles.json"
         self.credentials_path = self.root / "credentials.json"
+        self.checks_path = self.root / "checks.json"
         self.lock_path = self.root / ".state.lock"
         self._thread_lock = threading.RLock()
 
@@ -245,6 +258,28 @@ class ConfigStore:
                 EXIT_CONNECTIVITY,
                 error_code="config.permissions_failed",
             ) from exc
+
+    def private_file_status(self, path: Path) -> dict[str, Any]:
+        """Return safe metadata after enforcing private state-file invariants."""
+        if not path.exists() and not path.is_symlink():
+            return {"path": str(path), "exists": False}
+        _require_regular_private_file(path, "configuration file")
+        metadata = path.lstat()
+        return {
+            "path": str(path),
+            "exists": True,
+            "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+            "private": True,
+        }
+
+    def configuration_status(self) -> dict[str, dict[str, Any]]:
+        """Validate and describe every local state file used by the client."""
+        return {
+            "profilesFile": self.private_file_status(self.profiles_path),
+            "credentialsFile": self.private_file_status(self.credentials_path),
+            "checksFile": self.private_file_status(self.checks_path),
+            "lockFile": self.private_file_status(self.lock_path),
+        }
 
     @contextmanager
     def _locked(self):
@@ -420,6 +455,88 @@ class ConfigStore:
         with self._locked():
             return self._credentials_document()
 
+    def save_check(self, profile: Profile, check: dict[str, Any]) -> None:
+        """Cache authoritative preflight inputs for exact checked handoff."""
+        fingerprint = check.get("checkFingerprint")
+        revision = check.get("originalRevision")
+        operations = check.get("operations")
+        if (
+            not isinstance(fingerprint, str)
+            or CHECK_FINGERPRINT.fullmatch(fingerprint) is None
+            or not isinstance(revision, str)
+            or not revision
+            or not isinstance(operations, list)
+        ):
+            raise CliError(
+                "Proposal check response cannot be cached safely.",
+                EXIT_CONNECTIVITY,
+                error_code="proposal.check_invalid",
+            )
+        with self._locked():
+            document = self._read_json(self.checks_path, {"checks": {}})
+            if not isinstance(document, dict) or not isinstance(document.get("checks"), dict):
+                raise CliError(
+                    "checks.json has an unsupported structure.",
+                    EXIT_CONNECTIVITY,
+                    error_code="proposal.check_cache_malformed",
+                )
+            cache_key = f"{profile.name}:{fingerprint}"
+            document["checks"][cache_key] = {
+                "profile": profile.name,
+                "endpoint": profile.endpoint,
+                "instanceId": profile.instance_id,
+                "revision": revision,
+                "operations": operations,
+                "explanation": check.get("explanation"),
+            }
+            # Keep the private cache bounded. Dict order reflects insertion
+            # order for documents written by this client.
+            while len(document["checks"]) > 20:
+                del document["checks"][next(iter(document["checks"]))]
+            self._write_json(self.checks_path, document)
+
+    def load_check(self, profile: Profile, fingerprint: str) -> dict[str, Any]:
+        if CHECK_FINGERPRINT.fullmatch(fingerprint) is None:
+            raise CliError(
+                "Check fingerprint must contain 64 lowercase hexadecimal characters.",
+                EXIT_USAGE,
+                error_code="proposal.check_fingerprint_invalid",
+            )
+        with self._locked():
+            document = self._read_json(self.checks_path, {"checks": {}})
+            checks = document.get("checks") if isinstance(document, dict) else None
+            record = (
+                checks.get(f"{profile.name}:{fingerprint}")
+                if isinstance(checks, dict)
+                else None
+            )
+            # Read the original fingerprint-only format for existing clients.
+            if not isinstance(record, dict) and isinstance(checks, dict):
+                record = checks.get(fingerprint)
+            if not isinstance(record, dict):
+                raise CliError(
+                    "Checked operations are not available in this local profile store.",
+                    EXIT_USAGE,
+                    error_code="proposal.check_not_found",
+                )
+            if (
+                record.get("profile") != profile.name
+                or record.get("endpoint") != profile.endpoint
+                or record.get("instanceId") != profile.instance_id
+            ):
+                raise CliError(
+                    "Checked operations belong to a different target profile.",
+                    EXIT_CONFLICT,
+                    error_code="proposal.check_target_mismatch",
+                )
+            if not isinstance(record.get("revision"), str) or not isinstance(record.get("operations"), list):
+                raise CliError(
+                    "Cached checked operations are malformed.",
+                    EXIT_CONNECTIVITY,
+                    error_code="proposal.check_cache_malformed",
+                )
+            return dict(record)
+
     def _selected_profile(
         self,
         document: dict[str, Any],
@@ -511,11 +628,25 @@ class ConfigStore:
     ) -> None:
         references = cls._credential_references(profiles)
         for key in list(credentials):
-            generated = GENERATED_CREDENTIAL.fullmatch(key)
-            if key not in references and (
-                generated is not None or key not in profiles
-            ):
+            if key not in references:
                 del credentials[key]
+
+    def _best_effort_credential_cleanup(
+        self,
+        profiles: dict[str, Any],
+        credentials: dict[str, str],
+    ) -> None:
+        """Remove superseded secrets without turning a commit into a failure.
+
+        Profile publication is the commit point. A cleanup write that fails
+        afterward may leave only an unreachable private secret, which a later
+        successful state mutation will prune.
+        """
+        self._discard_orphaned_credentials(profiles, credentials)
+        try:
+            self._write_json(self.credentials_path, credentials)
+        except CliError:
+            pass
 
     def save_profile(
         self,
@@ -523,7 +654,27 @@ class ConfigStore:
         token: str,
         *,
         replace: bool = True,
-    ) -> None:
+    ) -> Profile:
+        return self.save_profile_transaction(
+            profile,
+            token,
+            replace=replace,
+        ).installed
+
+    def save_profile_transaction(
+        self,
+        profile: Profile,
+        token: str,
+        *,
+        replace: bool = True,
+        expected_profile: Profile | None | object = _PROFILE_UNCHECKED,
+    ) -> ProfileSave:
+        """Install a profile and retain the exact state needed for rollback.
+
+        When ``expected_profile`` is supplied, publishing fails if another
+        process changed the named profile while the remote target was being
+        verified.
+        """
         validate_profile_name(profile.name)
         if not isinstance(token, str) or not token:
             raise CliError(
@@ -533,7 +684,19 @@ class ConfigStore:
             )
         with self._locked():
             profiles = self._profiles_document()
-            if profile.name in profiles["profiles"] and not replace:
+            current_value = profiles["profiles"].get(profile.name)
+            current = (
+                Profile.from_mapping(profile.name, current_value)
+                if current_value is not None
+                else None
+            )
+            if expected_profile is not _PROFILE_UNCHECKED and current != expected_profile:
+                raise CliError(
+                    "Profile changed while the new target was being verified.",
+                    EXIT_CONFLICT,
+                    error_code="profile.changed",
+                )
+            if current is not None and not replace:
                 raise CliError(
                     f"Profile {profile.name} already exists. Use --force to replace it.",
                     EXIT_CONFLICT,
@@ -544,6 +707,17 @@ class ConfigStore:
                 profiles["profiles"],
                 credentials,
             )
+            previous_credential = (
+                current.credential_id or current.name
+                if current is not None
+                else None
+            )
+            previous_token = (
+                credentials.get(previous_credential)
+                if previous_credential is not None
+                else None
+            )
+            previous_active = profiles.get("active")
             credential_id = (
                 f"credential:{profile.name}:{secrets.token_hex(16)}"
             )
@@ -564,6 +738,116 @@ class ConfigStore:
             profiles["profiles"][profile.name] = stored_profile.mapping()
             profiles["active"] = profile.name
             self._write_json(self.profiles_path, profiles)
+            self._best_effort_credential_cleanup(
+                profiles["profiles"],
+                credentials,
+            )
+            return ProfileSave(
+                installed=stored_profile,
+                previous=current,
+                previous_token=previous_token,
+                previous_active=(
+                    previous_active if isinstance(previous_active, str) else None
+                ),
+            )
+
+    def replace_token(self, expected_profile: Profile, token: str) -> Profile:
+        """Atomically repoint an unchanged profile at a new immutable credential.
+
+        The caller can verify ``token`` before invoking this method.  The
+        compare with ``expected_profile`` prevents a concurrent profile edit
+        from binding the verified token to a different endpoint or instance.
+        """
+        if not isinstance(token, str) or not token:
+            raise CliError(
+                "Token must not be empty.",
+                EXIT_AUTHENTICATION,
+                error_code="auth.token_empty",
+            )
+        with self._locked():
+            profiles = self._profiles_document()
+            current_value = profiles["profiles"].get(expected_profile.name)
+            if current_value is None:
+                raise CliError(
+                    f"Unknown profile: {expected_profile.name}",
+                    EXIT_USAGE,
+                    error_code="profile.not_found",
+                )
+            current = Profile.from_mapping(expected_profile.name, current_value)
+            if current != expected_profile:
+                raise CliError(
+                    "Profile changed while the replacement credential was being verified.",
+                    EXIT_CONFLICT,
+                    error_code="profile.changed",
+                )
+            credentials = self._credentials_document()
+            credential_id = (
+                f"credential:{current.name}:{secrets.token_hex(16)}"
+            )
+            credentials[credential_id] = token
+            # As in save_profile, publish the immutable secret first. If the
+            # profile write fails, the old credential remains selected.
+            self._write_json(self.credentials_path, credentials)
+            replacement = Profile(
+                current.name,
+                current.endpoint,
+                current.instance_id,
+                current.contract_version,
+                current.allow_http,
+                credential_id,
+            )
+            profiles["profiles"][current.name] = replacement.mapping()
+            self._write_json(self.profiles_path, profiles)
+            self._best_effort_credential_cleanup(
+                profiles["profiles"],
+                credentials,
+            )
+            return replacement
+
+    def rollback_profile_save(
+        self,
+        save: ProfileSave,
+    ) -> bool:
+        """Undo a just-published profile save without clobbering newer state.
+
+        Returns false when another writer has already changed the profile.
+        Credential cleanup happens only after the public profile is restored.
+        """
+        installed_profile = save.installed
+        if not installed_profile.credential_id:
+            raise ValueError("installed_profile must identify its credential")
+        with self._locked():
+            profiles = self._profiles_document()
+            value = profiles["profiles"].get(installed_profile.name)
+            if value is None:
+                return False
+            current = Profile.from_mapping(installed_profile.name, value)
+            if current != installed_profile:
+                return False
+            credentials = self._credentials_document()
+            if save.previous is not None and save.previous_token is not None:
+                previous_credential = (
+                    save.previous.credential_id or save.previous.name
+                )
+                credentials[previous_credential] = save.previous_token
+                # Restore the previous secret before republishing its profile.
+                self._write_json(self.credentials_path, credentials)
+            if save.previous is None:
+                del profiles["profiles"][installed_profile.name]
+            else:
+                profiles["profiles"][installed_profile.name] = save.previous.mapping()
+            if profiles.get("active") == installed_profile.name:
+                profiles["active"] = (
+                    save.previous_active
+                    if save.previous_active in profiles["profiles"]
+                    else next(iter(profiles["profiles"]), None)
+                )
+            self._write_json(self.profiles_path, profiles)
+            self._best_effort_credential_cleanup(
+                profiles["profiles"],
+                credentials,
+            )
+            return True
 
     def list_profiles(self) -> dict[str, Any]:
         with self._locked():
@@ -577,6 +861,30 @@ class ConfigStore:
             return {
                 "active": document["active"],
                 "profiles": public_profiles,
+            }
+
+    def profile_summary(self, name: str) -> dict[str, Any]:
+        validate_profile_name(name)
+        with self._locked():
+            profiles = self._profiles_document()
+            value = profiles["profiles"].get(name)
+            if value is None:
+                raise CliError(
+                    f"Unknown profile: {name}",
+                    EXIT_USAGE,
+                    error_code="profile.not_found",
+                )
+            profile = Profile.from_mapping(name, value)
+            credentials = self._credentials_document()
+            credential_key = profile.credential_id or profile.name
+            return {
+                "name": profile.name,
+                "endpoint": profile.endpoint,
+                "storedInstanceId": profile.instance_id,
+                "contractVersion": profile.contract_version,
+                "allowHttp": profile.allow_http,
+                "active": profiles.get("active") == name,
+                "credentialAvailable": bool(credentials.get(credential_key)),
             }
 
     def use_profile(self, name: str) -> None:
@@ -603,14 +911,33 @@ class ConfigStore:
                     error_code="profile.not_found",
                 )
             credentials = self._credentials_document()
+            checks_document = self._read_json(self.checks_path, {"checks": {}})
+            checks = (
+                checks_document.get("checks")
+                if isinstance(checks_document, dict)
+                else None
+            )
+            if not isinstance(checks, dict):
+                raise CliError(
+                    "checks.json has an unsupported structure.",
+                    EXIT_CONNECTIVITY,
+                    error_code="proposal.check_cache_malformed",
+                )
+            checks_document["checks"] = {
+                fingerprint: record
+                for fingerprint, record in checks.items()
+                if not isinstance(record, dict) or record.get("profile") != name
+            }
+            # Cache cleanup is safe to publish first. If a later state write
+            # fails, the still-valid profile merely loses disposable checks.
+            self._write_json(self.checks_path, checks_document)
             del profiles["profiles"][name]
             if profiles.get("active") == name:
                 profiles["active"] = next(iter(profiles["profiles"]), None)
             # Remove the public profile first. If the process stops before the
             # credential cleanup, only an unreachable local secret remains.
             self._write_json(self.profiles_path, profiles)
-            self._discard_orphaned_credentials(
+            self._best_effort_credential_cleanup(
                 profiles["profiles"],
                 credentials,
             )
-            self._write_json(self.credentials_path, credentials)
