@@ -1613,6 +1613,91 @@ class CliTests(unittest.TestCase):
         self.assertIn("Configuration service URL: ", stderr.getvalue())
         self.assertNotIn("Profile name [default]: ", stdout.getvalue())
 
+    def test_setup_shows_existing_profile_and_token_prefix_before_override(self):
+        routes = standard_routes()
+        old_secret = "old-token-secret"
+        new_secret = "new-token-secret"
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = ConfigStore(Path(directory) / "config")
+            store.save_profile(
+                Profile(
+                    "default",
+                    server.endpoint,
+                    "instance-1",
+                    "1.0",
+                    True,
+                ),
+                old_secret,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("sys.stdin.isatty", return_value=True),
+                patch(
+                    "builtins.input",
+                    side_effect=["", "yes", server.endpoint, "yes"],
+                ),
+                patch(
+                    "mapp_config_cli.cli.getpass.getpass",
+                    return_value=new_secret,
+                ),
+            ):
+                code = main(
+                    ["setup"],
+                    stdout=stdout,
+                    stderr=stderr,
+                    store=store,
+                )
+            selected, stored_token = store.connection("default")
+
+        prompts = stderr.getvalue()
+        self.assertEqual(code, 0, prompts)
+        self.assertEqual(selected.endpoint, server.endpoint)
+        self.assertEqual(stored_token, new_secret)
+        self.assertIn("Current profile:", prompts)
+        self.assertIn("Name: default", prompts)
+        self.assertIn(f"Endpoint: {server.endpoint}", prompts)
+        self.assertIn("Instance: instance-1", prompts)
+        self.assertIn("Contract: 1.0", prompts)
+        self.assertIn("Allow HTTP: yes", prompts)
+        self.assertIn("Token prefix: old-to…", prompts)
+        self.assertIn("Override this profile? [y/N]: ", prompts)
+        self.assertIn(
+            f"Checking target identity at {server.endpoint} (timeout 10s)…",
+            prompts,
+        )
+        self.assertNotIn(old_secret, prompts)
+        self.assertNotIn(new_secret, prompts)
+        self.assertTrue(json.loads(stdout.getvalue())["setupComplete"])
+
+    def test_setup_declining_existing_profile_override_preserves_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            previous = store.save_profile(
+                Profile(
+                    "default",
+                    "https://config.example.com",
+                    "instance-1",
+                    "1.0",
+                ),
+                "old-token-secret",
+            )
+            with (
+                patch("sys.stdin.isatty", return_value=True),
+                patch("builtins.input", side_effect=["", "no"]),
+            ):
+                code, stdout, stderr = self.invoke(["setup"], store)
+            selected, token = store.connection("default")
+
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr[stderr.index("{"):])["code"],
+            "setup.replacement_cancelled",
+        )
+        self.assertEqual(selected, previous)
+        self.assertEqual(token, "old-token-secret")
+
     def test_setup_requires_terminal_and_does_not_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")

@@ -1227,12 +1227,29 @@ def _setup(args, store: ConfigStore) -> dict[str, Any]:
         if previous_value is not None
         else None
     )
-    if previous_profile is not None and not args.force:
-        raise CliError(
-            f"Profile {name} already exists. Run setup with --force to replace it.",
-            EXIT_CONFLICT,
-            error_code="profile.exists",
+    if previous_profile is not None:
+        previous_token = store.token_for(previous_profile)
+        print(
+            "Current profile:\n"
+            f"  Name: {previous_profile.name}\n"
+            f"  Endpoint: {previous_profile.endpoint}\n"
+            f"  Instance: {previous_profile.instance_id}\n"
+            f"  Contract: {previous_profile.contract_version}\n"
+            f"  Allow HTTP: {'yes' if previous_profile.allow_http else 'no'}\n"
+            f"  Token prefix: {previous_token[:6]}…",
+            file=prompt_stream,
         )
+        if not args.force:
+            answer = prompt(
+                "Override this profile? [y/N]: ",
+                prompt_stream,
+            )
+            if answer.strip().lower() not in {"y", "yes"}:
+                raise CliError(
+                    "Setup cancelled before overriding the existing profile.",
+                    EXIT_USAGE,
+                    error_code="setup.replacement_cancelled",
+                )
     endpoint = prompt("Configuration service URL: ", prompt_stream).strip()
     if not endpoint:
         raise CliError(
@@ -1263,9 +1280,16 @@ def _setup(args, store: ConfigStore) -> dict[str, Any]:
 
     if previous_profile is not None:
         normalized = normalize_endpoint(endpoint, allow_http=allow_http)
+        identity_timeout = min(args.timeout, 10.0)
+        print(
+            f"Checking target identity at {normalized} "
+            f"(timeout {identity_timeout:g}s)…",
+            file=prompt_stream,
+            flush=True,
+        )
         identity = ApiClient(
             normalized,
-            timeout=args.timeout,
+            timeout=identity_timeout,
             allow_http=allow_http,
         ).request("/api/public/identity", authenticated=False)
         new_instance = identity.get("instanceId")
@@ -1303,6 +1327,7 @@ def _setup(args, store: ConfigStore) -> dict[str, Any]:
     setup_args.init_profile = name
     setup_args.init_token_file = None
     setup_args.allow_http = allow_http
+    setup_args.force = previous_profile is not None
     saved: list[ProfileSave] = []
     result = _initialize(
         setup_args,
