@@ -245,6 +245,19 @@ config-cli proposals preview-screenshot PROPOSAL_ID \
   --artifact-dir "./visual-evidence/PROPOSAL_ID-bus-stops"
 ```
 
+For a proposal that changes initial layer visibility, capture the genuine
+startup state instead of forcing the requested layer into both URLs:
+
+```sh
+config-cli proposals preview-screenshot PROPOSAL_ID \
+  --layer "Bus Stops" --view-mode default \
+  --artifact-dir "./visual-evidence/PROPOSAL_ID-default-view"
+```
+
+Default-view mode produces a single original/candidate comparison without an
+XYZ `layers` query override. Keep `focus` mode for separate evidence that the
+retained visible layer renders at a useful data-derived location.
+
 Use explicit `--lng`, `--lat`, and `--zoom` when automatic framing is too
 broad, outlier-driven, or unrepresentative. Prefer separate readable views to
 one proposal-wide image zoomed too far out to verify. If the proposal affects

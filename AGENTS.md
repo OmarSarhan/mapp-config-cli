@@ -339,6 +339,11 @@ config-cli proposals preview-test PROPOSAL_ID --layer "LAYER KEY"
 config-cli proposals preview-screenshot PROPOSAL_ID --layer "LAYER KEY"
 ```
 
+For initial visibility or default-view changes, add `--view-mode default`.
+This omits XYZ's `layers` query override and compares the actual original and
+candidate startup views. Use the normal focused preview separately when proof
+that one retained layer renders is also required.
+
 Each invocation covers one requested layer in one selected map view. For a
 large or mixed proposal, derive a checklist from the focused diff and include:
 

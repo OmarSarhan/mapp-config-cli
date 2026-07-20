@@ -780,6 +780,8 @@ Render a pending proposal's retained candidate in an isolated runtime:
 config-cli proposals preview-plan PROPOSAL_ID --layer "Bus Stops"
 config-cli proposals preview-test PROPOSAL_ID --layer "Bus Stops"
 config-cli proposals preview-screenshot PROPOSAL_ID --layer "Bus Stops"
+config-cli proposals preview-screenshot PROPOSAL_ID --layer "Bus Stops" \
+  --view-mode default
 config-cli proposals preview-test PROPOSAL_ID --layer "Bus Stops" \
   --artifact-dir ./visual-evidence
 ```
@@ -797,6 +799,15 @@ changes the live workspace. A failed test or screenshot exits with code `6`
 while preserving the returned plan, report, and authenticated artifact paths.
 Conflicted, declined, superseded, corrupt, or stale candidates are rejected by
 the server rather than rendered.
+
+The default `--view-mode focus` supplies an XYZ `layers` query parameter so the
+requested layer (and relevant group context) is visible in the evidence. Use
+`--view-mode default` for initial-visibility changes. That mode omits the
+`layers` query parameter from both the original and candidate URLs, producing
+one comparison of the actual before and after startup views. Since the
+requested layer may correctly be hidden on either side, default-view evidence
+checks page health, canvas rendering, and browser errors without requiring its
+drawer label to be present.
 
 Each preview invocation covers one requested layer in one selected map view.
 It must not be presented as complete visual evidence for a large or mixed
