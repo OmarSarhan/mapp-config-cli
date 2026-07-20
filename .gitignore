@@ -47,3 +47,4 @@ artifacts/
 test-results/
 *.log
 visual-evidence/**/*
+.artifacts/*
