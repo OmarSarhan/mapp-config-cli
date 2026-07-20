@@ -328,6 +328,15 @@ def parser() -> JsonArgumentParser:
         preview.add_argument("--lat", type=finite_float)
         preview.add_argument("--zoom", type=finite_float)
         preview.add_argument(
+            "--view-mode",
+            choices=("focus", "default"),
+            default="focus",
+            help=(
+                "Use the focused layer override (default) or render the "
+                "workspace's actual initial layer visibility."
+            ),
+        )
+        preview.add_argument(
             "--artifact-dir",
             help="Fetch returned visual artifacts into this local directory.",
         )
@@ -450,6 +459,8 @@ def visual_payload(args) -> dict[str, Any]:
                 error_code="usage.invalid_visual_zoom",
             )
         payload["zoom"] = args.zoom
+    if getattr(args, "view_mode", "focus") != "focus":
+        payload["viewMode"] = args.view_mode
     return merge_input(args, payload)
 
 

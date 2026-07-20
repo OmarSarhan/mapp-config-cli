@@ -901,6 +901,11 @@ class CliTests(unittest.TestCase):
                         "Bus Stops",
                         "--locale",
                         "cy",
+                        *(
+                            ["--view-mode", "default"]
+                            if action == "preview-screenshot"
+                            else []
+                        ),
                     ],
                     store,
                 )
@@ -924,7 +929,18 @@ class CliTests(unittest.TestCase):
                 "/api/proposals/proposal-1/screenshot",
             ],
         )
-        self.assertTrue(all(body == {"layer": "Bus Stops", "locale": "cy"} for _, body in captured))
+        self.assertEqual(
+            [body for _, body in captured],
+            [
+                {"layer": "Bus Stops", "locale": "cy"},
+                {"layer": "Bus Stops", "locale": "cy"},
+                {
+                    "layer": "Bus Stops",
+                    "locale": "cy",
+                    "viewMode": "default",
+                },
+            ],
+        )
 
     def test_candidate_visual_rejects_unbound_response_and_preserves_failure(self):
         routes = standard_routes()
