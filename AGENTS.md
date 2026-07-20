@@ -294,6 +294,28 @@ new calculation. A line geometry has no meaningful polygon area without an
 explicit model; for example, `length_metres * width_metres` is an approximate
 rectangular footprint, not a geometry-derived area.
 
+Users may use “info panel” for three different XYZ surfaces. A categorized
+`style.theme` renders its legend in the Styling panel. An `infoj` entry with an
+`in` filter renders category statistics in the Filtering panel, and
+`filter.viewport=true` scopes those statistics and the feature count to the
+current view. Clicked-feature information is a third surface and does not
+automatically include either control. Inspect `layers style-elements`,
+`layers filters`, and `infoj`, then state where each requested element will
+appear.
+
+If the user explicitly wants a static categorized legend in clicked-feature
+information, add a bounded `type: "html"` `infoj` entry with a constant,
+read-only text `fieldfx` copied from the inspected theme labels, colours, and
+order. Disclose that this is duplicated static markup that will not follow
+later theme edits, while viewport counts remain interactive filter statistics.
+The SQL safety scanner rejects semicolons even inside string literals, so avoid
+semicolon-delimited inline CSS; a single colour declaration or bounded HTML
+colour attribute is sufficient. A new alias may not be selectable by
+standalone `sql test`; authoritative `proposals check` must validate the
+coordinated renderer and expression. Adding the entry may require exact
+replacement of the inspected `infoj` array because `-` append is unsupported;
+preserve every sibling and its order and review the smaller semantic diff.
+
 Formatting with PostgreSQL `to_char` returns text, so a formatted numeric entry
 must use a compatible text information renderer. A coordinated renderer and
 `fieldfx` change may not be testable against the current standalone `sql test`
@@ -319,6 +341,13 @@ instead of the child layer name in the checked UI text. A failed HTTP 422 visual
 result can still contain its plan, report, and authenticated artifacts;
 preserve that evidence. HTTP 429 means the bounded runner is busy; retry the
 read-only check only after the contention clears.
+
+For clicked-feature legend changes, require a candidate
+`preview-screenshot --artifact-dir` comparison and inspect the downloaded
+`beforeInfoPanel` and `afterInfoPanel` images. A passing browser test or text
+sample confirms the entry rendered but does not by itself prove the swatch
+colours. After approval and apply, repeat `visual-test` for the changed layer
+and confirm the live information-panel text.
 
 Use `--lng LONGITUDE --lat LATITUDE --zoom ZOOM` on `visual-plan`,
 `visual-test`, or `screenshot` when the automatic extent is misleading.

@@ -94,6 +94,27 @@ adding a duplicate. For line layers, “area” is ambiguous: line geometry itse
 has no polygon area, while length multiplied by width is only an approximate
 rectangular footprint.
 
+Treat “legend in the info panel with counts” as potentially spanning three
+independent controls. Inspect `layers style-elements` for the theme legend,
+`layers filters` for category statistics and viewport behavior, and `infoj`
+for clicked-feature content. Do not claim that enabling one surface changes
+the others.
+
+For a categorized theme, a compatible `filter.type="in"` on the same field
+plus `layer.filter.viewport=true` provides viewport-scoped generated category
+statistics in the Filtering panel. If the user separately requests a static
+legend inside clicked-feature information, use a bounded `type="html"` entry
+with a constant `fieldfx` text expression copied from the inspected theme.
+Explain that it is duplicated static markup, not a live binding to
+`style.theme`, and that viewport counts remain in the Filtering panel.
+
+Constant HTML still passes through the SQL expression validator and render
+probe. Avoid semicolons in inline CSS because the safety scanner treats them as
+statement separators even inside a string. If the new info alias does not yet
+exist, standalone `sql test` cannot select it; the complete candidate must pass
+`proposals check`. Adding the entry can require exact parent-array replacement,
+so preserve and review every existing `infoj` sibling and its order.
+
 ## 3. Build the smallest operation set
 
 Use only the JSON Pointer operations required for the request. Do not replace a

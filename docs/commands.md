@@ -377,6 +377,51 @@ requires a new inspection and proposal. `filter.default` is a fixed
 server-side restriction and may contain trusted template SQL in upstream XYZ;
 do not change one without explicit query and data-access review.
 
+For categorized symbology, distinguish three XYZ surfaces that users may call
+an “info panel”:
+
+- `style.theme` renders the category colour legend in the Styling panel;
+- an `infoj` entry with `filter.type="in"` supplies category statistics in the
+  Filtering panel, and layer `filter.viewport=true` scopes those statistics
+  and the feature count to the current map view;
+- clicked-feature information comes from `infoj` renderers and does not
+  automatically embed the Styling-panel legend or Filtering-panel statistics.
+
+When a user explicitly wants a fixed category key in clicked-feature
+information, add a `type="html"` entry whose `fieldfx` is a constant,
+read-only PostgreSQL text expression. Copy the labels and colours from the
+inspected categorized theme so the static key does not drift at proposal
+creation time. For example:
+
+```json
+{
+  "type": "html",
+  "title": "Registration year legend",
+  "field": "registration_period_legend",
+  "fieldfx": "'<div><div><font color=\"#b2182b\">■</font> Before 1970</div><div><font color=\"#2166ac\">■</font> 2015 onward</div></div>'::text",
+  "display": true
+}
+```
+
+This entry is static: it repeats for each selected feature and its labels,
+colours, and order do not update automatically when `style.theme` changes.
+Viewport category counts remain interactive filter statistics rather than
+values inside this HTML legend.
+
+The SQL safety scanner rejects semicolons even when they occur inside an SQL
+string, so avoid semicolon-delimited inline CSS in constant HTML expressions.
+A single `color` declaration or a bounded HTML `color` attribute is sufficient
+for a swatch. The new alias may not exist in the live `infoj` array, so
+standalone `sql test` can report that the selected entry does not exist.
+Treat that as a selector limitation and require the complete coordinated
+candidate to pass authoritative `proposals check` render validation.
+
+Because the CLI does not accept `-` as an array append index, adding the HTML
+entry may require replacing the inspected `infoj` parent array. Preserve every
+existing entry and its order exactly, add the `in` filter to the inspected
+category entry, and review the semantic diff separately from the
+transport-level array replacement.
+
 Layer keys, display names, and database relation names are different
 identifiers. A missing layer is an error. Omitting `--locale` selects the
 top-level default `locale`, even when named `locales` also exist. An explicit
