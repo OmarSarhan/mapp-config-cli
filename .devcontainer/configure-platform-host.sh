@@ -37,6 +37,11 @@ for candidate in sys.argv[2:]:
         pass
 PY
   )"
+  if [ -z "${host_ipv4}" ] && [ -n "${gateway_ipv4}" ]; then
+    host_ipv4="${gateway_ipv4}"
+    printf 'Platform is not reachable yet; using Docker gateway %s for %s.\n' \
+      "${host_ipv4}" "${alias_name}" >&2
+  fi
 fi
 
 case "${host_ipv4}" in

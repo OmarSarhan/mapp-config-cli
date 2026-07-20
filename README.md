@@ -176,11 +176,13 @@ locally running platform at `http://config.localhost:3000`. It has no platform
 source/state mounts, shared Docker network, or Docker socket; HTTP is the only
 integration boundary. The `MAPP_PLATFORM_URL` environment variable is provided
 as a convenience, but profiles remain the CLI's authoritative endpoint setup.
-At container start, the development hook replaces any stale Docker
-`host-gateway` entry with the IPv4 address used by `host.docker.internal`
-(falling back to the native Linux default gateway). This preserves the
-`config.localhost` Host header required by Caddy while avoiding Docker Desktop
-selecting an unreachable IPv6 gateway.
+At container start, the development hook probes the native Docker gateway and
+`host.docker.internal` against the configured platform port, then maps
+`config.localhost` to the first reachable IPv4 address. If the platform has not
+started yet, it records the native gateway so the route becomes usable once
+the platform is running. This preserves the `config.localhost` Host header
+required by Caddy while avoiding stale or unreachable Docker Desktop gateway
+addresses.
 
 Start the platform in its own dev container first, then initialize a local
 profile from this container:

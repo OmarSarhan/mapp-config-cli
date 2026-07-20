@@ -102,6 +102,32 @@ config-cli init http://config.localhost:3000 \
 `--allow-http` is required only for a trusted non-loopback development host.
 Never use it for a remote production host.
 
+### Docker development connection
+
+Inside the isolated CLI devcontainer, `config.localhost` must resolve to the
+Docker host address rather than the container's own loopback interface. The
+devcontainer runs `.devcontainer/configure-platform-host.sh` on every start.
+The hook probes the native Docker gateway and `host.docker.internal` against
+the port in `MAPP_PLATFORM_URL`, then writes the reachable IPv4 address to
+`/etc/hosts`.
+
+If setup reports `api.unreachable`, start the platform and rerun:
+
+```sh
+sudo sh .devcontainer/configure-platform-host.sh
+python -c "import urllib.request; print(urllib.request.urlopen(
+  'http://config.localhost:3000/api/public/identity',
+  timeout=5
+).read().decode())"
+config-cli setup
+```
+
+Some `curl` builds special-case every `.localhost` name back to `127.0.0.1`
+even when `/etc/hosts` contains another address. The CLI uses Python's system
+resolver, so use the Python identity check above when diagnosing this
+devcontainer route. Set `MAPP_HOST_IPV4` explicitly only when the automatically
+probed Docker gateway is not the machine hosting the platform.
+
 ## Configuration and credentials
 
 By default, client state is stored below:
