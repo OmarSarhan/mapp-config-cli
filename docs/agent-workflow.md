@@ -5,6 +5,12 @@ remote MAPP workspace. The goal is to keep target selection, intent
 resolution, approval, application, and verification as separate auditable
 steps.
 
+![Revision-bound proposal flow](images/proposal-flow.png)
+
+The diagram summarizes the mandatory path below. Its preview step means
+proposal-bound rendering of the pending candidate in isolated XYZ before
+approval; its final verification step tests the live map after application.
+
 ## 1. Identify the target
 
 Run:
