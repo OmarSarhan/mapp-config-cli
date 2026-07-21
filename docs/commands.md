@@ -879,6 +879,14 @@ config-cli proposals preview-test PROPOSAL_ID --layer "Bus Stops"
 config-cli proposals preview-screenshot PROPOSAL_ID --layer "Bus Stops"
 config-cli proposals preview-screenshot PROPOSAL_ID --layer "Bus Stops" \
   --view-mode default
+config-cli proposals preview-screenshot PROPOSAL_ID \
+  --layer "Definitive Paths" \
+  --panel filtering \
+  --expect-panel-text "Resurface cost"
+config-cli proposals preview-screenshot PROPOSAL_ID \
+  --layer "Definitive Paths" \
+  --panel styling \
+  --expect-panel-text "0–500 m"
 config-cli proposals preview-test PROPOSAL_ID --layer "Bus Stops" \
   --artifact-dir ./visual-evidence
 ```
@@ -896,6 +904,17 @@ changes the live workspace. A failed test or screenshot exits with code `6`
 while preserving the returned plan, report, and authenticated artifact paths.
 Conflicted, declined, superseded, corrupt, or stale candidates are rejected by
 the server rather than rendered.
+
+`preview-screenshot` accepts repeated `--panel filtering` and `--panel styling`
+options. The server expands the requested layer, including its containing
+folder when XYZ exposes a group label instead of the child layer name, opens
+the requested drawer in both original and candidate renders, and returns
+dedicated artifacts such as `beforeFilteringPanel`, `afterFilteringPanel`,
+`beforeStylingPanel`, and `afterStylingPanel`. Use repeated
+`--expect-panel-text` values to require specific filter labels, numeric bound
+labels, legend titles, class labels, or other control text to be present. If
+XYZ cannot open the requested drawer, the command exits as a visual evidence
+failure while preserving the page/map/report artifacts that were produced.
 
 The default `--view-mode focus` supplies an XYZ `layers` query parameter so the
 requested layer (and relevant group context) is visible in the evidence. Use

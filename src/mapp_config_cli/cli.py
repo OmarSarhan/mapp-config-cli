@@ -358,6 +358,24 @@ def parser() -> JsonArgumentParser:
             "--artifact-dir",
             help="Fetch returned visual artifacts into this local directory.",
         )
+        if action == "preview-screenshot":
+            preview.add_argument(
+                "--panel",
+                action="append",
+                choices=("filtering", "styling"),
+                help=(
+                    "Open and capture an additional XYZ layer panel. Repeat "
+                    "for both filtering and styling."
+                ),
+            )
+            preview.add_argument(
+                "--expect-panel-text",
+                action="append",
+                help=(
+                    "Require text to appear after opening requested panels; "
+                    "repeat for multiple filter or legend labels."
+                ),
+            )
 
     for name, help_text in (
         ("visual-plan", "Plan a server-side visual check."),
@@ -479,6 +497,12 @@ def visual_payload(args) -> dict[str, Any]:
         payload["zoom"] = args.zoom
     if getattr(args, "view_mode", "focus") != "focus":
         payload["viewMode"] = args.view_mode
+    panels = getattr(args, "panel", None)
+    if panels:
+        payload["panels"] = panels
+    expected_panel_text = getattr(args, "expect_panel_text", None)
+    if expected_panel_text:
+        payload["expectedPanelText"] = expected_panel_text
     return merge_input(args, payload)
 
 

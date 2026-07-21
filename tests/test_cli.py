@@ -950,7 +950,16 @@ class CliTests(unittest.TestCase):
                         "--locale",
                         "cy",
                         *(
-                            ["--view-mode", "default"]
+                            [
+                                "--view-mode",
+                                "default",
+                                "--panel",
+                                "filtering",
+                                "--panel",
+                                "styling",
+                                "--expect-panel-text",
+                                "Cost",
+                            ]
                             if action == "preview-screenshot"
                             else []
                         ),
@@ -986,6 +995,8 @@ class CliTests(unittest.TestCase):
                     "layer": "Bus Stops",
                     "locale": "cy",
                     "viewMode": "default",
+                    "panels": ["filtering", "styling"],
+                    "expectedPanelText": ["Cost"],
                 },
             ],
         )

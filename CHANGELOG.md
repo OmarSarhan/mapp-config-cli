@@ -41,6 +41,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Revision-bound proposal creation and retained proposal review.
 - Isolated proposal-bound visual plans, browser tests, and screenshot evidence
   with strict proposal/candidate identity validation.
+- Proposal screenshot panel capture flags for XYZ Filtering and Styling
+  drawers, with optional expected text checks and local artifact download.
 - Explicit `--confirm` guard for applying an approved proposal.
 - Structured errors and stable automation exit-code categories.
 - Unit, contract, integration, security, and clean-package test foundations.
