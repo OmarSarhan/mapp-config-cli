@@ -48,3 +48,4 @@ test-results/
 *.log
 visual-evidence/**/*
 .artifacts/*
+.codex-paths-h3-r9.sql
