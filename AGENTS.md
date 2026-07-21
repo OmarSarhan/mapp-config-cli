@@ -288,6 +288,21 @@ PostGIS constructors. If a derived-layer create or refresh reports HTTP `5xx`,
 inspect `derived-layers list|show` and the catalog before retrying because the
 database relation may already have committed.
 
+Lower-level H3 point input uses PostgreSQL point order `(longitude, latitude)`.
+When line-to-cell generation is required, segment endpoint traversal plus a
+bounded neighbouring-ring expansion can produce candidates, but every accepted
+cell must still pass the reviewed exact predicate against the source segment.
+Cast the published geometry to an explicit typmod such as
+`geometry(Polygon,3857)`; a transformed geometry with only a runtime SRID may
+fail derived-output validation. Resolution changes can alter feature counts and
+useful preview zooms by orders of magnitude, so materialize and visually test
+the requested resolution rather than treating it as a label-only change.
+
+A durable background operation can report a terminal serialization or result-
+reporting failure after its database transaction committed. Audit
+`operations show`, `derived-layers list|show`, and `catalog list` before acting
+on any late background failure, even when its operation status says `failed`.
+
 Inspect existing `infoj` entries and catalog columns before adding a calculated
 field. Ask whether the user wants an existing stored value, formatting, or a
 new calculation. A line geometry has no meaningful polygon area without an
@@ -323,6 +338,14 @@ selector; the complete candidate must still pass authoritative
 `proposals check` validation. Report rounding, grouping, nullability, and
 overflow behavior of the selected format.
 
+XYZ hover configuration selects a feature field but does not itself provide
+numeric grouping or a suffix formatter. If hover needs a value such as
+`1,250 m`, expose a text column from an authorized managed view while retaining
+the original numeric column for graduated styling. Keep clicked-feature
+`infoj`, hover, and theme fields independent. A browser visual test does not
+exercise hover reliably, so disclose that evidence gap unless the tooltip was
+manually observed.
+
 ## Visual evidence and limitations
 
 `visual-plan --layer` uses PostGIS geometry extent and map scale to choose a
@@ -341,6 +364,12 @@ instead of the child layer name in the checked UI text. A failed HTTP 422 visual
 result can still contain its plan, report, and authenticated artifacts;
 preserve that evidence. HTTP 429 means the bounded runner is busy; retry the
 read-only check only after the contention clears.
+
+For MVT layers on pinned XYZ v4.23.4, use the string value `"3857"` for `srid`.
+Schema validation may accept numeric `3857` while the browser runtime warns and
+fails to bind the layer. Also, an empty `infoj` suppresses feature fields but
+does not guarantee that clicking cannot open an empty information-panel shell;
+report that distinction instead of calling the layer non-clickable.
 
 For clicked-feature legend changes, require a candidate
 `preview-screenshot --artifact-dir` comparison and inspect the downloaded

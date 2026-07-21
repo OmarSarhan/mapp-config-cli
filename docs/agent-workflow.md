@@ -465,10 +465,43 @@ Restricted server search paths can expose extension-wrapper assumptions. If a
 higher-level H3/PostGIS wrapper fails with missing `geometry`, `st_dump`, or
 similar function/type resolution errors, rewrite the query to explicitly
 qualify PostGIS functions or use lower-level H3 boundary output plus qualified
-PostGIS constructors. If a derived-layer create, replace, or refresh returns a
-timeout or HTTP `5xx`, inspect `derived-layers list`, `derived-layers show`,
-and `catalog list` before retrying; the database action may have committed
-even though response serialization or operation reporting failed.
+PostGIS constructors. Use synchronous derived-layer commands first for normal
+jobs. For a known slow materialized create, replace, or refresh, add
+`--background`; the CLI polls the durable operation automatically. If its
+local wait expires, continue with `operations wait OPERATION_ID`; the server
+work was not cancelled. If a synchronous request times out or returns HTTP
+`5xx`, inspect `derived-layers list`, `derived-layers show`, and `catalog list`
+before retrying because the database action may have committed. Never
+automatically resubmit an ambiguous mutation.
+
+When using lower-level H3 functions, PostgreSQL points are ordered
+`(longitude, latitude)`. For lines, grid traversal between segment endpoint
+cells plus a bounded neighbour expansion is a candidate-generation technique,
+not final acceptance; retain only cells that pass exact intersection against
+the source segment. Publish a geometry with an explicit typmod such as
+`geometry(Polygon,3857)`, because `ST_Transform(...,3857)` alone may not satisfy
+the derived-output contract. Reinspect feature count, extent, and preview zoom
+after changing resolution; a coarser resolution is a different dataset, not a
+cosmetic configuration change.
+
+A background operation may finish the database transaction and then fail while
+serializing or recording its result. Treat any late reporting failure as an
+audit case even if the durable operation says `failed`: inspect the operation,
+managed-layer registry, and catalog before deciding whether creation committed.
+
+Hover configuration points at a feature field and has no built-in thousands-
+grouping or suffix formatter. For formatted hover text, create an authorized
+managed view that keeps the numeric source column for themes and adds a text
+column such as `to_char(round(length_metres)::bigint,
+'FM999,999,999,990') || ' m'`. State rounding and null behavior, keep clicked
+`infoj` independent, and disclose that standard visual tests do not trigger
+hover. Empty `infoj` prevents feature fields from rendering but may still allow
+an empty information-panel shell to open on click.
+
+For MVT layers on pinned XYZ v4.23.4, prefer `srid: "3857"`. Although the schema
+also accepts numeric `3857`, the browser runtime can reject that representation
+with an SRID warning; candidate screenshots are the authoritative compatibility
+check.
 
 ## Non-negotiable safeguards
 

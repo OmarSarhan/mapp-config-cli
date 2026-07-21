@@ -541,6 +541,12 @@ config-cli derived-layers refresh paths_h3_r9 --confirm
 config-cli derived-layers drop paths_h3_r9 --confirm
 ```
 
+For a refresh already known to be slow, opt into durable background execution:
+
+```sh
+config-cli derived-layers refresh paths_h3_r9 --confirm --background
+```
+
 Atomically replace a definition or convert its kind:
 
 ```sh
@@ -580,6 +586,52 @@ boundary functions when that happens. A derived-layer mutation that returns a
 timeout or HTTP `5xx` is indeterminate: inspect `derived-layers list`,
 `derived-layers show NAME`, and `catalog list` before recreating, replacing,
 or dropping anything.
+
+Create, replace, and refresh are synchronous by default; use that path first
+for ordinary views and jobs expected to finish promptly. For a known slow
+materialized job, add `--background`; the CLI then requests a durable server
+operation and polls it automatically. Background mode accepts
+`--wait-timeout` (default 1860 seconds) and `--interval` (default one second).
+Reaching the local wait timeout does not cancel database work; continue with
+the operation ID from the structured error using
+`config-cli operations wait OPERATION_ID`.
+
+Do not blindly resend a synchronous request after a client timeout or HTTP
+`5xx`: it may have committed. Inspect `derived-layers list`,
+`derived-layers show NAME`, and `catalog list` first. Use `--background` for a
+subsequent deliberate attempt only after confirming the original did not
+commit.
+
+The same audit is required when a background operation reaches `failed` after
+doing substantial work. A serialization or result-reporting error can occur
+after the relation was committed. Compare `operations show OPERATION_ID`,
+`derived-layers list`, `derived-layers show NAME`, and the catalog; do not
+recreate a relation that those reads confirm already exists.
+
+Lower-level H3 point functions take PostgreSQL points as
+`(longitude, latitude)`. A line workflow may traverse cells between each
+segment's endpoint cells and expand candidates by a bounded grid ring, but it
+must still filter candidates with exact `ST_Intersects` against the generating
+segment. Cast output explicitly, for example
+`ST_Transform(...,3857)::geometry(Polygon,3857)`, so geometry type and SRID are
+part of the relation contract. Resolution changes should be re-materialized
+and re-previewed: feature count, cell size, rendering cost, and useful map zoom
+can all change substantially.
+
+`style.hover` displays a selected feature field; it does not format numbers or
+append units. To show `1,250 m`, expose a text field from an authorized managed
+view while preserving the numeric length field used by a graduated theme. For
+example, use `to_char(round(length_metres)::bigint,
+'FM999,999,999,990') || ' m'`, with an explicit null branch when nulls must stay
+null. The standard visual runner validates that the layer renders but does not
+reliably trigger hover, so tooltip formatting remains a disclosed evidence gap
+unless manually observed.
+
+For MVT configuration on XYZ v4.23.4, use `"3857"` rather than numeric `3857`
+for `srid`; the schema accepts both, but the browser runtime may warn and fail
+to bind the numeric form. An empty `infoj` removes feature fields but can still
+leave an empty information-panel shell on click, so it is not sufficient proof
+that a layer is completely non-clickable.
 
 ## Dry-run mutation validation
 
