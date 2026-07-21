@@ -135,6 +135,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertEqual(captured["query"], query)
         self.assertEqual(captured["kind"], "materialized")
+        self.assertNotIn("background", captured)
         self.assertEqual(captured["sources"], [
             "leeds.h3_cells", "leeds.definitive_paths"
         ])
@@ -177,6 +178,53 @@ class CliTests(unittest.TestCase):
         self.assertTrue(captured["confirmed"])
         self.assertEqual(captured["kind"], "materialized")
         self.assertEqual(json.loads(stdout)["derivedLayer"]["replacedKind"], "view")
+
+    def test_derived_create_waits_for_background_operation(self):
+        polls = {"count": 0}
+
+        def create(request):
+            self.assertTrue(request["body"]["background"])
+            return 202, {"operation": {
+                "id": "derived-op-1",
+                "kind": "derived-layer.create",
+                "status": "running",
+            }}
+
+        def status(_request):
+            polls["count"] += 1
+            return 200, {"operation": {
+                "id": "derived-op-1",
+                "kind": "derived-layer.create",
+                "status": "succeeded",
+                "result": {"derivedLayer": {
+                    "name": "slow_places",
+                    "kind": "materialized",
+                }},
+            }}
+
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers")] = create
+        routes[("GET", "/api/operations/derived-op-1")] = status
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT id, geom FROM etl.places", encoding="utf-8"
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "slow_places",
+                "--kind", "materialized",
+                "--query-file", str(query_file),
+                "--source", "etl.places",
+                "--id-column", "id",
+                "--geometry-column", "geom",
+                "--background",
+                "--interval", "0.001",
+            ], store)
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(1, polls["count"])
+        self.assertEqual("slow_places", json.loads(stdout)["derivedLayer"]["name"])
 
     def test_derived_layer_in_use_feedback_preserves_detected_uses(self):
         routes = standard_routes()

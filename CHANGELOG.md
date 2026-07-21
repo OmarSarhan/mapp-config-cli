@@ -10,6 +10,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Optional `--background` derived-layer create, replace, and refresh polling
+  for known slow jobs, while retaining synchronous operation by default.
 - Confirmed `derived-layers replace` for atomic definition updates and
   view/materialized-view conversion with structured in-use feedback.
 - Documented H3-derived layer practices for candidate-cell expansion, exact

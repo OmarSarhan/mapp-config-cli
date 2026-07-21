@@ -248,6 +248,24 @@ def parser() -> JsonArgumentParser:
     derived_refresh = derived_actions.add_parser("refresh")
     derived_refresh.add_argument("name")
     derived_refresh.add_argument("--confirm", action="store_true", required=True)
+    for background_action in (derived_create, derived_replace, derived_refresh):
+        background_action.add_argument(
+            "--background",
+            action="store_true",
+            help="Run a known slow job as a durable server operation.",
+        )
+        background_action.add_argument(
+            "--wait-timeout",
+            type=finite_float,
+            default=1860,
+            help="Local seconds to wait for background completion (default: 1860).",
+        )
+        background_action.add_argument(
+            "--interval",
+            type=finite_float,
+            default=1,
+            help="Operation polling interval in seconds (default: 1).",
+        )
     derived_drop = derived_actions.add_parser("drop")
     derived_drop.add_argument("name")
     derived_drop.add_argument("--confirm", action="store_true", required=True)
@@ -645,6 +663,79 @@ def _invalid_response(
         details=data,
         error_code=error_code,
     )
+
+
+def _complete_background_operation(
+    client: ApiClient,
+    submitted: dict[str, Any],
+    *,
+    wait_timeout: float,
+    interval: float,
+) -> dict[str, Any]:
+    """Resolve an optional 202 operation while accepting synchronous servers."""
+    operation = submitted.get("operation")
+    if not isinstance(operation, dict):
+        return submitted
+    operation_id = operation.get("id")
+    if not isinstance(operation_id, str) or not operation_id:
+        raise _invalid_response(
+            "Background operation",
+            submitted,
+            error_code="operation.invalid_response",
+        )
+    if wait_timeout <= 0 or interval <= 0:
+        raise CliError(
+            "Operation wait timeout and interval must be positive.",
+            EXIT_USAGE,
+            error_code="operation.invalid_wait",
+        )
+    deadline = time.monotonic() + wait_timeout
+    while True:
+        status = operation.get("status")
+        if status in {"succeeded", "failed", "indeterminate"}:
+            if status == "succeeded":
+                result = operation.get("result")
+                if not isinstance(result, dict):
+                    raise _invalid_response(
+                        "Background operation result",
+                        {"operation": operation},
+                        error_code="operation.invalid_response",
+                    )
+                return result
+            raise CliError(
+                (
+                    "Derived-layer background operation failed."
+                    if status == "failed"
+                    else "Derived-layer operation is indeterminate; inspect the operation and authoritative database state before retrying."
+                ),
+                EXIT_VALIDATION if status == "failed" else EXIT_CONNECTIVITY,
+                details={"operation": operation},
+                error_code=f"operation.{status}",
+            )
+        if status != "running":
+            raise _invalid_response(
+                "Background operation",
+                {"operation": operation},
+                error_code="operation.invalid_response",
+            )
+        if time.monotonic() >= deadline:
+            raise CliError(
+                "Derived-layer work is still running after the local wait timeout; it was not cancelled. Inspect it with operations wait.",
+                EXIT_CONNECTIVITY,
+                details={"operationId": operation_id, "status": status},
+                error_code="operation.wait_timeout",
+            )
+        time.sleep(interval)
+        polled = client.request(
+            f"/api/operations/{quote_segment(operation_id)}"
+        )
+        operation = polled.get("operation")
+        if not isinstance(operation, dict):
+            raise _invalid_response(
+                "Background operation",
+                polled,
+                error_code="operation.invalid_response",
+            )
 
 
 def _proposal_from_response(
@@ -2038,6 +2129,8 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 )
             if args.action == "replace":
                 payload["confirmed"] = True
+            if args.background:
+                payload["background"] = True
             result = client.request(
                 (
                     f"{base}/{quote_segment(args.name)}/replace"
@@ -2048,6 +2141,13 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 payload=payload,
                 failure_code=EXIT_VALIDATION,
             )
+            if args.background:
+                result = _complete_background_operation(
+                    client,
+                    result,
+                    wait_timeout=args.wait_timeout,
+                    interval=args.interval,
+                )
             if not isinstance(result.get("derivedLayer"), dict):
                 raise _invalid_response(
                     "Derived layer",
@@ -2055,12 +2155,20 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     error_code="derived_layer.invalid_response",
                 )
         else:
+            background = args.action == "refresh" and args.background
             result = client.request(
                 f"{base}/{quote_segment(args.name)}/{args.action}",
                 method="POST",
-                payload={"confirmed": True},
+                payload={"confirmed": True, **({"background": True} if background else {})},
                 failure_code=EXIT_VALIDATION,
             )
+            if background:
+                result = _complete_background_operation(
+                    client,
+                    result,
+                    wait_timeout=args.wait_timeout,
+                    interval=args.interval,
+                )
             if not isinstance(result.get("derivedLayer"), dict):
                 raise _invalid_response(
                     "Derived layer",
