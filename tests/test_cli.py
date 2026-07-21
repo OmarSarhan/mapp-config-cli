@@ -1312,6 +1312,12 @@ class CliTests(unittest.TestCase):
                             "filter": True,
                         },
                         {"field": "direction", "type": "text", "filter": True},
+                        {
+                            "title": "Rounded cost",
+                            "field": "cost_rounded",
+                            "fieldfx": "round(cost)::bigint",
+                            "type": "integer",
+                        },
                         {"field": "pin", "type": "pin"},
                     ],
                 },
@@ -1329,9 +1335,16 @@ class CliTests(unittest.TestCase):
         self.assertTrue(payload["viewport"])
         self.assertEqual(
             [(item["field"], item["type"]) for item in payload["filters"]],
-            [("town", "like"), ("stop_id", "match"), ("object_id", "integer")],
+            [
+                ("town", "like"),
+                ("stop_id", "match"),
+                ("object_id", "integer"),
+                ("cost_rounded", "integer"),
+            ],
         )
         self.assertEqual(payload["filters"][0]["source"], "includeAll")
+        self.assertFalse(payload["filters"][3]["safe"])
+        self.assertIn("fieldfx", payload["filters"][3]["warning"])
 
     def test_unknown_locale_preserves_the_server_error_code(self):
         routes = standard_routes()

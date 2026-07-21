@@ -70,6 +70,10 @@ derives them from `infoj` entries plus the layer `filter` object; preserve the
 entry index, field, type, advanced options, and unknown extensions. Distinguish
 interactive filters from `filter.default`, a fixed server-side restriction
 that may carry trusted template SQL requiring explicit security review.
+Do not enable interactive filters on calculated `infoj[].fieldfx` aliases:
+pinned XYZ builds filter SQL and numeric min/max requests against the literal
+`field` name, not the `fieldfx` expression. Use a real table column or first
+expose the calculation as a derived-layer output column.
 
 Resolve natural-language intent to the effective workspace property. Layer
 keys, labels, database relations, locale names, style states, and theme-driven

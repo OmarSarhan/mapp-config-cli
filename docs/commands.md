@@ -362,6 +362,13 @@ visibility, viewport behavior, include/exclude lists, and whether a fixed
 default exists. It reports only the presence of `filter.default`, not its
 potentially sensitive content.
 
+Each reported filter includes `safe`. A `false` value means the filter comes
+from a calculated `infoj[].fieldfx` alias. XYZ v4.23.4 can display that value
+in clicked feature information, but its Filtering panel queries SQL and
+numeric min/max statistics against the literal field name. Use a real source
+column such as `resurface_cost`, or expose the calculation as a derived-layer
+output column, before enabling an interactive filter.
+
 Use checked proposals for changes:
 
 ```sh

@@ -2039,7 +2039,8 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 )
                 if filter_type not in supported:
                     continue
-                filters.append({
+                safe = not entry.get("fieldfx")
+                filter_item = {
                     "index": index,
                     "field": field,
                     "title": entry.get("title") or entry.get("label") or field,
@@ -2047,7 +2048,15 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     "type": filter_type,
                     "source": source,
                     "configuration": entry.get("filter"),
-                })
+                    "safe": safe,
+                }
+                if not safe:
+                    filter_item["warning"] = (
+                        "Calculated fieldfx entries are not safe for XYZ "
+                        "interactive filters; use a real table column or a "
+                        "derived-layer output column."
+                    )
+                filters.append(filter_item)
             result = {
                 "revision": workspace_revision,
                 "locale": locale_name,
