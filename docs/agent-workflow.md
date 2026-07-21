@@ -112,6 +112,12 @@ with a constant `fieldfx` text expression copied from the inspected theme.
 Explain that it is duplicated static markup, not a live binding to
 `style.theme`, and that viewport counts remain in the Filtering panel.
 
+If a categorized point layer needs symbols composed from more than one
+attribute, use `style.theme.fields` plus a category-level `field` on each
+category. Do not leave `style.theme.field` in place; the workspace schema
+requires either the single-field form or the multi-field form. This produces
+point icon arrays, so do not use it for line or polygon symbology.
+
 Constant HTML still passes through the SQL expression validator and render
 probe. Avoid semicolons in inline CSS because the safety scanner treats them as
 statement separators even inside a string. If the new info alias does not yet

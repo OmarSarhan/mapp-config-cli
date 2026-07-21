@@ -394,6 +394,20 @@ an “info panel”:
 - clicked-feature information comes from `infoj` renderers and does not
   automatically embed the Styling-panel legend or Filtering-panel statistics.
 
+Single-field categorized themes use `style.theme.field`. Multi-field
+categorized point icons use `style.theme.fields` and each category's own
+`field`; do not set both `field` and `fields` on the same theme. The multi-field
+form composes an array of point icons, so use it only where the target layer
+renders as point geometry. A revision-bound proposal can set the complete theme:
+
+```sh
+config-cli proposals check \
+  --base-revision WORKSPACE_REVISION \
+  --set '/locale/layers/Bus Stops/style/theme={"type":"categorized","title":"Bus stop status markers","fields":["status","priority"],"categories":[{"field":"status","value":"open","label":"Open","style":{"icon":{"type":"dot","fillColor":"#176b4d"}}},{"field":"priority","value":"high","label":"High priority","style":{"icon":{"type":"triangle","fillColor":"#f8961e"}}}]}' \
+  --set '/locale/layers/Bus Stops/style/elements=["theme"]' \
+  --explanation 'Composes Bus Stops point icons from status and priority without setting a top-level categorized field.'
+```
+
 When a user explicitly wants a fixed category key in clicked-feature
 information, add a `type="html"` entry whose `fieldfx` is a constant,
 read-only PostgreSQL text expression. Copy the labels and colours from the
