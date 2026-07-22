@@ -246,7 +246,25 @@ Read the supported workspace schema, optionally at one JSON Pointer:
 ```sh
 config-cli schema
 config-cli schema --pointer '/properties/locale'
+config-cli schema --pointer '/$defs/templateDefinition'
+config-cli schema --pointer '/$defs/locale/properties'
+config-cli schema --pointer '/$defs/layer/properties/gazetteer'
 ```
+
+Treat entries explicitly present under the returned `properties` map as the
+server's audited pinned-XYZ capabilities. Unknown contract properties are
+rejected rather than preserved or silently removed. Open maps represent
+audited arbitrary-name features, not general extension support. Before proposing a
+template, plugin, gazetteer, or other advanced change, inspect the focused
+definition and then inspect the raw target value with `workspace get` or
+`layers get`.
+
+On the currently pinned platform, gazetteer configuration is a layer property,
+not a locale property. A live template `src` descriptor is validated without
+executing it; XYZ fetches it on first use in a reloaded generation. Proposal
+evidence must therefore include post-apply reload status and an appropriate
+functional or visual test rather than treating schema validation as proof that
+the source loaded or its SQL/module ran.
 
 ### `rules`
 
@@ -256,6 +274,27 @@ Read validation and safety rules, optionally restricted to a category:
 config-cli rules
 config-cli rules --category security
 ```
+
+### `plugins list|show|validate|usage`
+
+Inspect the connected server's pinned XYZ plugin registry and runtime rules:
+
+```sh
+config-cli plugins list
+config-cli plugins show feature_info
+config-cli plugins show viewport-layer-count
+config-cli plugins validate
+config-cli plugins usage viewport-layer-count
+```
+
+The response covers dynamic sources, registration, synchronous/parallel
+locale dispatch, non-awaited layer dispatch, failure behavior, prerequisites,
+and security. External entries also include their manifest schema, hashes,
+XYZ range, catalogue fingerprint, usage, and declarative preview checks.
+`validate` fails when the catalogue or current workspace usage is invalid.
+Dynamic modules execute trusted browser JavaScript; preview evidence verifies
+registration and declared observable behavior even though XYZ itself tolerates
+an import failure.
 
 ### `examples`
 

@@ -147,6 +147,8 @@ which already requests and waits for the associated reload.
 
 The live server remains authoritative for workspace structure and
 XYZ-version-specific behavior. Use `config-cli schema`, `config-cli rules`,
+`config-cli plugins list`, `config-cli plugins show KEY`,
+`config-cli plugins validate`, `config-cli plugins usage [KEY]`,
 and `config-cli examples` instead of encoding those rules in the client.
 
 Omitting `--locale` selects the top-level XYZ `locale`, including when named

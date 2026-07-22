@@ -435,7 +435,11 @@ applicable checklist item is covered or every gap is explicitly disclosed.
 
 ## Safety rules
 
-- Preserve unknown XYZ, plugin, template, role, and advanced properties.
+- Treat external XYZ plugins as server-catalogued trusted deployment code.
+  Inspect manifest compatibility, usage, and preview requirements; never infer
+  availability from a module URL alone.
+- Reject properties outside the server-advertised pinned-XYZ contract. Never
+  silently delete them; arbitrary names are valid only in schema-declared maps.
 - Never expose database URLs, passwords, tokens, authorization headers, or
   sensitive SQL samples.
 - Never mount or expose the Docker socket.
