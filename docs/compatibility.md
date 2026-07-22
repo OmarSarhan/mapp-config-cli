@@ -80,6 +80,26 @@ Use `schema`, `rules`, `examples`, and capability endpoints at runtime. Do not
 copy those rules into client code or assume every server exposes the same
 optional capabilities.
 
+Use `plugins list`, `show`, `validate`, and `usage` for plugin behavior. The
+server-owned response includes pinned built-ins and source-controlled external
+manifests, hashes, schemas, preview checks, and a catalogue fingerprint.
+
+The workspace schema is an advertised-capability contract, not merely a list
+of properties the server can round-trip. A property under a typed `properties`
+map means the server has audited it against its pinned XYZ commit. Unknown
+contract properties are rejected with their exact path, not preserved or
+silently removed. Open maps exist only where arbitrary keys are an audited
+part of the feature; they are not general extension points.
+
+For the MAPP Platform pinned to XYZ v4.23.4, the audited native additions cover
+workspace/query templates, locale and layer template composition, recursive
+key/value dictionaries, SVG templates, layer-panel gazetteer search, and the
+plugins bundled in that exact XYZ commit plus compatible installed external
+plugin manifests. The schema intentionally does not
+advertise external/older keys such as `measure_distance`, `query_features`,
+`posthog`, or `googleMaps`. Re-run `describe` and `schema` against each target;
+another server or future pin may expose a different surface.
+
 Capability matching is exact at the CLI command boundary. A server action ID
 or route that resembles a command does not satisfy a differently named
 contract command. For example, an advertised proposal visual-test action is

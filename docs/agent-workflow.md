@@ -62,7 +62,7 @@ operation to add or move a layer. Unset the property to remove membership.
 Inspect `layers style-elements "LAYER KEY"` before changing the interactive
 Styling drawer. `style.elements` controls order and inclusion only; each
 built-in element still needs its corresponding `style.<key>` configuration.
-Preserve unknown/custom keys. Use `style.hidden`, not deletion of rendering
+Preserve audited custom style values. Reject unadvertised keys. Use `style.hidden`, not deletion of rendering
 styles, when the request is only to suppress the drawer.
 
 Inspect `layers filters "LAYER KEY"` before changing interactive filters. XYZ
@@ -89,7 +89,36 @@ If raw `workspace.locale` is absent, XYZ still selects a synthetic empty
 default for no option or `--locale locale`; never infer that a sole named
 locale is the default.
 
-Preserve unknown XYZ, plugin, template, role, and advanced properties.
+Reject unknown XYZ, plugin, template, and advanced properties; do not silently
+delete them. Only fields explicitly advertised under
+the connected server schema's typed `properties` maps have been audited
+against that server's pinned XYZ version. An unlisted locale key is invalid.
+
+Before changing templates or plugin configuration, inspect:
+
+```sh
+config-cli schema --pointer '/$defs/templateDefinition'
+config-cli schema --pointer '/$defs/locale/properties'
+config-cli schema --pointer '/$defs/layer/properties/gazetteer'
+config-cli plugins list
+config-cli plugins validate
+config-cli plugins usage
+```
+
+Pinned XYZ v4.23.4 exposes database/coordinate gazetteer behavior through
+`layer.gazetteer`; the similarly shaped locale-level object is not consumed.
+Its live template loader accepts audited provider-qualified `src` descriptors,
+but descriptor validation neither fetches the source nor executes template SQL
+or module code. Include post-apply reload and functional/visual evidence for
+such a change.
+
+For plugin work, use `plugins show KEY` and `plugins usage KEY`; distinguish module sources in
+locale/layer `plugins[]`, ordering in `syncPlugins[]`, and the same-named
+configuration property. Dynamic imports use all-settled behavior, so a loading
+map does not prove every module loaded. Verify bundled registration or review
+the external module's `mapp.plugins` side effect, then collect post-apply
+browser evidence for the affected behavior. A changed catalogue fingerprint
+makes an earlier proposal and its preview stale.
 
 Inspect `infoj` before adding a feature-information field. A requested value
 may already be displayed, may exist as an unused catalog column, or may require

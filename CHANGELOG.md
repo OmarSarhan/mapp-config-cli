@@ -10,6 +10,8 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Server-authoritative `plugins list` and `plugins show` inspection for pinned
+  registry, dynamic loading, dispatch, prerequisites, and security behavior.
 - Optional `--background` derived-layer create, replace, and refresh polling
   for known slow jobs, while retaining synchronous operation by default.
 - Confirmed `derived-layers replace` for atomic definition updates and
@@ -59,6 +61,13 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Added manifest-backed external plugin inspection, validation, workspace usage,
+  catalogue fingerprints, configuration schemas, and preview requirements to
+  the server-authoritative `plugins` commands.
+- Clarified that server schema properties advertise capabilities audited
+  against the server's pinned XYZ version, with unknown contract properties
+  rejected rather than preserved or silently removed; added focused template, bundled-plugin,
+  and layer-gazetteer inspection guidance.
 - Expanded the command, compatibility, and agent documentation with verified
   input-merging limits, array-edit constraints, SQL renderer coordination,
   exact capability matching, and visual-evidence limitations.

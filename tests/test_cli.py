@@ -2032,6 +2032,60 @@ class CliTests(unittest.TestCase):
         self.assertIn("Status: healthy", human)
         self.assertFalse(human.lstrip().startswith("{"))
 
+    def test_plugin_manifest_list_and_show_are_server_authoritative(self):
+        routes = standard_routes()
+        routes[("GET", "/api/plugins")] = (200, {"plugins": {
+            "xyzVersion": "v4.23.4",
+            "registrySource": "GEOLYTIX XYZ lib/plugins/_plugins.mjs",
+            "loading": {"failure": "continues"},
+            "dispatch": {"sync": "sequential"},
+            "security": ["arbitrary browser JavaScript"],
+            "xyzCommit": "a6f03c07dd7aaae2e9ab04087143ee0400e15cb9",
+            "fingerprint": "catalogue-1",
+            "valid": True,
+            "workspaceErrors": [],
+            "usage": [{"pluginId": "viewport-layer-count", "scope": "layer", "path": "locale.layers.Places"}],
+            "bundled": [
+                {"key": "zoomBtn", "configuration": "object", "execution": "locale"},
+            ],
+            "external": [{
+                "id": "viewport-layer-count",
+                "registrationKey": "viewport_layer_count",
+                "configurationKey": "viewport_layer_count",
+                "entryUrl": "/instance/plugins/viewport-layer-count/index.mjs",
+                "available": True,
+                "diagnostics": [],
+            }],
+        }})
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            list_code, list_out, list_err = self.invoke(["plugins", "list"], store)
+            show_code, show_out, show_err = self.invoke(
+                ["plugins", "show", "zoomBtn"], store
+            )
+            external_code, external_out, external_err = self.invoke(
+                ["plugins", "show", "viewport-layer-count"], store
+            )
+            validate_code, validate_out, validate_err = self.invoke(
+                ["plugins", "validate"], store
+            )
+            usage_code, usage_out, usage_err = self.invoke(
+                ["plugins", "usage", "viewport-layer-count"], store
+            )
+        self.assertEqual(list_code, 0, list_err)
+        self.assertEqual(show_code, 0, show_err)
+        self.assertEqual(external_code, 0, external_err)
+        self.assertEqual(validate_code, 0, validate_err)
+        self.assertEqual(usage_code, 0, usage_err)
+        self.assertEqual(json.loads(list_out)["plugins"]["xyzVersion"], "v4.23.4")
+        shown = json.loads(show_out)
+        self.assertEqual(shown["plugin"]["key"], "zoomBtn")
+        self.assertIn("loading", shown)
+        self.assertIn("dispatch", shown)
+        self.assertEqual(json.loads(external_out)["plugin"]["id"], "viewport-layer-count")
+        self.assertTrue(json.loads(validate_out)["valid"])
+        self.assertEqual(len(json.loads(usage_out)["usage"]), 1)
+
     def test_capability_discovery_and_operation_status_are_machine_readable(self):
         routes = standard_routes()
         routes[("GET", "/api/capabilities")] = (
