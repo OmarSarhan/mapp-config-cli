@@ -185,6 +185,17 @@ def parser() -> JsonArgumentParser:
     capability_actions.add_parser("list")
     capability_show = capability_actions.add_parser("show")
     capability_show.add_argument("id")
+    plugins_command = commands.add_parser(
+        "plugins",
+        help="Inspect the server-audited pinned XYZ plugin system.",
+    )
+    plugin_actions = plugins_command.add_subparsers(dest="action", required=True)
+    plugin_actions.add_parser("list")
+    plugin_show = plugin_actions.add_parser("show")
+    plugin_show.add_argument("key")
+    plugin_actions.add_parser("validate")
+    plugin_usage = plugin_actions.add_parser("usage")
+    plugin_usage.add_argument("key", nargs="?")
     explain_error = commands.add_parser("explain-error")
     explain_error.add_argument("rule_id")
 
@@ -443,7 +454,7 @@ def required_contract_command(args) -> str:
         return "rules"
     if args.command in {
         "workspace", "catalog", "icons", "auth", "xyz", "sql",
-        "capabilities", "operations", "derived-layers",
+        "capabilities", "plugins", "operations", "derived-layers",
     }:
         return f"{args.command} {args.action}"
     if args.command == "layers":
@@ -1021,7 +1032,7 @@ def _download_visual_artifacts(
         except CliError as exc:
             if not preserve_download_failures:
                 raise
-            failure = {
+            failure: dict[str, Any] = {
                 "artifact": name,
                 "path": artifact_path,
                 "error": exc.message,
@@ -1623,6 +1634,93 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 "contractVersion": result.get("contractVersion"),
                 "instanceId": result.get("instanceId"),
                 "action": selected,
+                "meta": result.get("meta"),
+            }
+        return _with_context(result, context)
+
+    if args.command == "plugins":
+        result = client.request("/api/plugins")
+        manifest = result.get("plugins")
+        if not isinstance(manifest, dict):
+            raise _invalid_response(
+                "Plugins",
+                result,
+                error_code="plugins.invalid_response",
+            )
+        bundled = manifest.get("bundled")
+        external = manifest.get("external", [])
+        if not isinstance(bundled, list) or any(not isinstance(item, dict) for item in bundled):
+            raise _invalid_response(
+                "Plugins",
+                result,
+                error_code="plugins.invalid_response",
+            )
+        if not isinstance(external, list) or any(not isinstance(item, dict) for item in external):
+            raise _invalid_response("Plugins", result, error_code="plugins.invalid_response")
+        if args.action == "show":
+            selected = next((item for item in bundled if item.get("key") == args.key), None)
+            selected = selected or next((
+                item for item in external
+                if args.key in {
+                    item.get("id"), item.get("registrationKey"),
+                    item.get("configurationKey"), item.get("entryUrl"),
+                }
+            ), None)
+            if selected is None:
+                raise CliError(
+                    f"The connected platform does not advertise plugin {args.key}.",
+                    EXIT_VALIDATION,
+                    details={"pluginKey": args.key, "xyzVersion": manifest.get("xyzVersion")},
+                    error_code="plugins.not_found",
+                )
+            result = {
+                "xyzVersion": manifest.get("xyzVersion"),
+                "xyzCommit": manifest.get("xyzCommit"),
+                "pluginCatalogueFingerprint": manifest.get("fingerprint"),
+                "registrySource": manifest.get("registrySource"),
+                "plugin": selected,
+                "loading": manifest.get("loading"),
+                "dispatch": manifest.get("dispatch"),
+                "security": manifest.get("security"),
+                "meta": result.get("meta"),
+            }
+        elif args.action == "validate":
+            diagnostics = [
+                {"pluginId": item.get("id"), "diagnostics": item.get("diagnostics", [])}
+                for item in external if not item.get("available")
+            ]
+            workspace_errors = manifest.get("workspaceErrors", [])
+            result = {
+                "valid": manifest.get("valid") is True and not workspace_errors,
+                "xyzVersion": manifest.get("xyzVersion"),
+                "xyzCommit": manifest.get("xyzCommit"),
+                "pluginCatalogueFingerprint": manifest.get("fingerprint"),
+                "diagnostics": diagnostics,
+                "workspaceErrors": workspace_errors,
+                "meta": result.get("meta"),
+            }
+            if not result["valid"]:
+                raise CliError(
+                    "Plugin catalogue or workspace plugin usage is invalid.",
+                    EXIT_VALIDATION,
+                    details=result,
+                    error_code="plugins.validation_failed",
+                )
+        elif args.action == "usage":
+            usage = manifest.get("usage", [])
+            if not isinstance(usage, list):
+                raise _invalid_response("Plugin usage", result, error_code="plugins.invalid_response")
+            if args.key:
+                matching_ids = {
+                    item.get("id") for item in external
+                    if args.key in {item.get("id"), item.get("registrationKey"), item.get("configurationKey")}
+                }
+                usage = [item for item in usage if item.get("pluginId") in matching_ids]
+            result = {
+                "plugin": args.key,
+                "pluginCatalogueFingerprint": manifest.get("fingerprint"),
+                "usage": usage,
+                "workspaceErrors": manifest.get("workspaceErrors", []),
                 "meta": result.get("meta"),
             }
         return _with_context(result, context)
