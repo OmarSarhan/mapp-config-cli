@@ -89,6 +89,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Validated the bounded semantic delivery-blocker batch and its explicit
+  `deliveryBlockersMore` continuation signal so an incomplete repair queue
+  cannot be mistaken for a complete result.
 - Preserved hardened derived-layer validation, policy, compute, storage, and
   indeterminate-operation guidance through automatic background polling and
   `operations wait`, including stable server codes and safe primary messages

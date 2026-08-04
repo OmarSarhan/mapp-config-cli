@@ -30,6 +30,12 @@ of the collection. `--limit` or `--cursor` fails closed when the server does
 not advertise pagination; the one exception is semantic search's legacy
 `--limit`, which remains compatible with earlier API-1.x servers.
 
+The derived-profile list may also return a bounded `deliveryBlockers` repair
+batch. A literal boolean `deliveryBlockersMore` means additional unmatched
+archive repairs remain server-side; repair the displayed batch and refresh the
+list. The CLI rejects malformed or unaccompanied backlog flags instead of
+mistaking an incomplete administrative work queue for a complete result.
+
 Until the first stable CLI release, minor `0.x` releases may contain breaking
 client-side changes. Review the changelog before upgrading.
 

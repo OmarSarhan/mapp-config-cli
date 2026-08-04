@@ -1795,6 +1795,7 @@ class SemanticCliTests(unittest.TestCase):
                 "catalogRevision": 7,
                 "derivedProfiles": [],
                 "deliveryBlockers": [blocker],
+                "deliveryBlockersMore": True,
             },
         )
 
@@ -1835,6 +1836,7 @@ class SemanticCliTests(unittest.TestCase):
         self.assertEqual(0, listed[0], listed[2])
         self.assertIn("dropped_stops", listed[1])
         self.assertIn("deliveryBlockers", listed[1])
+        self.assertIn("deliveryBlockersMore", listed[1])
         self.assertEqual(0, repair_result[0], repair_result[2])
         self.assertEqual(
             "pending_archive",
@@ -1856,7 +1858,9 @@ class SemanticCliTests(unittest.TestCase):
         missing = dict(valid)
         missing.pop("eventId")
         invalid = (
+            {"deliveryBlockersMore": True},
             {"deliveryBlockers": {}},
+            {"deliveryBlockers": [], "deliveryBlockersMore": "true"},
             {"deliveryBlockers": [missing]},
             {"deliveryBlockers": [{**valid, "unexpected": True}]},
             {

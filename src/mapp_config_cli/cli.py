@@ -2010,6 +2010,15 @@ def _semantic_delivery_blockers(
     *,
     label: str,
 ) -> list[dict[str, Any]]:
+    if "deliveryBlockersMore" in data and (
+        not isinstance(data["deliveryBlockersMore"], bool)
+        or "deliveryBlockers" not in data
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="semantic.invalid_response",
+        )
     if "deliveryBlockers" not in data:
         return []
     blockers = data["deliveryBlockers"]
