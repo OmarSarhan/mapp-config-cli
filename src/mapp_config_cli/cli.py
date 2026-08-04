@@ -79,6 +79,13 @@ MAX_VISUAL_ARTIFACT_TOTAL_BYTES = 64 * 1024 * 1024
 _LOCAL_READ_CHUNK_BYTES = 64 * 1024
 
 
+def _posix_fchmod(descriptor: int, mode: int) -> None:
+    fchmod = getattr(os, "fchmod", None)
+    if os.name != "posix" or fchmod is None:
+        raise OSError("secure descriptor permissions require POSIX fchmod")
+    fchmod(descriptor, mode)
+
+
 class JsonArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
         raise CliError(message, EXIT_USAGE, error_code="usage.invalid_arguments")
@@ -984,7 +991,7 @@ def write_private_output(path: str, content: str) -> None:
     )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            os.fchmod(stream.fileno(), 0o600)
+            _posix_fchmod(stream.fileno(), 0o600)
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
@@ -3637,7 +3644,7 @@ def _open_artifact_root(destination: str) -> tuple[Path, int | None]:
                     _artifact_directory_flags(),
                     dir_fd=descriptor,
                 )
-                os.fchmod(child, 0o700)
+                _posix_fchmod(child, 0o700)
             os.close(descriptor)
             descriptor = child
         return root, descriptor
@@ -3668,7 +3675,7 @@ def _open_artifact_parent(root_descriptor: int, parts: list[str]) -> int:
                     _artifact_directory_flags(),
                     dir_fd=descriptor,
                 )
-                os.fchmod(child, 0o700)
+                _posix_fchmod(child, 0o700)
             os.close(descriptor)
             descriptor = child
         return descriptor
@@ -3709,7 +3716,7 @@ def _write_artifact_descriptor(
             break
         if descriptor < 0:
             raise OSError("unable to allocate a unique artifact temporary file")
-        os.fchmod(descriptor, 0o600)
+        _posix_fchmod(descriptor, 0o600)
         remaining = memoryview(body)
         while remaining:
             written = os.write(descriptor, remaining)

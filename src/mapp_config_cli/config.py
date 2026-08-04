@@ -50,6 +50,13 @@ MAX_CONFIG_FILE_BYTES = 128 * 1024 * 1024
 _PROFILE_UNCHECKED = object()
 
 
+def _posix_fchmod(descriptor: int, mode: int) -> None:
+    fchmod = getattr(os, "fchmod", None)
+    if os.name != "posix" or fchmod is None:
+        raise OSError("secure descriptor permissions require POSIX fchmod")
+    fchmod(descriptor, mode)
+
+
 def config_home() -> Path:
     explicit = os.environ.get("CONFIG_CLI_HOME")
     if explicit:
@@ -530,7 +537,7 @@ class ConfigStore:
                 suffix=".tmp",
                 dir=self.root,
             )
-            os.fchmod(descriptor, 0o600)
+            _posix_fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 descriptor = -1
                 json.dump(data, stream, indent=2, ensure_ascii=False)
