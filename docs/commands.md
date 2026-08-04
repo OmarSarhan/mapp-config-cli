@@ -23,10 +23,12 @@ config-cli \
 `--version` prints the installed client version. For commands after
 initialization, `--token-file` supplies a mode-`0600` token file for that
 invocation instead of the stored credential. During `init`, the token is
-copied into the CLI's private credential store. `--timeout` sets the request
-timeout and defaults to 60 seconds.
+copied into the CLI's private credential store. Token files must be regular,
+non-symlink files no larger than 64 KiB. `--timeout` sets the request timeout
+and defaults to 60 seconds.
 JSON remains the stable default. `--output human` provides a concise view for
-`doctor`, `proposals check`, and `proposals create`; other commands retain JSON.
+`doctor`, `proposals check`, `proposals create`, and semantic table/field
+generation; other commands retain JSON.
 `--input` merges a bounded JSON object into supported request-producing
 commands; conflicts with explicit flags fail closed. Use `-` for stdin.
 Credential-like keys are rejected. `--extract` selects one scalar from the
@@ -37,7 +39,12 @@ regular non-symlink file. Keys containing `authorization`, `credential`,
 `password`, `secret`, or `token` are rejected recursively. Input merging occurs
 after command-line parsing: it can add request fields, but it does not satisfy
 required parser arguments such as `--base-revision`, `--set`, `--layer`, or
-`--expression`.
+`--expression`. For `semantic proposals check`, a supplied `operations` array
+may replace `--set`/`--unset`; `--asset-id` and `--base-version` remain
+required.
+
+The same regular-file, no-symlink, and 5 MiB local-read boundary applies to
+`validate --file` candidates and derived-layer `--query-file` SQL.
 
 Extraction accepts dot-separated object keys and numeric list indices, with an
 optional `$` or `$.` prefix, for example `revision`,
@@ -47,12 +54,54 @@ parent directories privately where possible and atomically replaces the
 destination with a mode-`0600` file.
 
 Specialized `--output human` rendering is currently provided for `doctor`,
-`proposals check`, and `proposals create`. Other commands retain JSON output
-even when `human` is selected.
+`proposals check`, `proposals create`, `semantic generate table`, and
+`semantic generate field`. Other commands retain JSON output even when
+`human` is selected.
 
 `--input` is supported by `validate`, `sql test`, the dry-run mutation
-commands, live visual commands, proposal check/create, and proposal candidate
-preview commands. Other commands reject it with `input.unsupported`.
+commands, live visual commands, workspace proposal check/create, semantic
+proposal check, and proposal candidate preview commands. Other commands reject
+it with `input.unsupported`.
+
+## Runtime command and API map
+
+The connected platform, not this document, is authoritative. The CLI reads the
+exact command set from `GET /api/contract` and action schemas from
+`GET /api/capabilities`. It fails with `capability.missing` when the required
+command or compatibility marker is absent; a related action ID or a known URL
+is not permission to bypass that gate.
+
+| CLI family | Server API | Advertised action | Scope |
+| --- | --- | --- | --- |
+| `setup`, `init`, `auth replace` | Public identity plus authenticated contract/connect; setup finishes with `describe` | Client-side bootstrap/profile operation | A valid token can initialize/replace; setup's final workspace check needs `inspect` |
+| `profiles *`, `completion` | None | Local-only command | None |
+| `doctor` | Identity/contract/auth plus conditional workspace/semantic reads | Client-side diagnostic; intentionally not capability-gated | Depends on checks supported by the target and granted to the credential |
+| `describe`, `schema`, `rules`, `examples`, `explain-error` | Identity, contract/connect, workspace, and guidance reads | Command-advertised read | `inspect` after unauthenticated public identity |
+| `capabilities list\|show` | `/api/capabilities` | Returns `actions[]` | Any authenticated credential, including a semantic-only token |
+| `plugins list\|show\|validate\|usage` | `/api/plugins` | Command-advertised read | `inspect` |
+| `workspace get`, `layers list\|get\|style-elements\|filters`, `catalog list`, `icons list`, `sql capabilities` | Corresponding authenticated GET routes | Command-advertised reads; layer commands require the `layers effective` compatibility marker | `inspect` |
+| `validate` | `/api/validate` | Command-advertised non-saving validation | Legacy `full` or administrator session |
+| `set`, `unset`, `amend` | `/api/mutate` with `save: false` | Command-advertised dry run | Legacy `full` or administrator session |
+| `sql test` | `/api/sql/test` | Command-advertised bounded probe | Legacy `full` or administrator session |
+| `derived-layers capabilities\|list\|show\|map-extent` | `/api/derived-layers/*` GET routes | `derived-layers.map-extent` for the preview | `inspect` |
+| `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also need `semantic:inspect` |
+| `proposals check\|create` | Workspace proposal routes | `proposals.check`, `proposals.create` | `propose` |
+| `proposals list\|show` | Workspace proposal GET routes | Command-advertised reads | `inspect` |
+| `proposals decline` | Workspace proposal decline route | Command-advertised lifecycle operation | `propose` |
+| `proposals apply` | Workspace proposal apply route | `proposals.apply` | `apply` |
+| `visual-plan`, `visual-test`, `screenshot` | `/api/visual-plan`, `/api/visual-test` | `visual.plan`, `visual.test`, `visual.screenshot` | `visual` |
+| `proposals preview-plan\|preview-test\|preview-screenshot` | Proposal-bound visual routes | `proposals.preview-plan`, `proposals.preview-test`, `proposals.preview-screenshot` | `visual` |
+| `xyz status\|reload` (`reload-xyz` alias) | `/api/xyz/status`, `/api/xyz/reload` | `xyz.reload` for reload | `inspect` or `reload` |
+| `operations show\|wait` | `/api/operations/{operationId}` | Originating operation kind | Same `visual`, `apply`, `reload`, or `derive` scope |
+| `auth status\|device` | Auth identity and device start/poll routes | Command-advertised auth flow | Any authenticated credential for status; device verifies the current target before unauthenticated start/poll |
+| `semantic *` | `/api/semantic/*` | Matching `semantic.*` action | See [Semantic metadata](#semantic-metadata) |
+
+`/api/auth/login`, `/api/auth/logout`, and the password, token,
+device-approval, and audit routes under `/api/admin/*` are dashboard-only
+administrator-session surfaces, not CLI commands. Neither are direct workspace
+saves or private semantic-service, browser-runner, preview, and XYZ
+reload-channel interfaces. Dry-run `set`, `unset`, and `amend` use only the
+configuration API's non-saving validation path; remote writes use proposals.
 
 ## Connection and profiles
 
@@ -148,8 +197,9 @@ config-cli --profile production describe
 ```
 
 The result includes the profile, endpoint, instance ID, workspace key, current
-revision, API version, contract version, XYZ version, and compatibility
-status. Run this before planning any change.
+revision, semantic readiness and catalog revision when advertised, API
+version, contract version, XYZ version, and compatibility status. Run this
+before planning any change.
 
 ### `doctor`
 
@@ -161,7 +211,8 @@ config-cli --profile production doctor
 
 The result covers credential availability without revealing it, private state
 permissions, target identity and compatibility, authentication/scopes,
-workspace access, and advertised SQL and visual capabilities.
+workspace access, semantic readiness, and advertised SQL, visual, and semantic
+capabilities.
 Failures include a machine-readable remediation action.
 
 ### `auth status`
@@ -192,13 +243,31 @@ Replace the selected profile credential with a browser-approved scoped token:
 ```sh
 config-cli auth device
 config-cli auth device --scope inspect --scope propose --scope visual
+config-cli auth device --scope derive
+config-cli auth device --scope semantic:inspect
+config-cli auth device --scope semantic:inspect --scope semantic:source
+config-cli auth device --scope semantic:inspect --scope semantic:generate
+config-cli auth device --scope semantic:inspect --scope semantic:generate \
+  --scope semantic:data
 config-cli auth device --no-browser
 ```
 
-The default omits `apply` and `reload`. The device code expires after ten
-minutes, the token after thirty days, and the token response is one-time. The
-old credential remains selected until the new credential verifies the same
-instance and compatible contract. Use `--no-browser` on a headless or remote
+Without an explicit `--scope`, the CLI requests the server contract's
+advertised safe defaults. The current platform advertises `inspect`,
+`propose`, `visual`, and `semantic:inspect`; a legacy 1.0 server without
+semantic support falls back to `inspect`, `propose`, and `visual`. Malformed,
+unsupported, unknown, or elevated advertised defaults are rejected.
+Workspace apply/reload, `derive`, and the elevated `semantic:source`,
+`semantic:propose`, `semantic:generate`, `semantic:data`, `semantic:apply`, and
+`semantic:admin` scopes remain explicit grants. Semantic generation also
+requires `semantic:inspect`; it is
+not included in the safe default device authority because it sends authorized
+metadata to an external model. The
+device code expires after ten minutes, the token after thirty days, and the
+token response is one-time. The start response, issued credential record, and
+authenticated identity must each report exactly the requested scope set. The
+old credential remains selected unless all checks verify the same instance,
+compatible contract, and authority. Use `--no-browser` on a headless or remote
 terminal to print the verification flow without attempting to open a local
 browser.
 
@@ -224,8 +293,12 @@ config-cli operations wait OPERATION_ID --wait-timeout 120 --interval 1
 ```
 
 Terminal states are `succeeded`, `failed`, and `indeterminate`. Never blindly
-retry an indeterminate apply or reload. `operations wait` defaults to a
-120-second wait timeout and a one-second polling interval.
+retry an indeterminate apply or reload. Background derived-layer create,
+replace, and refresh jobs are also durable operations and require `derive` to
+inspect. A late derived-layer reporting failure may follow a committed database
+transaction, so reconcile the operation, managed-layer registry, and catalog
+before retrying. `operations wait` defaults to a 120-second wait timeout and a
+one-second polling interval.
 
 ### `completion`
 
@@ -265,6 +338,17 @@ executing it; XYZ fetches it on first use in a reloaded generation. Proposal
 evidence must therefore include post-apply reload status and an appropriate
 functional or visual test rather than treating schema validation as proof that
 the source loaded or its SQL/module ran.
+
+### Advanced workspace setup
+
+Advanced configuration is optional: an absent `templates` object or an empty
+advanced locale object means it has not been configured. It is not an API
+read error. Place named query/composition definitions in top-level
+`templates`; use `locale.keyvalue_dictionary` or `layer.keyvalue_dictionary`
+for recursive replacements; configure a gazetteer at `layer.gazetteer`; and
+inspect `plugins list`, `plugins show KEY`, and `plugins usage KEY` before
+configuring a bundled plugin. The dashboard’s **Advanced workspace
+configuration** guide provides the same mapping.
 
 ### `rules`
 
@@ -580,7 +664,28 @@ materialized view in its fixed `derived_layers` schema:
 config-cli derived-layers capabilities
 config-cli derived-layers list
 config-cli derived-layers show paths_h3_r9
+config-cli derived-layers map-extent
+config-cli derived-layers map-extent --locale Leeds
 ```
+
+Choose a PostgreSQL-safe managed relation name before writing the query. It
+must start with `a-z`, then contain only lowercase `a-z`, `0-9`, or `_`, and
+must be no longer than 63 characters:
+`^[a-z][a-z0-9_]{0,62}$`. The `--id-column` and `--geometry-column` values use
+the same rule. Prefer a name such as `road_lengths_h3_r9`; do not use spaces,
+hyphens, dots, uppercase, or quoted mixed-case names. The server always uses
+the fixed `derived_layers` schema and safely quotes these identifiers.
+
+For agent-driven work, start with `semantic catalog search` and
+`semantic catalog show` rather than guessing a relation, field, geometry, or
+unit. Every declared `--source` must already have a ready PostgreSQL semantic
+profile, so an unprofiled source is rejected by the server. If no suitable
+profile exists, discover only authorized candidates with `semantic source
+relations`, then explicitly register the selected relation with `semantic
+source sync ... --confirm` and inspect the resulting generated profile before
+writing the derived SQL. This applies to table and view relations only;
+PostgreSQL, PostGIS, and H3 functions used inside the query do not need
+semantic profiles.
 
 Put the query in a file so shell parsing cannot change it:
 
@@ -592,6 +697,104 @@ config-cli derived-layers create paths_h3_r9 \
   --id-column h3_id \
   --geometry-column geom_3857
 ```
+
+Every create or replace uses a fixed, bounded spatial scope around the selected
+locale's configured map centre. The server uses a 1920x1080 planning viewport
+at one zoom level wider than the configured view (`max(0, z-1)`, clamped at
+zoom 0) and wraps the submitted query with an exact intersection filter.
+`--map-extent` remains accepted for compatibility with older automation but
+does not change this mandatory behavior:
+
+```sh
+config-cli derived-layers map-extent --locale Leeds
+config-cli derived-layers create paths_h3_r9 \
+  --kind materialized \
+  --query-file paths-h3-r9.sql \
+  --source leeds.definitive_paths \
+  --id-column h3_id \
+  --geometry-column geom_3857 \
+  --locale Leeds
+```
+
+Preview the resolved envelope before the mutation. The filter selects complete
+output features whose geometry intersects the envelope; it does not clip their
+geometry. The saved envelope does not follow later map pans, zooms, viewport
+sizes, or workspace view changes. Use `derived-layers replace ... --locale ...
+--confirm` to resolve and save a new scope. Ordinary views still track
+source-row changes within that fixed scope; materialized views update on
+refresh; refresh does not recalculate the envelope. Replace always submits a
+new server-resolved scope, and omitting the compatibility flag cannot clear it.
+
+The automatic wrapper filters final output rows only. It is not an RLS or
+security boundary, and it does not make upstream aggregates, window values,
+limits, or computation map-scoped. When a metric itself must describe the map
+area, apply the previewed envelope inside the source-side SQL before
+aggregation. Doing this as early as practical also avoids an otherwise
+unbounded source calculation. Semantic catalog profiles remain authoritative
+for relation and field meaning; the spatial option is not permission to guess
+either. The preview and returned `derivedLayer.spatialScope` contain the
+server-resolved plan; retain that object in an agent's review/evidence packet.
+Background create or replace returns and validates the same resolved plan when
+the durable operation completes.
+
+A per-cell point count and its denominator can intentionally have different
+scopes. For “portion of all points in each cell,” count intersections per cell
+but calculate the denominator from the complete declared point relation. Use a
+map-filtered denominator only when “all” explicitly means all points within the
+saved map area; neither the wrapper nor a size probe samples that denominator.
+
+`derived-layers capabilities` advertises `queryGuard` for every layer kind.
+On API/contract 1.3 it includes ordered AST/catalog/EXPLAIN `stages`,
+`shapeLimits`, plan `limits`, H3 bounds, and the stable `errorCategories`
+mapping; the CLI validates that closed shape while still accepting the earlier
+compatible 1.x guard shape.
+Before any create or replacement, and before a materialized refresh, the server
+runs non-writing PostgreSQL `EXPLAIN` over the exact scoped query and recursively
+checks total cost, final and intermediate rows, intermediate bytes, join
+expansion, plan size/depth, planned workers, and recursion. It first rejects
+obviously explosive SQL shapes, sleep/session/advisory-lock functions, and
+unprovable H3 or generated-row expansion.
+Successful mutations return `derivedLayer.queryPlanProbe`; preserve it in the
+review packet. Guard failures use distinct codes:
+
+| Code | Status/category | What the user should correct |
+| --- | --- | --- |
+| `derived_layer.query_invalid` | HTTP 400 / `invalid` | Fix malformed SQL or submit exactly one parseable `SELECT` statement. |
+| `derived_layer.query_not_allowed` | HTTP 422 / `policy` | Remove or replace the prohibited SQL/catalog dependency, following each reason's `suggestedAction`. |
+| `derived_layer.query_too_expensive` | HTTP 409 / `compute` | Reduce SQL/H3 expansion, join fan-out, recursion, or intermediate planner work. |
+
+All three block both kinds and have no `recommendedKind`; never offer a view as
+an escape. The structured response includes `operation`, reason-specific
+actions, and, when known, `stateUnchanged: true` plus an operation-specific
+`safeState`. Present those fields instead of a generic cost or H3 message, and
+keep `technicalDetail` in optional diagnostics only.
+For `derived_layer.database_error`, that optional object is limited to bounded
+`sqlstate` and primary `message` fields; it never contains the SQL, PostgreSQL
+context, detail, or hint.
+A `derived_layer.source_mismatch` response separately exposes
+`declaredSources`, `resolvedSources`, `missingSources`, and `extraSources`; make
+those two lists match instead of treating the failure as query cost.
+
+Capabilities separately advertise `materializationGuard`. For a materialized
+create, view-to-materialized replacement, or refresh, the same plan estimates
+storage from planned rows and row width, adds the advertised row overhead and
+safety multiplier, and blocks estimates above `maxEstimatedBytes` (currently
+1 GiB). This is a planner estimate, not a row sample or a guarantee of final
+on-disk size. Successful materialized mutations also return
+`derivedLayer.materializationProbe` for review.
+
+An oversized stored result returns `derived_layer.materialization_too_large`,
+`blocked: true`, `recommendedKind: "view"`, and the closed `probe`. With
+`probeStage: "estimate"`, no materialized DDL or refresh started. With
+`probeStage: "actual"`, population and indexing happened inside the transaction
+before the measured result exceeded the limit; `rolledBack: true` confirms the
+transaction was rolled back, but not that it avoided transient table, index,
+TOAST, or WAL growth. Preserve the operation-specific `safeState` and ask
+before changing the requested kind. An ordinary view stores no result rows and
+is the offered fallback only after the computation probe passes; it moves query
+cost to reads and is not an automatic equivalent. For refresh, the corrective
+choice is to convert the existing layer or reduce its output, not create a
+duplicate layer.
 
 Use `--kind materialized` for a stored result. Refresh and drop are explicit
 confirmed database actions:
@@ -630,13 +833,30 @@ These mutations require the separately granted `derive` scope. Creation does
 not add an XYZ workspace layer. Inspect the refreshed catalog, then use the
 normal revision-bound proposal workflow to add the new relation. The CLI
 forwards definitions to the server and never receives database credentials.
+Every response preserves the server's `semanticProfile` readiness record.
+Do not propose a new workspace reference until its status is `ready`; inspect
+other states with the semantic commands below. `repair` is not a general state
+transition: it only requeues the unchanged retained event for a
+`repair_required` profile. Correct deterministic failures before requeueing or
+the same rejection will recur.
 
-H3-derived relations should make their spatial semantics explicit. For
-"touches any source feature" workflows, use H3 cell generation to find
-candidates and then filter the generated cell polygons with a reviewed exact
-predicate, such as `ST_Intersects`, against the original geometry. Use the H3
-containment strings accepted by the connected database extension; do not guess
-short aliases.
+H3-derived relations should make their spatial semantics explicit. Generate
+polygon candidates directly from the server-supplied
+`_mapp_h3_scope.geom_4326` using a literal resolution. The server estimates the
+resulting scope cells and rejects unsafe or dynamic expansion; it also requires
+literal bounded distances for grid disk/ring traversal. Non-expanding H3 index,
+parent, and boundary operations and provable one-level child expansion remain
+available for legitimate aggregation. Arbitrary child targets, uncompact, and
+grid-path expansion are not admitted. Polygon cells, disk/ring maxima, and
+one-level children are multiplied conservatively and must remain within the
+advertised 10,000,000 combined-cell bound. The general PostgreSQL plan budget
+still applies.
+
+For "touches any source feature" workflows, use those map-bounded cells as
+candidates and then filter or aggregate their generated polygons with a
+reviewed exact predicate, such as `ST_Intersects`, against the complete original
+relation. Do not sample source rows when a layer-level average, sum, window, or
+other value must use the complete declared input.
 
 Some H3/PostGIS convenience wrappers assume a broader PostgreSQL search path
 than the derived-layer runner provides. Errors such as unresolved `geometry`
@@ -655,6 +875,14 @@ operation and polls it automatically. Background mode accepts
 Reaching the local wait timeout does not cancel database work; continue with
 the operation ID from the structured error using
 `config-cli operations wait OPERATION_ID`.
+
+When a durable query or size guard rejects the work, the server stores the same
+structured envelope under `operation.error`. The CLI uses its safe
+`userMessage` and `derived_layer.*` code as the primary error and preserves its
+`suggestedAction`, reasons, probe, and state fields under `details`. An
+unexpected `derived_layer.operation_failed` is reported as `indeterminate` and
+has no unchanged-state claim; inspect the operation, managed layer, and catalog
+before retrying.
 
 Do not blindly resend a synchronous request after a client timeout or HTTP
 `5xx`: it may have committed. Inspect `derived-layers list`,
@@ -683,15 +911,251 @@ append units. To show `1,250 m`, expose a text field from an authorized managed
 view while preserving the numeric length field used by a graduated theme. For
 example, use `to_char(round(length_metres)::bigint,
 'FM999,999,999,990') || ' m'`, with an explicit null branch when nulls must stay
-null. The standard visual runner validates that the layer renders but does not
-reliably trigger hover, so tooltip formatting remains a disclosed evidence gap
-unless manually observed.
+null. Live and candidate visual tests automatically exercise configured hover.
+Use `--hover` to require it and repeated `--expect-hover-text` assertions for
+the formatted value; count it as evidence only when the report says hover was
+attempted, opened, and passed and includes the dedicated tooltip artifact.
 
 For MVT configuration on XYZ v4.23.4, use `"3857"` rather than numeric `3857`
 for `srid`; the schema accepts both, but the browser runtime may warn and fail
 to bind the numeric form. An empty `infoj` removes feature fields but can still
 leave an empty information-panel shell on click, so it is not sufficient proof
 that a layer is completely non-clickable.
+
+## Semantic metadata
+
+Semantic reads require `semantic:inspect` and return the authoritative
+`catalogRevision`:
+
+```sh
+config-cli semantic status
+config-cli semantic catalog export
+config-cli semantic catalog search "bus stops" --limit 20
+config-cli semantic catalog show ASSET_ID
+config-cli semantic catalog history ASSET_ID
+config-cli semantic catalog archive ASSET_ID --confirm
+config-cli semantic derived-profiles list
+config-cli semantic derived-profiles show DERIVED_LAYER_NAME
+```
+
+`catalog show` returns the complete generated profile for that asset, including
+its binding, relation facts, ordered fields, types, and stable field IDs, plus
+the separately curated table annotation and field annotations. Search results
+are discovery hints; use `catalog show` and its canonical asset ID, version,
+provenance, and revision as evidence. These semantic commands consume API JSON;
+they do not connect to PostgreSQL or return table rows. `catalog list` is a
+separate workspace-configuration catalog and is not a substitute for reviewed
+semantic meaning.
+
+The semantic command-to-contract mapping is:
+
+| CLI command | Capability action | API route | Required narrow scopes |
+| --- | --- | --- | --- |
+| `semantic status` | `semantic.status` | `GET /api/semantic/status` | `semantic:inspect` |
+| `semantic catalog export` | `semantic.catalog.export` | `GET /api/semantic/catalog` | `semantic:inspect` |
+| `semantic catalog search` | `semantic.catalog.search` | `GET /api/semantic/catalog/search` | `semantic:inspect` |
+| `semantic catalog show` | `semantic.catalog.show` | `GET /api/semantic/catalog/objects/{assetId}` | `semantic:inspect`; add `semantic:admin` for an exact archived ID |
+| `semantic catalog history` | `semantic.catalog.history` | `GET /api/semantic/catalog/objects/{assetId}/history` | `semantic:inspect`; add `semantic:admin` for an exact archived ID |
+| `semantic catalog archive` | `semantic.catalog.archive` | `POST /api/semantic/catalog/objects/{assetId}/archive` | `semantic:inspect` + `semantic:admin` |
+| `semantic source relations` | `semantic.source.relations` | `GET /api/semantic/source/relations` | `semantic:inspect` + `semantic:source` |
+| `semantic source sync` | `semantic.source.sync` | `POST /api/semantic/source/sync` | `semantic:inspect` + `semantic:source` |
+| `semantic source archive-excluded` | `semantic.source.archive-excluded` | `POST /api/semantic/source/archive-excluded` | `semantic:inspect` + `semantic:admin` |
+| `semantic generate table\|field` | `semantic.generate` | `POST /api/semantic/generate` | `semantic:inspect` + `semantic:generate`; add `semantic:data` for either context flag |
+| `semantic derived-profiles list\|show` | `semantic.derived-profiles.list\|show` | `GET /api/semantic/derived-profiles[/{name}]` | `semantic:inspect`; `semantic:admin` adds delivery diagnostics |
+| `semantic derived-profiles repair` | `semantic.derived-profiles.repair` | `POST /api/semantic/derived-profiles/{name}/repair` | `semantic:admin` (`semantic:inspect` is additionally needed to discover/inspect the profile) |
+| `semantic proposals list\|show` | `semantic.proposals.list\|show` | `GET /api/semantic/proposals[/{proposalId}]` | `semantic:inspect` |
+| `semantic proposals check\|create\|decline` | matching `semantic.proposals.*` action | matching semantic proposal `POST` route | `semantic:propose` |
+| `semantic proposals apply` | `semantic.proposals.apply` | `POST /api/semantic/proposals/{proposalId}/apply` | `semantic:apply` |
+
+The exact action and CLI command must be advertised by the connected server;
+a similar route is not a compatibility substitute. A legacy `full` token or
+dashboard administrator is handled by the server separately from these narrow
+scope combinations. `schemaVersion` identifies the semantic data shape, while
+`catalogRevision` identifies a whole-catalog snapshot; neither is the asset
+`version` used as a proposal's `baseVersion`.
+
+Tokens with both `semantic:inspect` and the separate `semantic:source` scope
+can discover source relations and explicitly synchronize one relation into
+generated semantic metadata:
+
+```sh
+config-cli semantic source relations
+config-cli semantic source sync \
+  --alias DATABASE_ALIAS \
+  --schema SCHEMA \
+  --relation RELATION \
+  --confirm
+config-cli semantic source archive-excluded --confirm
+```
+
+Discovery returns the relation kind and deterministic asset ID for configured
+database relations, but no columns or rows. Internal underscore-prefixed
+relations are never returned or accepted as semantic sources. Operators can
+also configure named exclusions with `SEMANTIC_SOURCE_EXCLUSIONS`, using the
+same `ALIAS:schema.relation` or `ALIAS:schema.*` selector form as the source
+allowlist. This is deployment configuration rather than a hard-coded table
+list; the bundled platform example uses
+`MAPP:leeds.census_datasets`. It blocks future discovery and synchronization
+but does not retroactively hide a profile registered before the setting
+changed.
+Synchronization sends exactly the
+alias/schema/relation identity to the server, which performs the authoritative
+schema inspection; it does not accept SQL or upload row data. The operation
+registers a missing source asset or refreshes its generated schema facts while
+preserving curated meaning. If the schema definition digest has not changed,
+the server returns `unchanged` and does not advance the catalog. Review the
+returned operation, canonical asset, version, and catalog revision before
+using `semantic generate`. The local
+`--confirm` guard is required because synchronization changes the semantic
+catalog; it is not sent as an extra API property.
+
+`archive-excluded` requires `semantic:inspect` and `semantic:admin`. It
+archives every ready source asset matching the server's configured
+`SEMANTIC_SOURCE_EXCLUSIONS`, retaining immutable history while removing it
+from normal semantic discovery. `semantic catalog archive ASSET_ID --confirm`
+uses the same scopes to archive one selected ready profile. Neither action
+changes the database relation or its rows. Retain the asset IDs before
+archiving: catalog export, search, and derived-profile collections omit
+archived assets even for administrators, while an exact `catalog show` or
+`catalog history` remains available by ID only with both scopes. Ordinary
+exact reads return `404`, and removing an exclusion does not unarchive the
+tombstone.
+
+An explicitly authorized caller can ask Gemini for a review-only draft for an
+entire table or one stable field ID. Generation is metadata-only unless one of
+the optional data-context flags is supplied:
+
+```sh
+config-cli semantic generate table ASSET_ID
+config-cli semantic generate field ASSET_ID FIELD_ID
+config-cli semantic generate table ASSET_ID --sample-rows
+config-cli semantic generate field ASSET_ID FIELD_ID --statistics
+config-cli semantic generate table ASSET_ID --sample-rows --statistics
+```
+
+Generation requires both `semantic:inspect` and `semantic:generate`. The server
+sends only semantic/schema metadata the caller is already allowed to inspect
+when neither flag is present. `--sample-rows` explicitly allows raw values from
+a bounded 5% sample to leave MAPP for Gemini. `--statistics` allows relevant
+server-calculated table or target-column statistics to be sent, without
+including raw sampled values unless `--sample-rows` is also present. Either
+option additionally requires `semantic:data`. The current percentage, maximum
+rows, maximum serialized bytes, availability, and required scope are owned by
+the server and advertised by `semantic status`; the CLI does not silently
+increase those limits. On the current platform the sample caps are 100 rows,
+96 KiB, 20 eligible table columns, and 512 characters per serialized value;
+geometry and binary values are omitted. Field statistics use at most 1,000
+rows selected from a 5% sample. The status response remains authoritative for
+another deployment. The server never exposes its Gemini key or raw database
+credentials. A field must belong to the selected asset and an archived or
+hidden asset remains unavailable according to the caller's normal catalog
+permissions.
+
+The response binds `draft.assetId` and `draft.baseVersion`, identifies the
+exact table/field target and Gemini model, and contains curated-only
+`draft.operations`. `generation.metadataOnly` is true only when neither
+optional context was selected; `generation.contextOptions` reports the exact
+`sampleRows` and `statistics` booleans used. `generation.proposalCreated`
+remains false. The CLI makes one generation
+request and does not automatically retry provider failures. It never checks,
+creates, or applies a proposal. Table and field drafts contain one to four
+individual `set` operations for `displayName`, `description`, `tags`, and
+`caveats`; values already identical to curated metadata are omitted. A fully
+identical result returns `semantic.generation_no_change` instead of an empty
+draft. Review the text, tags, caveats, exact JSON Pointer paths, reported
+context options, and existing curated values before copying `draft.operations`
+and `draft.explanation` into an explicit check:
+
+In the dashboard, up to ten stable field IDs can be selected together. The
+dashboard makes one field-scoped generation request for each selected ID and
+submits those requests concurrently, reports completed/total progress, and
+preserves selected field order in the combined non-overlapping operations. It
+publishes no partial draft if any request fails and still creates no proposal
+automatically. One CLI invocation targets one table or one field; the CLI does
+not silently fan out a batch.
+
+```sh
+config-cli semantic proposals check \
+  --asset-id ASSET_ID \
+  --base-version DRAFT_BASE_VERSION \
+  --input REVIEWED_OPERATIONS_JSON
+```
+
+`REVIEWED_OPERATIONS_JSON` is an object containing only the reviewed
+`operations` array and optional `explanation`; do not pass the complete
+generation response as proposal input. Continue with `proposals create` only
+from the successful check fingerprint, then wait for separate approval before
+apply. If the asset version changed, discard the draft and generate or inspect
+again rather than silently rebasing it.
+
+Users with `derive` cause the generated profile to be registered as part of
+the managed derived-layer lifecycle, but that does not grant general semantic
+editing. After investigating and correcting the delivery failure, a
+`semantic:admin` caller may requeue a retained `repair_required` event:
+
+```sh
+config-cli semantic derived-profiles repair DERIVED_LAYER_NAME --confirm
+```
+
+The command requeues the exact retained event; it does not regenerate or edit
+its payload. A deterministic validation or payload failure must be corrected
+first, otherwise the same failure will recur.
+For administrators, `derived-profiles list` also returns
+`deliveryBlockers`. This includes retained archive failures whose derived
+relation has already been dropped, so they have no ordinary derived-profile
+row. Use the blocker `name` with the same repair command; a requeued archive
+reports `pending_archive`.
+
+Curated metadata changes use their own checked proposal domain:
+
+```sh
+config-cli semantic proposals check \
+  --asset-id ASSET_ID \
+  --base-version ASSET_VERSION \
+  --set '/curated/description="Reviewed business meaning"' \
+  --explanation 'Clarifies the meaning of this derived asset.'
+config-cli semantic proposals create --from-check CHECK_FINGERPRINT
+config-cli semantic proposals list
+config-cli semantic proposals show SEMANTIC_PROPOSAL_ID
+config-cli semantic proposals apply SEMANTIC_PROPOSAL_ID --confirm
+config-cli semantic proposals decline SEMANTIC_PROPOSAL_ID \
+  --reason 'Superseded' --confirm
+```
+
+To remove only reviewed semantic wording while keeping the generated profile
+and database data, use a focused `--unset`, for example:
+
+```sh
+config-cli semantic proposals check \
+  --asset-id ASSET_ID \
+  --base-version ASSET_VERSION \
+  --unset '/curated/description' \
+  --explanation 'Removes only the saved table description.'
+config-cli semantic proposals check \
+  --asset-id ASSET_ID \
+  --base-version ASSET_VERSION \
+  --unset '/curated/fields/FIELD_ID' \
+  --explanation 'Removes only this field annotation.'
+```
+
+Review and create only one intended check. A narrower field property can be
+unset below `/curated/fields/FIELD_ID/...`. JSON Pointer-escape `/` as `~1`
+and `~` as `~0` in an ID or property. These operations cannot remove generated
+relation or column facts; a trusted source refresh owns those facts. Use the
+administrator archive command only when the whole semantic profile should
+leave normal discovery.
+
+Only `/curated` JSON Pointers are accepted locally; generated bindings,
+columns, types, and provenance remain lifecycle-owned. JSON input accepts one
+to 100 closed operation objects: `set` has exactly `op`, `path`, and `value`;
+`unset` has exactly `op` and `path`. Paths use strict RFC 6901 escaping, cannot
+repeat, and cannot contain empty keys. A root `set` requires an object and the
+root cannot be unset. Semantic and workspace check fingerprints are namespaced
+and cannot be reused across domains. Creation and application require
+`semantic:propose` and `semantic:apply` respectively. The original request is
+not approval to apply. A timeout, HTTP `5xx`, or malformed/inconsistent
+successful apply response is indeterminate: do not retry automatically;
+inspect the proposal and asset version first.
 
 ## Dry-run mutation validation
 
@@ -885,6 +1349,10 @@ or without an explicit centre. Longitude, latitude, and zoom are validated
 before the request. `--locale` selects a named workspace locale; omit it to use
 the top-level default, including when named alternatives exist. A missing raw
 default resolves to XYZ's synthetic empty locale, not a sole named alternative.
+Supplying longitude, latitude, and zoom together also bypasses database-wide
+feature-count, extent, and representative-feature planning. The browser uses
+the exact map centre, so hover or clicked-feature evidence still proves whether
+the requested location contains the expected feature.
 
 ### `visual-test`
 
@@ -897,6 +1365,10 @@ config-cli visual-test --layer "Bus Stops" \
   --lng -1.55 --lat 53.81 --zoom 12.5
 config-cli visual-test --layer "Bus Stops" \
   --artifact-dir ./visual-evidence
+config-cli visual-test --layer "Bus Stops" \
+  --hover --expect-hover-text "Stop name"
+config-cli visual-test --layer "Bus Stops" \
+  --expect-info-text "Data source: approved survey"
 ```
 
 Run it after applying a proposal for every changed visual layer. A passing test
@@ -911,15 +1383,36 @@ If the bounded browser runner is already full, the server returns HTTP 429 with
 the plan; the CLI also exits with code `6`, and the read-only visual request
 may be retried after the reported contention clears.
 
+A database failure before the browser starts also exits with code `6`, but has
+no report or artifacts. Inspect the preserved `code`, `planningStage`, and
+`queryPurpose` fields: `visual.planning_timeout` identifies a timed-out
+automatic planning query, while `visual.planning_database_error` identifies
+another read-only planning failure. The server does not return raw SQL or
+driver details. Retry with a complete `--lng`, `--lat`, and `--zoom` view when
+the automatic feature-count/extent path is unnecessary.
+
 Use `--artifact-dir` to fetch returned authenticated artifacts into a local
 directory. The JSON response then includes `localArtifacts`, keyed like the
-server's `visual.artifacts` object, so before/after screenshots can be opened
-directly from the agent workspace.
+server's `visual.artifacts` object, so its report and screenshots can be opened
+directly from the agent workspace. An explicit export requires a non-empty map
+with at most 16 artifacts. Each artifact response is limited to 20 MiB and the
+complete response to 64 MiB. Successful responses are fully downloaded and
+validated before any artifact is written, so a size or transport failure
+cannot leave a partial successful evidence set. These limits are part of the
+client compatibility boundary; servers must stay within them or negotiate a
+future contract revision.
+
+Configured hover is exercised automatically. `--hover` requires it,
+`--no-hover` suppresses it, and repeated `--expect-hover-text` values assert
+tooltip content. Repeated `--expect-info-text` values assert captured
+clicked-feature information. A requested interaction counts as evidence only
+when its dedicated report fields pass and its cropped artifact is present.
 
 A passing test checks HTTP success, canvas presence, the requested layer, and
-browser errors. It does not prove exact colour appearance, pointer interaction,
-information-panel output, emoji/custom-font glyph fidelity, or general
-cartographic quality. Grouped layers may render and interact successfully while
+browser errors. It does not prove exact colour appearance, emoji/custom-font
+glyph fidelity, or general cartographic quality. Hover and clicked-feature
+content are evidence only when their dedicated checks and cropped artifacts
+pass. Grouped layers may render and interact successfully while
 a strict layer-name text assertion fails because the visible drawer text is the
 folder label rather than the child layer name. Use downloaded screenshots,
 returned reports, and manual interaction when those details are acceptance
@@ -949,6 +1442,10 @@ config-cli proposals preview-screenshot PROPOSAL_ID \
   --expect-panel-text "0–500 m"
 config-cli proposals preview-test PROPOSAL_ID --layer "Bus Stops" \
   --artifact-dir ./visual-evidence
+config-cli proposals preview-test PROPOSAL_ID --layer "Bus Stops" \
+  --hover --expect-hover-text "Stop name"
+config-cli proposals preview-screenshot PROPOSAL_ID --layer "Bus Stops" \
+  --expect-info-text "Data source: approved survey"
 ```
 
 All three accept the same optional `--locale`, `--lng`, `--lat`, `--zoom`, and
@@ -975,6 +1472,22 @@ dedicated artifacts such as `beforeFilteringPanel`, `afterFilteringPanel`,
 labels, legend titles, class labels, or other control text to be present. If
 XYZ cannot open the requested drawer, the command exits as a visual evidence
 failure while preserving the page/map/report artifacts that were produced.
+The CLI additionally requires each requested panel's `passed` record and
+dedicated before/after artifact, so an overall page screenshot cannot be
+mistaken for panel evidence.
+
+Configured hover is exercised automatically. `--hover` makes it mandatory,
+`--no-hover` suppresses the automatic check, and repeated
+`--expect-hover-text` values require tooltip content. Hover counts as evidence
+only when it was requested, attempted, opened, passed, and produced the
+dedicated tooltip artifact; the runner's skipped-hover state is not evidence.
+
+Use repeated `--expect-info-text` values for clicked-feature labels or a static
+source note. For a changed `infoj`, the server captures the applicable
+original/candidate side independently—including candidate-only capture for a
+new layer—and requires the expected text and cropped information-panel
+artifact. The CLI exits with code `6` and identifies `missingEvidence` if a
+nominally successful response omits any requested proof.
 
 The default `--view-mode focus` supplies an XYZ `layers` query parameter so the
 requested layer (and relevant group context) is visible in the evidence. Use

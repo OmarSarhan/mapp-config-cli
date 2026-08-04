@@ -24,12 +24,17 @@ from .version import __version__
 
 SUPPORTED_CONTRACT_MAJOR = 1
 SUPPORTED_API_MAJOR = 1
+CONNECT_CONTRACT_MINOR = 3
+MAX_REQUEST_BYTES = 5 * 1024 * 1024
 MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 VERSION_PATTERN = re.compile(
     r"^(?P<major>0|[1-9][0-9]*)"
     r"(?:\.(?:0|[1-9][0-9]*)){0,2}"
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+SERVER_ERROR_CODE_PATTERN = re.compile(
+    r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+"
 )
 
 
@@ -152,6 +157,16 @@ def require_compatible_api(version: Any) -> str:
     return str(version)
 
 
+def _allows_legacy_connection_fallback(contract_version: str) -> bool:
+    release = contract_version.split("-", 1)[0].split("+", 1)[0]
+    components = release.split(".")
+    minor = int(components[1]) if len(components) >= 2 else 0
+    return (
+        int(components[0]) == SUPPORTED_CONTRACT_MAJOR
+        and minor < CONNECT_CONTRACT_MINOR
+    )
+
+
 class RejectRedirects(urllib.request.HTTPRedirectHandler):
     """Return redirect responses as errors without issuing another request."""
 
@@ -202,12 +217,13 @@ def _response_json(body: bytes, *, status: int, content_type: str | None) -> dic
     return value
 
 
-def _read_bounded(stream) -> bytes:
-    body = stream.read(MAX_RESPONSE_BYTES + 1)
-    if len(body) > MAX_RESPONSE_BYTES:
+def _read_bounded(stream, max_bytes: int = MAX_RESPONSE_BYTES) -> bytes:
+    body = stream.read(max_bytes + 1)
+    if len(body) > max_bytes:
         raise CliError(
-            "Configuration service response exceeds the 20 MiB client limit.",
+            "Configuration service response exceeds the client byte limit.",
             EXIT_CONNECTIVITY,
+            details={"maxResponseBytes": max_bytes},
             error_code="api.response_too_large",
         )
     return body
@@ -241,6 +257,15 @@ def _http_exit(status: int, details: Any, failure_code: int | None) -> int:
     if status in {400, 404, 422}:
         return EXIT_VALIDATION
     return EXIT_CONNECTIVITY
+
+
+def _server_error_code(details: Any) -> str | None:
+    if not isinstance(details, dict):
+        return None
+    code = details.get("code")
+    if not isinstance(code, str) or SERVER_ERROR_CODE_PATTERN.fullmatch(code) is None:
+        return None
+    return code
 
 
 class ApiClient:
@@ -289,13 +314,28 @@ class ApiClient:
         body = None
         if payload is not None:
             try:
-                body = json.dumps(payload, allow_nan=False).encode("utf-8")
+                body = json.dumps(
+                    payload,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
             except (TypeError, ValueError) as exc:
                 raise CliError(
                     f"Request payload is not valid JSON: {exc}",
                     EXIT_VALIDATION,
                     error_code="client.invalid_payload",
                 ) from exc
+            if len(body) > MAX_REQUEST_BYTES:
+                raise CliError(
+                    "Request payload exceeds the 5 MiB platform limit.",
+                    EXIT_VALIDATION,
+                    details={
+                        "requestBytes": len(body),
+                        "maxRequestBytes": MAX_REQUEST_BYTES,
+                    },
+                    error_code="client.payload_too_large",
+                )
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
             self.endpoint + path,
@@ -346,19 +386,12 @@ class ApiClient:
                     if isinstance(details, dict) and isinstance(details.get("error"), str)
                     else f"Configuration service returned HTTP {exc.code}."
                 )
-                server_code = (
-                    details.get("code")
-                    if isinstance(details, dict)
-                    and isinstance(details.get("code"), str)
-                    and details["code"].startswith("derived_layer.")
-                    else None
-                )
                 raise CliError(
                     str(_scrub_secret(message, self.token)),
                     _http_exit(exc.code, details, failure_code),
                     details=details,
                     http_status=exc.code,
-                    error_code=server_code or "api.http_error",
+                    error_code=_server_error_code(details) or "api.http_error",
                 ) from exc
             finally:
                 exc.close()
@@ -382,9 +415,18 @@ class ApiClient:
         path: str,
         *,
         authenticated: bool = True,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
     ) -> tuple[bytes, str | None]:
         if not path.startswith("/"):
             raise CliError("API path must start with '/'.", error_code="client.invalid_path")
+        if (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or not 0 < max_response_bytes <= MAX_RESPONSE_BYTES
+        ):
+            raise ValueError(
+                "max_response_bytes must be from 1 to MAX_RESPONSE_BYTES"
+            )
         headers = {
             "Accept": "*/*",
             "User-Agent": f"mapp-config-cli/{__version__}",
@@ -404,10 +446,13 @@ class ApiClient:
         )
         try:
             with self.opener.open(request, timeout=self.timeout) as response:
-                return _read_bounded(response), response.headers.get("Content-Type")
+                return (
+                    _read_bounded(response, max_response_bytes),
+                    response.headers.get("Content-Type"),
+                )
         except urllib.error.HTTPError as exc:
             try:
-                response_body = _read_bounded(exc)
+                response_body = _read_bounded(exc, max_response_bytes)
                 try:
                     details: Any = json.loads(
                         response_body.decode("utf-8"),
@@ -429,7 +474,7 @@ class ApiClient:
                     _http_exit(exc.code, details, None),
                     details=details,
                     http_status=exc.code,
-                    error_code="api.http_error",
+                    error_code=_server_error_code(details) or "api.http_error",
                 ) from exc
             finally:
                 exc.close()
@@ -454,6 +499,7 @@ class VerifiedTarget:
     profile: Profile
     identity: dict[str, Any]
     contract: dict[str, Any]
+    connection: dict[str, Any]
 
     @property
     def live_instance_id(self) -> str:
@@ -506,6 +552,37 @@ def verify_target(client: ApiClient, profile: Profile) -> VerifiedTarget:
             },
             error_code="instance.contract_mismatch",
         )
-    require_compatible_contract(contract.get("contractVersion"))
+    contract_version = require_compatible_contract(contract.get("contractVersion"))
     require_compatible_api(contract.get("apiVersion"))
-    return VerifiedTarget(profile, identity, contract)
+    try:
+        connection = client.request("/api/connect")
+    except CliError as exc:
+        if exc.http_status != 404 or not _allows_legacy_connection_fallback(
+            contract_version
+        ):
+            raise
+        legacy_connection = client.request("/api/auth/me")
+        connection = {
+            "authenticated": True,
+            "actor": legacy_connection.get("actor"),
+            "scopes": legacy_connection.get("scopes"),
+            "expires": legacy_connection.get("expires"),
+        }
+    actor = connection.get("actor")
+    scopes = connection.get("scopes")
+    expires = connection.get("expires")
+    if (
+        connection.get("authenticated") is not True
+        or not isinstance(actor, str)
+        or not actor
+        or not isinstance(scopes, list)
+        or any(not isinstance(scope, str) or not scope for scope in scopes)
+        or (expires is not None and not isinstance(expires, str))
+    ):
+        raise CliError(
+            "Configuration service returned an invalid connection response.",
+            EXIT_CONNECTIVITY,
+            details=connection,
+            error_code="auth.invalid_response",
+        )
+    return VerifiedTarget(profile, identity, contract, connection)

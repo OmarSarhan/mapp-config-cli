@@ -27,6 +27,8 @@ class PackageTests(unittest.TestCase):
             ["completion-spec"],
             ["sql", "explain"],
             ["proposals", "delete", "id"],
+            ["semantic", "query"],
+            ["semantic", "functions", "list"],
         ):
             with self.subTest(arguments=arguments), self.assertRaises(CliError):
                 parser().parse_args(arguments)

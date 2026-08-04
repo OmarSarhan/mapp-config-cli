@@ -9,7 +9,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mapp_config_cli.config import ConfigStore, Profile, config_home, read_token_file
+from mapp_config_cli.config import (
+    MAX_CONFIG_FILE_BYTES,
+    MAX_TOKEN_FILE_BYTES,
+    ConfigStore,
+    Profile,
+    config_home,
+    read_token_file,
+)
 from mapp_config_cli.errors import CliError
 
 
@@ -78,6 +85,101 @@ class ConfigPermissionTests(unittest.TestCase):
             link.symlink_to(target)
             with self.assertRaises(CliError):
                 read_token_file(link)
+
+    def test_token_file_read_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            with token.open("wb") as stream:
+                stream.truncate(MAX_TOKEN_FILE_BYTES + 1)
+            os.chmod(token, 0o600)
+
+            with self.assertRaises(CliError) as raised:
+                read_token_file(token)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "auth.token_file_too_large",
+        )
+        self.assertEqual(
+            raised.exception.safe_details["maxBytes"],
+            MAX_TOKEN_FILE_BYTES,
+        )
+
+    def test_token_file_swap_to_symlink_is_rejected_at_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = root / "token"
+            target = root / "target"
+            token.write_text("original", encoding="utf-8")
+            target.write_text("replacement", encoding="utf-8")
+            os.chmod(token, 0o600)
+            os.chmod(target, 0o600)
+            real_open = os.open
+            swapped = False
+
+            def swap_before_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and Path(path) == token:
+                    swapped = True
+                    token.unlink()
+                    token.symlink_to(target)
+                return real_open(path, flags, *args, **kwargs)
+
+            with (
+                patch(
+                    "mapp_config_cli.config.os.open",
+                    side_effect=swap_before_open,
+                ),
+                self.assertRaises(CliError) as raised,
+            ):
+                read_token_file(token)
+
+        self.assertTrue(swapped)
+        self.assertEqual(raised.exception.error_code, "config.symlink_rejected")
+
+    def test_configuration_json_read_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "config"
+            root.mkdir(mode=0o700)
+            profiles = root / "profiles.json"
+            with profiles.open("wb") as stream:
+                stream.truncate(MAX_CONFIG_FILE_BYTES + 1)
+            os.chmod(profiles, 0o600)
+
+            with self.assertRaises(CliError) as raised:
+                ConfigStore(root).profiles_document()
+
+        self.assertEqual(raised.exception.error_code, "config.file_too_large")
+        self.assertEqual(
+            raised.exception.safe_details["maxBytes"],
+            MAX_CONFIG_FILE_BYTES,
+        )
+
+    def test_private_text_reads_reject_invalid_utf8_cleanly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = root / "token"
+            token.write_bytes(b"\xff")
+            os.chmod(token, 0o600)
+            with self.assertRaises(CliError) as token_error:
+                read_token_file(token)
+
+            config_root = root / "config"
+            config_root.mkdir(mode=0o700)
+            profiles = config_root / "profiles.json"
+            profiles.write_bytes(b"\xff")
+            os.chmod(profiles, 0o600)
+            with self.assertRaises(CliError) as config_error:
+                ConfigStore(config_root).profiles_document()
+
+        self.assertEqual(
+            token_error.exception.error_code,
+            "auth.token_file_unreadable",
+        )
+        self.assertEqual(
+            config_error.exception.error_code,
+            "config.invalid_json",
+        )
 
     def test_malformed_state_raises_cli_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -195,6 +297,60 @@ class ConfigPermissionTests(unittest.TestCase):
                 "credentialId",
                 store.list_profiles()["profiles"]["production"],
             )
+
+    def test_allow_http_is_explicit_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "config"
+            root.mkdir(mode=0o700)
+            profiles = root / "profiles.json"
+            credentials = root / "credentials.json"
+            profiles.write_text(
+                json.dumps(
+                    {
+                        "active": "production",
+                        "profiles": {
+                            "production": {
+                                "endpoint": "https://http.example.com",
+                                "instanceId": "http-instance",
+                                "contractVersion": "1.0",
+                                "allowHttp": True,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            profiles.write_text(
+                profiles.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            credentials.write_text(json.dumps({"production": "allow-token"}), encoding="utf-8")
+            os.chmod(profiles, 0o600)
+            os.chmod(credentials, 0o600)
+            profile, token = ConfigStore(root).connection()
+            self.assertTrue(profile.allow_http)
+            self.assertEqual(token, "allow-token")
+
+            profiles.write_text(
+                json.dumps(
+                    {
+                        "active": "production",
+                        "profiles": {
+                            "production": {
+                                "endpoint": "https://legacy.example.com",
+                                "instanceId": "legacy-instance",
+                                "contractVersion": "1.0",
+                                "insecure": True,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(profiles, 0o600)
+            profile, token = ConfigStore(root).connection()
+            self.assertFalse(profile.allow_http)
+            self.assertEqual(token, "allow-token")
 
     def test_interrupted_replace_cannot_cross_pair_endpoint_and_token(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -495,7 +651,10 @@ class ConfigPermissionTests(unittest.TestCase):
             stored_checks = json.loads(store.checks_path.read_text())["checks"]
             self.assertEqual(
                 set(stored_checks),
-                {f"production:{fingerprint}", f"staging:{fingerprint}"},
+                {
+                    f"production:workspace:{fingerprint}",
+                    f"staging:workspace:{fingerprint}",
+                },
             )
 
     def test_checked_operations_cache_reads_legacy_fingerprint_key(self):
@@ -532,6 +691,106 @@ class ConfigPermissionTests(unittest.TestCase):
             loaded = store.load_check(profile, fingerprint)
             self.assertEqual(loaded["revision"], "legacy-revision")
             self.assertEqual(loaded["profile"], profile.name)
+
+    def test_checked_operations_cache_separates_workspace_and_semantic_domains(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            profile = store.save_profile(
+                Profile(
+                    "production",
+                    "https://config.example.com",
+                    "production-instance",
+                    "1.0",
+                ),
+                "token",
+            )
+            fingerprint = "f" * 64
+            store.save_check(
+                profile,
+                {
+                    "checkFingerprint": fingerprint,
+                    "originalRevision": "workspace-revision",
+                    "operations": [
+                        {"op": "set", "path": "/title", "value": "Workspace"}
+                    ],
+                },
+                domain="workspace",
+            )
+            store.save_check(
+                profile,
+                {
+                    "fingerprint": fingerprint,
+                    "assetId": "asset:derived:places",
+                    "baseVersion": 4,
+                    "operations": [
+                        {
+                            "op": "set",
+                            "path": "/curated/description",
+                            "value": "Places",
+                        }
+                    ],
+                },
+                domain="semantic",
+            )
+
+            workspace = store.load_check(
+                profile,
+                fingerprint,
+                domain="workspace",
+            )
+            semantic = store.load_check(
+                profile,
+                fingerprint,
+                domain="semantic",
+            )
+            keys = set(json.loads(store.checks_path.read_text())["checks"])
+
+        self.assertEqual(workspace["revision"], "workspace-revision")
+        self.assertEqual(semantic["revision"], 4)
+        self.assertEqual(semantic["assetId"], "asset:derived:places")
+        self.assertEqual(
+            keys,
+            {
+                f"production:workspace:{fingerprint}",
+                f"production:semantic:{fingerprint}",
+            },
+        )
+
+    def test_checked_operations_cache_rejects_cross_domain_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            profile = store.save_profile(
+                Profile(
+                    "production",
+                    "https://config.example.com",
+                    "production-instance",
+                    "1.0",
+                ),
+                "token",
+            )
+            fingerprint = "a" * 64
+            store.save_check(
+                profile,
+                {
+                    "checkFingerprint": fingerprint,
+                    "originalRevision": "workspace-revision",
+                    "operations": [
+                        {"op": "set", "path": "/title", "value": "Workspace"}
+                    ],
+                },
+                domain="workspace",
+            )
+            with self.assertRaises(CliError) as raised:
+                store.load_check(
+                    profile,
+                    fingerprint,
+                    domain="semantic",
+                )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "semantic.proposal.check_domain_mismatch",
+        )
 
     def test_configuration_status_validates_all_private_state_files(self):
         with tempfile.TemporaryDirectory() as directory:

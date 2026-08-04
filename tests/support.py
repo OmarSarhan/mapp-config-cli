@@ -124,6 +124,7 @@ def standard_routes(
                     "derived-layers capabilities",
                     "derived-layers list",
                     "derived-layers show",
+                    "derived-layers map-extent",
                     "derived-layers create",
                     "derived-layers refresh",
                     "derived-layers replace",
@@ -174,5 +175,15 @@ def standard_routes(
         ("GET", "/api/auth/me"): (
             200,
             {"actor": "token:abc", "scopes": ["full"]},
+        ),
+        ("GET", "/api/connect"): (
+            200,
+            {
+                "authenticated": True,
+                "actor": "token:abc",
+                "tokenId": "abc",
+                "scopes": ["full"],
+                "expires": None,
+            },
         ),
     }

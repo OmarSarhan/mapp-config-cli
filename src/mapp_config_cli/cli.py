@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import getpass
 import json
 import math
 import os
+import stat
 import sys
 import tempfile
 import time
 import urllib.parse
 import webbrowser
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NoReturn, Sequence, TextIO
 
 from .client import (
+    MAX_RESPONSE_BYTES,
     SUPPORTED_API_MAJOR,
     SUPPORTED_CONTRACT_MAJOR,
     ApiClient,
@@ -43,11 +46,37 @@ from .errors import (
 )
 from .credentials import rotation_result, verify_and_replace_token
 from .operations import build_operations
-from .output import render
+from .output import render, sanitize_terminal_text
 from .version import __version__
 
 
 _INITIALIZE_CURRENT = object()
+_DEVICE_SCOPE_CHOICES = (
+    "inspect",
+    "propose",
+    "visual",
+    "apply",
+    "reload",
+    "derive",
+    "semantic:inspect",
+    "semantic:source",
+    "semantic:generate",
+    "semantic:data",
+    "semantic:propose",
+    "semantic:apply",
+    "semantic:admin",
+)
+_DEVICE_SCOPES = frozenset(_DEVICE_SCOPE_CHOICES)
+_SAFE_DEFAULT_DEVICE_SCOPES = frozenset({
+    "inspect",
+    "propose",
+    "visual",
+    "semantic:inspect",
+})
+MAX_LOCAL_FILE_BYTES = 5 * 1024 * 1024
+MAX_VISUAL_ARTIFACTS = 16
+MAX_VISUAL_ARTIFACT_TOTAL_BYTES = 64 * 1024 * 1024
+_LOCAL_READ_CHUNK_BYTES = 64 * 1024
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -68,6 +97,83 @@ def finite_float(value: str) -> float:
         raise argparse.ArgumentTypeError("value must be a number") from exc
     if not math.isfinite(number):
         raise argparse.ArgumentTypeError("value must be finite")
+    return number
+
+
+def _canonical_json_equal(left: Any, right: Any) -> bool:
+    """Compare JSON values without Python's bool/integer coercion."""
+    try:
+        left_json = json.dumps(
+            left,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        right_json = json.dumps(
+            right,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return left_json == right_json
+    except (TypeError, ValueError):
+        return False
+
+
+def nonnegative_integer(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be an integer") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("value must not be negative")
+    return number
+
+
+def semantic_search_limit(value: str) -> int:
+    number = nonnegative_integer(value)
+    if not 1 <= number <= 100:
+        raise argparse.ArgumentTypeError("limit must be from 1 to 100")
+    return number
+
+
+def pagination_cursor(value: str) -> str:
+    if (
+        not value
+        or value != value.strip()
+        or len(value) > 2048
+        or any(character.isspace() for character in value)
+    ):
+        raise argparse.ArgumentTypeError(
+            "cursor must be a non-empty opaque value without whitespace"
+        )
+    return value
+
+
+def add_pagination(
+    command: argparse.ArgumentParser,
+    *,
+    default_limit: int | None = None,
+) -> None:
+    command.add_argument(
+        "--limit",
+        type=semantic_search_limit,
+        default=default_limit,
+        help="Return at most this many items (1-100).",
+    )
+    command.add_argument(
+        "--cursor",
+        type=pagination_cursor,
+        help="Continue from an opaque nextCursor returned by the preceding page.",
+    )
+
+
+def positive_integer(value: str) -> int:
+    number = nonnegative_integer(value)
+    if number == 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
     return number
 
 
@@ -239,6 +345,11 @@ def parser() -> JsonArgumentParser:
     derived_actions.add_parser("list")
     derived_show = derived_actions.add_parser("show")
     derived_show.add_argument("name")
+    derived_map_extent = derived_actions.add_parser(
+        "map-extent",
+        help="Preview the server-resolved workspace map extent.",
+    )
+    derived_map_extent.add_argument("--locale", type=nonempty)
     derived_create = derived_actions.add_parser("create")
     derived_create.add_argument("name", nargs="?")
     derived_create.add_argument("--kind", choices=("view", "materialized"))
@@ -247,6 +358,15 @@ def parser() -> JsonArgumentParser:
     derived_create.add_argument("--id-column")
     derived_create.add_argument("--geometry-column")
     derived_create.add_argument("--description")
+    derived_create.add_argument(
+        "--map-extent",
+        action="store_true",
+        help=(
+            "Accepted for compatibility; derived output is always restricted "
+            "to the server-resolved workspace map extent."
+        ),
+    )
+    derived_create.add_argument("--locale", type=nonempty)
     derived_replace = derived_actions.add_parser("replace")
     derived_replace.add_argument("name")
     derived_replace.add_argument("--kind", choices=("view", "materialized"))
@@ -255,6 +375,15 @@ def parser() -> JsonArgumentParser:
     derived_replace.add_argument("--id-column")
     derived_replace.add_argument("--geometry-column")
     derived_replace.add_argument("--description")
+    derived_replace.add_argument(
+        "--map-extent",
+        action="store_true",
+        help=(
+            "Accepted for compatibility; derived output is always restricted "
+            "to the server-resolved workspace map extent."
+        ),
+    )
+    derived_replace.add_argument("--locale", type=nonempty)
     derived_replace.add_argument("--confirm", action="store_true", required=True)
     derived_refresh = derived_actions.add_parser("refresh")
     derived_refresh.add_argument("name")
@@ -263,7 +392,10 @@ def parser() -> JsonArgumentParser:
         background_action.add_argument(
             "--background",
             action="store_true",
-            help="Run a known slow job as a durable server operation.",
+            help=(
+                "Run and poll a known slow job as a durable server operation; "
+                "structured server error guidance is preserved."
+            ),
         )
         background_action.add_argument(
             "--wait-timeout",
@@ -280,6 +412,185 @@ def parser() -> JsonArgumentParser:
     derived_drop = derived_actions.add_parser("drop")
     derived_drop.add_argument("name")
     derived_drop.add_argument("--confirm", action="store_true", required=True)
+
+    semantic = commands.add_parser(
+        "semantic",
+        help="Inspect and govern semantic metadata.",
+    )
+    semantic_areas = semantic.add_subparsers(
+        dest="semantic_area",
+        required=True,
+    )
+    semantic_areas.add_parser("status")
+
+    semantic_catalog = semantic_areas.add_parser("catalog")
+    semantic_catalog_actions = semantic_catalog.add_subparsers(
+        dest="semantic_action",
+        required=True,
+    )
+    semantic_export = semantic_catalog_actions.add_parser("export")
+    add_pagination(semantic_export)
+    semantic_search = semantic_catalog_actions.add_parser("search")
+    semantic_search.add_argument("query", type=nonempty)
+    semantic_search.add_argument(
+        "--limit",
+        type=semantic_search_limit,
+        default=20,
+    )
+    semantic_search.add_argument("--cursor", type=pagination_cursor)
+    semantic_show = semantic_catalog_actions.add_parser("show")
+    semantic_show.add_argument("id", type=nonempty)
+    semantic_history = semantic_catalog_actions.add_parser("history")
+    semantic_history.add_argument("id", type=nonempty)
+    add_pagination(semantic_history)
+    semantic_archive = semantic_catalog_actions.add_parser(
+        "archive",
+        help="Archive semantic metadata without changing the database data.",
+    )
+    semantic_archive.add_argument("id", type=nonempty)
+    semantic_archive.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+    )
+
+    semantic_source = semantic_areas.add_parser(
+        "source",
+        help="Discover and synchronize authorized source relations.",
+    )
+    semantic_source_actions = semantic_source.add_subparsers(
+        dest="semantic_action",
+        required=True,
+    )
+    semantic_relations = semantic_source_actions.add_parser("relations")
+    add_pagination(semantic_relations)
+    semantic_source_archive = semantic_source_actions.add_parser(
+        "archive-excluded",
+        help="Archive ready semantic source assets matching configured exclusions.",
+    )
+    semantic_source_archive.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+    )
+    semantic_source_sync = semantic_source_actions.add_parser("sync")
+    semantic_source_sync.add_argument("--alias", required=True, type=nonempty)
+    semantic_source_sync.add_argument("--schema", required=True, type=nonempty)
+    semantic_source_sync.add_argument(
+        "--relation",
+        required=True,
+        type=nonempty,
+    )
+    semantic_source_sync.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+    )
+
+    semantic_generate = semantic_areas.add_parser(
+        "generate",
+        help="Generate a review-only semantic draft from authorized context.",
+    )
+    semantic_generate_targets = semantic_generate.add_subparsers(
+        dest="semantic_action",
+        required=True,
+    )
+    semantic_generate_table = semantic_generate_targets.add_parser("table")
+    semantic_generate_table.add_argument("asset_id", type=nonempty)
+    semantic_generate_table.add_argument(
+        "--sample-rows",
+        action="store_true",
+        help=(
+            "Opt in to sending raw row values from a server-bounded 5%% "
+            "sample to Gemini; requires semantic:data. Inspect semantic "
+            "status for advertised caps."
+        ),
+    )
+    semantic_generate_table.add_argument(
+        "--statistics",
+        action="store_true",
+        help=(
+            "Opt in to sending relevant server-calculated table/column "
+            "statistics to Gemini; requires semantic:data."
+        ),
+    )
+    semantic_generate_field = semantic_generate_targets.add_parser("field")
+    semantic_generate_field.add_argument("asset_id", type=nonempty)
+    semantic_generate_field.add_argument("field_id", type=nonempty)
+    semantic_generate_field.add_argument(
+        "--sample-rows",
+        action="store_true",
+        help=(
+            "Opt in to sending raw field values from a server-bounded 5%% "
+            "sample to Gemini; requires semantic:data. Inspect semantic "
+            "status for advertised caps."
+        ),
+    )
+    semantic_generate_field.add_argument(
+        "--statistics",
+        action="store_true",
+        help=(
+            "Opt in to sending relevant server-calculated field statistics "
+            "to Gemini; requires semantic:data."
+        ),
+    )
+
+    semantic_profiles = semantic_areas.add_parser("derived-profiles")
+    semantic_profile_actions = semantic_profiles.add_subparsers(
+        dest="semantic_action",
+        required=True,
+    )
+    semantic_profile_list = semantic_profile_actions.add_parser("list")
+    add_pagination(semantic_profile_list)
+    semantic_profile_show = semantic_profile_actions.add_parser("show")
+    semantic_profile_show.add_argument("name", type=nonempty)
+    semantic_profile_repair = semantic_profile_actions.add_parser("repair")
+    semantic_profile_repair.add_argument("name", type=nonempty)
+    semantic_profile_repair.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+    )
+
+    semantic_proposals = semantic_areas.add_parser("proposals")
+    semantic_proposal_actions = semantic_proposals.add_subparsers(
+        dest="semantic_action",
+        required=True,
+    )
+    semantic_check = semantic_proposal_actions.add_parser("check")
+    add_mutations(semantic_check)
+    semantic_check.add_argument("--asset-id", required=True, type=nonempty)
+    semantic_check.add_argument(
+        "--base-version",
+        required=True,
+        type=positive_integer,
+    )
+    semantic_check.add_argument("--explanation")
+    semantic_create = semantic_proposal_actions.add_parser("create")
+    semantic_create.add_argument(
+        "--from-check",
+        required=True,
+        metavar="FINGERPRINT",
+    )
+    semantic_proposal_list = semantic_proposal_actions.add_parser("list")
+    add_pagination(semantic_proposal_list)
+    semantic_proposal_show = semantic_proposal_actions.add_parser("show")
+    semantic_proposal_show.add_argument("id", type=nonempty)
+    semantic_proposal_apply = semantic_proposal_actions.add_parser("apply")
+    semantic_proposal_apply.add_argument("id", type=nonempty)
+    semantic_proposal_apply.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+    )
+    semantic_proposal_decline = semantic_proposal_actions.add_parser("decline")
+    semantic_proposal_decline.add_argument("id", type=nonempty)
+    semantic_proposal_decline.add_argument("--reason")
+    semantic_proposal_decline.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+    )
 
     validate = commands.add_parser("validate")
     validate.add_argument("--file")
@@ -325,7 +636,8 @@ def parser() -> JsonArgumentParser:
     add_mutations(check)
     check.add_argument("--base-revision", required=True, type=nonempty)
     check.add_argument("--explanation")
-    proposal_actions.add_parser("list")
+    proposal_list_command = proposal_actions.add_parser("list")
+    add_pagination(proposal_list_command)
     show = proposal_actions.add_parser("show")
     show.add_argument("id")
     apply = proposal_actions.add_parser("apply")
@@ -369,6 +681,38 @@ def parser() -> JsonArgumentParser:
             "--artifact-dir",
             help="Fetch returned visual artifacts into this local directory.",
         )
+        preview.add_argument(
+            "--expect-info-text",
+            action="append",
+            help=(
+                "Require text in captured clicked-feature information; repeat "
+                "for multiple labels or static notes."
+            ),
+        )
+        hover = preview.add_mutually_exclusive_group()
+        hover.add_argument(
+            "--hover",
+            dest="hover",
+            action="store_const",
+            const=True,
+            default=None,
+            help="Require configured hover-tooltip evidence.",
+        )
+        hover.add_argument(
+            "--no-hover",
+            dest="hover",
+            action="store_const",
+            const=False,
+            help="Suppress automatic hover-tooltip evidence.",
+        )
+        preview.add_argument(
+            "--expect-hover-text",
+            action="append",
+            help=(
+                "Require text in the captured hover tooltip; repeat for "
+                "multiple values."
+            ),
+        )
         if action == "preview-screenshot":
             preview.add_argument(
                 "--panel",
@@ -403,6 +747,38 @@ def parser() -> JsonArgumentParser:
             "--artifact-dir",
             help="Fetch returned visual artifacts into this local directory.",
         )
+        visual.add_argument(
+            "--expect-info-text",
+            action="append",
+            help=(
+                "Require text in captured clicked-feature information; repeat "
+                "for multiple labels or static notes."
+            ),
+        )
+        hover = visual.add_mutually_exclusive_group()
+        hover.add_argument(
+            "--hover",
+            dest="hover",
+            action="store_const",
+            const=True,
+            default=None,
+            help="Require configured hover-tooltip evidence.",
+        )
+        hover.add_argument(
+            "--no-hover",
+            dest="hover",
+            action="store_const",
+            const=False,
+            help="Suppress automatic hover-tooltip evidence.",
+        )
+        visual.add_argument(
+            "--expect-hover-text",
+            action="append",
+            help=(
+                "Require text in the captured hover tooltip; repeat for "
+                "multiple values."
+            ),
+        )
 
     xyz = commands.add_parser("xyz")
     xyz_actions = xyz.add_subparsers(dest="action", required=True)
@@ -428,7 +804,7 @@ def parser() -> JsonArgumentParser:
         "--scope",
         dest="device_scopes",
         action="append",
-        choices=("inspect", "propose", "visual", "apply", "reload"),
+        choices=_DEVICE_SCOPE_CHOICES,
         default=[],
     )
     auth_device.add_argument("--no-browser", action="store_true")
@@ -461,6 +837,12 @@ def required_contract_command(args) -> str:
         return "layers effective"
     if args.command == "proposals":
         return f"proposals {args.action}"
+    if args.command == "semantic":
+        if args.semantic_area == "status":
+            return "semantic status"
+        return (
+            f"semantic {args.semantic_area} {args.semantic_action}"
+        )
     return args.command
 
 
@@ -514,12 +896,34 @@ def visual_payload(args) -> dict[str, Any]:
     expected_panel_text = getattr(args, "expect_panel_text", None)
     if expected_panel_text:
         payload["expectedPanelText"] = expected_panel_text
+    expected_info_text = getattr(args, "expect_info_text", None)
+    if expected_info_text:
+        payload["expectedInfoPanelText"] = expected_info_text
+    hover = getattr(args, "hover", None)
+    if hover is not None:
+        payload["hover"] = hover
+    expected_hover_text = getattr(args, "expect_hover_text", None)
+    if expected_hover_text:
+        payload["expectedHoverText"] = expected_hover_text
     return merge_input(args, payload)
 
 
 def emit(data: Any, stream: TextIO = sys.stdout) -> None:
-    stream.write(json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
+    content = json.dumps(
+        data,
+        indent=2,
+        ensure_ascii=False,
+        allow_nan=False,
+    ) + "\n"
+    if _is_terminal(stream):
+        content = sanitize_terminal_text(content, preserve_newlines=True)
+    stream.write(content)
     stream.flush()
+
+
+def _is_terminal(stream: TextIO) -> bool:
+    isatty = getattr(stream, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False
 
 
 def extract_response_value(value: Any, path: str) -> str:
@@ -579,22 +983,146 @@ def write_private_output(path: str, content: str) -> None:
             os.unlink(temporary_name)
 
 
+def _read_bounded_local_text(
+    path: Path,
+    *,
+    label: str,
+    exit_code: int,
+    unavailable_code: str,
+    too_large_code: str,
+    invalid_utf8_code: str,
+    max_bytes: int = MAX_LOCAL_FILE_BYTES,
+) -> str:
+    target = path.expanduser()
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    expected_metadata = None
+    if not getattr(os, "O_NOFOLLOW", 0):  # pragma: no cover - Windows fallback
+        try:
+            expected_metadata = target.lstat()
+        except OSError as exc:
+            raise CliError(
+                f"Unable to read {label}: {exc}",
+                exit_code,
+                details={"path": str(target)},
+                error_code=unavailable_code,
+            ) from exc
+        if stat.S_ISLNK(expected_metadata.st_mode):
+            raise CliError(
+                f"{label.capitalize()} must be a regular, non-symlink file.",
+                exit_code,
+                details={"path": str(target)},
+                error_code=unavailable_code,
+            )
+
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(target, flags)
+        except OSError as exc:
+            reason = (
+                "symlink"
+                if exc.errno == errno.ELOOP
+                else type(exc).__name__
+            )
+            raise CliError(
+                f"Unable to read {label}: {exc}",
+                exit_code,
+                details={"path": str(target), "reason": reason},
+                error_code=unavailable_code,
+            ) from exc
+
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (
+                expected_metadata is not None
+                and not os.path.samestat(expected_metadata, metadata)
+            )
+        ):
+            raise CliError(
+                f"{label.capitalize()} must be a regular, non-symlink file.",
+                exit_code,
+                details={"path": str(target)},
+                error_code=unavailable_code,
+            )
+        if metadata.st_size > max_bytes:
+            raise CliError(
+                f"{label.capitalize()} exceeds the 5 MiB limit.",
+                exit_code,
+                details={
+                    "path": str(target),
+                    "fileBytes": metadata.st_size,
+                    "maxBytes": max_bytes,
+                },
+                error_code=too_large_code,
+            )
+
+        raw = bytearray()
+        while len(raw) <= max_bytes:
+            chunk = os.read(
+                descriptor,
+                min(_LOCAL_READ_CHUNK_BYTES, max_bytes + 1 - len(raw)),
+            )
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) > max_bytes:
+            raise CliError(
+                f"{label.capitalize()} exceeds the 5 MiB limit.",
+                exit_code,
+                details={
+                    "path": str(target),
+                    "fileBytes": len(raw),
+                    "maxBytes": max_bytes,
+                },
+                error_code=too_large_code,
+            )
+    except CliError:
+        raise
+    except OSError as exc:
+        raise CliError(
+            f"Unable to read {label}: {exc}",
+            exit_code,
+            details={"path": str(target)},
+            error_code=unavailable_code,
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    try:
+        return bytes(raw).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CliError(
+            f"{label.capitalize()} is not valid UTF-8.",
+            exit_code,
+            details={"path": str(target)},
+            error_code=invalid_utf8_code,
+        ) from exc
+
+
 def input_object(args) -> dict[str, Any]:
     source = getattr(args, "input", None)
     if not source:
         return {}
     if source == "-":
-        raw = sys.stdin.read(5 * 1024 * 1024 + 1)
+        raw = sys.stdin.read(MAX_LOCAL_FILE_BYTES + 1)
     else:
-        path = Path(source).expanduser()
-        if not path.is_file() or path.is_symlink():
-            raise CliError(
-                "Input must be a regular, non-symlink file.",
-                EXIT_USAGE,
-                error_code="input.invalid_file",
-            )
-        raw = path.read_text(encoding="utf-8")
-    if len(raw.encode("utf-8")) > 5 * 1024 * 1024:
+        raw = _read_bounded_local_text(
+            Path(source),
+            label="input file",
+            exit_code=EXIT_USAGE,
+            unavailable_code="input.invalid_file",
+            too_large_code="input.too_large",
+            invalid_utf8_code="input.invalid_json",
+        )
+    if len(raw.encode("utf-8")) > MAX_LOCAL_FILE_BYTES:
         raise CliError(
             "Input JSON exceeds the 5 MiB limit.",
             EXIT_USAGE,
@@ -636,8 +1164,10 @@ def input_object(args) -> dict[str, Any]:
     return value
 
 
-def merge_input(args, payload: dict[str, Any]) -> dict[str, Any]:
-    supplied = input_object(args)
+def merge_supplied_input(
+    supplied: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
     conflicts = [
         key
         for key in supplied.keys() & payload.keys()
@@ -651,6 +1181,10 @@ def merge_input(args, payload: dict[str, Any]) -> dict[str, Any]:
             error_code="input.conflict",
         )
     return {**supplied, **payload}
+
+
+def merge_input(args, payload: dict[str, Any]) -> dict[str, Any]:
+    return merge_supplied_input(input_object(args), payload)
 
 
 def _token_for_init(args) -> str:
@@ -700,17 +1234,331 @@ def _invalid_response(
     )
 
 
+def _has_exact_response_keys(
+    data: dict[str, Any],
+    expected: set[str],
+) -> bool:
+    return (
+        set(data) - {"meta"} == expected
+        and (
+            "meta" not in data
+            or isinstance(data["meta"], dict)
+        )
+    )
+
+
+def _pagination_contract(contract: dict[str, Any]) -> dict[str, Any] | None:
+    value = contract.get("pagination")
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != "1"
+        or not _nonnegative_integer(value.get("defaultLimit"))
+        or not 1 <= value["defaultLimit"] <= 100
+        or not _nonnegative_integer(value.get("maxLimit"))
+        or not value["defaultLimit"] <= value["maxLimit"] <= 100
+        or value.get("cursor") != "opaque"
+    ):
+        raise CliError(
+            "Server contract advertises an invalid pagination capability.",
+            EXIT_CONFLICT,
+            details={"pagination": value},
+            error_code="contract.invalid_pagination",
+        )
+    return value
+
+
+def _paginated_path(
+    path: str,
+    *,
+    contract: dict[str, Any],
+    args: Any,
+    parameters: dict[str, Any] | None = None,
+    legacy_limit: bool = False,
+) -> tuple[str, int | None]:
+    query = dict(parameters or {})
+    pagination = _pagination_contract(contract)
+    requested_limit = getattr(args, "limit", None)
+    cursor = getattr(args, "cursor", None)
+    if pagination is None:
+        if cursor is not None or (requested_limit is not None and not legacy_limit):
+            raise CliError(
+                "The connected server does not advertise bounded pagination.",
+                EXIT_CONFLICT,
+                error_code="pagination.unsupported",
+            )
+        if legacy_limit and requested_limit is not None:
+            query["limit"] = requested_limit
+        encoded = urllib.parse.urlencode(query)
+        return path + (f"?{encoded}" if encoded else ""), None
+
+    effective_limit = (
+        requested_limit
+        if requested_limit is not None
+        else pagination["defaultLimit"]
+    )
+    if effective_limit > pagination["maxLimit"]:
+        raise CliError(
+            "Requested page size exceeds the server's advertised maximum.",
+            EXIT_USAGE,
+            details={
+                "requestedLimit": effective_limit,
+                "maxLimit": pagination["maxLimit"],
+            },
+            error_code="pagination.limit_exceeded",
+        )
+    query["limit"] = effective_limit
+    if cursor is not None:
+        query["cursor"] = cursor
+    return f"{path}?{urllib.parse.urlencode(query)}", effective_limit
+
+
+def _validate_pagination_response(
+    data: dict[str, Any],
+    *,
+    label: str,
+    expected_limit: int | None,
+    error_code: str,
+) -> dict[str, Any] | None:
+    if expected_limit is None:
+        return None
+    pagination = data.get("pagination")
+    if not isinstance(pagination, dict) or set(pagination) != {
+        "limit",
+        "nextCursor",
+    }:
+        raise _invalid_response(label, data, error_code=error_code)
+    next_cursor = pagination.get("nextCursor")
+    if (
+        pagination.get("limit") != expected_limit
+        or isinstance(pagination.get("limit"), bool)
+        or (
+            next_cursor is not None
+            and (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or len(next_cursor) > 2048
+                or any(character.isspace() for character in next_cursor)
+            )
+        )
+    ):
+        raise _invalid_response(label, data, error_code=error_code)
+    return pagination
+
+
+def _terminal_operation_error(
+    operation: dict[str, Any],
+    *,
+    details: dict[str, Any],
+    failed_exit_code: int,
+    failed_message: str,
+    indeterminate_message: str,
+) -> CliError:
+    """Preserve safe server guidance from a terminal operation failure."""
+    status = operation.get("status")
+    indeterminate = status == "indeterminate"
+    message = indeterminate_message if indeterminate else failed_message
+    error_code = "operation.indeterminate" if indeterminate else "operation.failed"
+    exit_code = EXIT_CONNECTIVITY if indeterminate else failed_exit_code
+    operation_error = operation.get("error")
+    if isinstance(operation_error, dict):
+        for key in ("userMessage", "error", "message"):
+            candidate = operation_error.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                message = candidate
+                break
+        server_code = operation_error.get("code")
+        if (
+            isinstance(server_code, str)
+            and server_code.startswith("derived_layer.")
+        ):
+            error_code = server_code
+            server_status = operation_error.get("status")
+            if not indeterminate:
+                if server_status in {401, 403}:
+                    exit_code = EXIT_AUTHENTICATION
+                elif server_status == 409:
+                    exit_code = EXIT_CONFLICT
+                elif server_status in {400, 404, 422}:
+                    exit_code = EXIT_VALIDATION
+
+    return CliError(
+        message,
+        exit_code,
+        details=details,
+        error_code=error_code,
+    )
+
+
+def _validate_background_wait(wait_timeout: float, interval: float) -> None:
+    if (
+        not math.isfinite(wait_timeout)
+        or wait_timeout <= 0
+        or not math.isfinite(interval)
+        or interval <= 0
+    ):
+        raise CliError(
+            "Operation wait timeout and interval must be finite and positive.",
+            EXIT_USAGE,
+            error_code="operation.invalid_wait",
+        )
+
+
+def _background_poll_error(
+    operation_id: str,
+    status: Any,
+    *,
+    cause: CliError | None = None,
+    interrupted: bool = False,
+) -> CliError:
+    details: dict[str, Any] = {
+        "operationId": operation_id,
+        "status": status,
+        "reconciliation": {
+            "required": True,
+            "automaticRetry": False,
+            "commands": [
+                {
+                    "command": "config-cli operations show",
+                    "arguments": [operation_id],
+                },
+                {
+                    "command": "config-cli operations wait",
+                    "arguments": [operation_id],
+                },
+            ],
+        },
+    }
+    if cause is not None:
+        details["cause"] = {
+            "code": cause.error_code,
+            "httpStatus": cause.http_status,
+            "details": cause.safe_details,
+        }
+    return CliError(
+        (
+            "Background operation continues after local polling was interrupted; "
+            "do not resubmit the mutation. Reconcile the retained operation ID."
+            if interrupted
+            else "Background operation polling failed while server work may continue; "
+            "do not resubmit the mutation. Reconcile the retained operation ID."
+        ),
+        EXIT_INTERRUPTED if interrupted else EXIT_CONNECTIVITY,
+        details=details,
+        error_code=(
+            "operation.poll_interrupted"
+            if interrupted
+            else "operation.poll_failed"
+        ),
+    )
+
+
+def _derived_mutation_indeterminate(
+    name: str,
+    action: str,
+    *,
+    response: dict[str, Any] | None = None,
+    cause: CliError | None = None,
+    interrupted: bool = False,
+) -> CliError:
+    details: dict[str, Any] = {
+        "derivedLayer": name,
+        "action": action,
+        "reconciliation": {
+            "required": True,
+            "automaticRetry": False,
+            "commands": [
+                {
+                    "command": "config-cli derived-layers show",
+                    "arguments": [name],
+                },
+                {
+                    "command": "config-cli derived-layers list",
+                    "arguments": [],
+                },
+            ],
+        },
+    }
+    if response is not None:
+        details["response"] = response
+    if cause is not None:
+        details["cause"] = {
+            "code": cause.error_code,
+            "httpStatus": cause.http_status,
+            "details": cause.safe_details,
+        }
+    if interrupted:
+        details["interrupted"] = True
+    return CliError(
+        (
+            "Derived-layer mutation outcome is indeterminate. Do not retry "
+            "automatically; reconcile the retained database and catalog state."
+        ),
+        EXIT_INTERRUPTED if interrupted else EXIT_CONNECTIVITY,
+        details=details,
+        error_code="derived_layer.mutation_indeterminate",
+    )
+
+
+def _request_derived_mutation(
+    client: ApiClient,
+    path: str,
+    *,
+    name: str,
+    action: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return client.request(
+            path,
+            method="POST",
+            payload=payload,
+            failure_code=EXIT_VALIDATION,
+        )
+    except KeyboardInterrupt as exc:
+        raise _derived_mutation_indeterminate(
+            name,
+            action,
+            interrupted=True,
+        ) from exc
+    except CliError as exc:
+        if (
+            exc.http_status is not None
+            and 400 <= exc.http_status < 500
+            and exc.http_status != 408
+        ):
+            raise
+        if (
+            exc.error_code in {
+                "api.invalid_response",
+                "api.non_json_response",
+                "api.response_too_large",
+                "api.transport_error",
+                "api.unreachable",
+            }
+            or exc.http_status is not None
+        ):
+            raise _derived_mutation_indeterminate(
+                name,
+                action,
+                cause=exc,
+            ) from exc
+        raise
+
+
 def _complete_background_operation(
     client: ApiClient,
     submitted: dict[str, Any],
     *,
     wait_timeout: float,
     interval: float,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str | None]:
     """Resolve an optional 202 operation while accepting synchronous servers."""
+    _validate_background_wait(wait_timeout, interval)
     operation = submitted.get("operation")
     if not isinstance(operation, dict):
-        return submitted
+        return submitted, None
     operation_id = operation.get("id")
     if not isinstance(operation_id, str) or not operation_id:
         raise _invalid_response(
@@ -718,59 +1566,90 @@ def _complete_background_operation(
             submitted,
             error_code="operation.invalid_response",
         )
-    if wait_timeout <= 0 or interval <= 0:
-        raise CliError(
-            "Operation wait timeout and interval must be positive.",
-            EXIT_USAGE,
-            error_code="operation.invalid_wait",
-        )
     deadline = time.monotonic() + wait_timeout
-    while True:
-        status = operation.get("status")
-        if status in {"succeeded", "failed", "indeterminate"}:
-            if status == "succeeded":
-                result = operation.get("result")
-                if not isinstance(result, dict):
-                    raise _invalid_response(
-                        "Background operation result",
-                        {"operation": operation},
-                        error_code="operation.invalid_response",
-                    )
-                return result
-            raise CliError(
-                (
-                    "Derived-layer background operation failed."
-                    if status == "failed"
-                    else "Derived-layer operation is indeterminate; inspect the operation and authoritative database state before retrying."
-                ),
-                EXIT_VALIDATION if status == "failed" else EXIT_CONNECTIVITY,
-                details={"operation": operation},
-                error_code=f"operation.{status}",
-            )
-        if status != "running":
-            raise _invalid_response(
-                "Background operation",
-                {"operation": operation},
-                error_code="operation.invalid_response",
-            )
-        if time.monotonic() >= deadline:
-            raise CliError(
-                "Derived-layer work is still running after the local wait timeout; it was not cancelled. Inspect it with operations wait.",
-                EXIT_CONNECTIVITY,
-                details={"operationId": operation_id, "status": status},
-                error_code="operation.wait_timeout",
-            )
-        time.sleep(interval)
-        polled = client.request(
-            f"/api/operations/{quote_segment(operation_id)}"
-        )
-        operation = polled.get("operation")
-        if not isinstance(operation, dict):
-            raise _invalid_response(
-                "Background operation",
-                polled,
-                error_code="operation.invalid_response",
-            )
+    last_status: Any = operation.get("status")
+    try:
+        while True:
+            status = operation.get("status")
+            last_status = status
+            if status in {"succeeded", "failed", "indeterminate"}:
+                if status == "succeeded":
+                    result = operation.get("result")
+                    if not isinstance(result, dict):
+                        invalid = _invalid_response(
+                            "Background operation result",
+                            {"operation": operation},
+                            error_code="operation.invalid_response",
+                        )
+                        raise _background_poll_error(
+                            operation_id,
+                            status,
+                            cause=invalid,
+                        ) from invalid
+                    return result, operation_id
+                raise _terminal_operation_error(
+                    operation,
+                    details={"operation": operation},
+                    failed_exit_code=EXIT_VALIDATION,
+                    failed_message="Derived-layer background operation failed.",
+                    indeterminate_message=(
+                        "Derived-layer operation is indeterminate; inspect the "
+                        "operation and authoritative database state before retrying."
+                    ),
+                )
+            if status != "running":
+                invalid = _invalid_response(
+                    "Background operation",
+                    {"operationId": operation_id, "operation": operation},
+                    error_code="operation.invalid_response",
+                )
+                raise _background_poll_error(
+                    operation_id,
+                    status,
+                    cause=invalid,
+                ) from invalid
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                detached = _background_poll_error(operation_id, status)
+                raise CliError(
+                    "Derived-layer work is still running after the local wait "
+                    "timeout; it was not cancelled.",
+                    EXIT_CONNECTIVITY,
+                    details=detached.safe_details,
+                    error_code="operation.wait_timeout",
+                )
+            time.sleep(min(interval, remaining))
+            try:
+                polled = client.request(
+                    f"/api/operations/{quote_segment(operation_id)}"
+                )
+            except CliError as exc:
+                raise _background_poll_error(
+                    operation_id,
+                    status,
+                    cause=exc,
+                ) from exc
+            operation = polled.get("operation")
+            if (
+                not isinstance(operation, dict)
+                or operation.get("id") != operation_id
+            ):
+                invalid = _invalid_response(
+                    "Background operation",
+                    {"operationId": operation_id, "response": polled},
+                    error_code="operation.invalid_response",
+                )
+                raise _background_poll_error(
+                    operation_id,
+                    status,
+                    cause=invalid,
+                ) from invalid
+    except KeyboardInterrupt as exc:
+        raise _background_poll_error(
+            operation_id,
+            last_status,
+            interrupted=True,
+        ) from exc
 
 
 def _proposal_from_response(
@@ -780,6 +1659,7 @@ def _proposal_from_response(
     expected_id: str | None = None,
     require_original_revision: bool = False,
     require_applied_revision: bool = False,
+    require_candidate_hash: bool = False,
 ) -> dict[str, Any]:
     proposal = data.get("proposal")
     if not isinstance(proposal, dict):
@@ -820,7 +1700,857 @@ def _proposal_from_response(
             data,
             error_code="proposal.invalid_response",
         )
+    if require_candidate_hash and (
+        not isinstance(proposal.get("candidateHash"), str)
+        or len(proposal["candidateHash"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in proposal["candidateHash"]
+        )
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="proposal.invalid_response",
+        )
     return proposal
+
+
+def _proposal_apply_from_response(
+    data: dict[str, Any],
+    *,
+    expected_id: str,
+    original_revision: str,
+    expected_candidate_hash: str,
+) -> dict[str, Any]:
+    proposal = _proposal_from_response(
+        data,
+        label="Proposal application",
+        expected_id=expected_id,
+        require_applied_revision=True,
+        require_candidate_hash=True,
+    )
+    reload_result = data.get("reload")
+    operation = data.get("operation")
+    if not isinstance(reload_result, dict) or not isinstance(operation, dict):
+        raise _invalid_response(
+            "Proposal application",
+            data,
+            error_code="proposal.invalid_response",
+        )
+    reload_status = reload_result.get("status")
+    operation_result = operation.get("result")
+    operation_target = operation.get("target")
+    applied_fingerprint = proposal.get("appliedFingerprint")
+    if (
+        proposal["status"] != "applied"
+        or proposal.get("originalRevision") != original_revision
+        or proposal.get("candidateHash") != expected_candidate_hash
+        or not isinstance(applied_fingerprint, str)
+        or len(applied_fingerprint) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in applied_fingerprint
+        )
+        or not isinstance(reload_status, dict)
+        or reload_status.get("completed") is not True
+        or reload_result.get("expectedWorkspaceFingerprint")
+        != applied_fingerprint
+        or reload_status.get("workspaceFingerprint") != applied_fingerprint
+        or not isinstance(operation.get("id"), str)
+        or not operation["id"]
+        or operation.get("kind") != "proposal.apply"
+        or operation.get("status") != "succeeded"
+        or operation.get("error") is not None
+        or not isinstance(operation_target, dict)
+        or operation_target.get("proposalId") != expected_id
+        or operation_target.get("candidateHash") != expected_candidate_hash
+        or not isinstance(operation_result, dict)
+        or not _canonical_json_equal(
+            operation_result.get("proposal"), proposal
+        )
+        or not _canonical_json_equal(
+            operation_result.get("reload"), reload_result
+        )
+    ):
+        raise _invalid_response(
+            "Proposal application",
+            data,
+            error_code="proposal.invalid_response",
+        )
+    return proposal
+
+
+def _semantic_revision(data: dict[str, Any], *, label: str) -> int:
+    revision = data.get("catalogRevision")
+    if (
+        not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 0
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="semantic.invalid_response",
+        )
+    return revision
+
+
+def _semantic_asset(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+    expected_id: str | None = None,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("id"), str)
+        or not value["id"].strip()
+        or (
+            expected_id is not None
+            and value["id"] != expected_id
+        )
+        or not _nonnegative_integer(value.get("version"))
+        or not isinstance(value.get("generated"), dict)
+        or not isinstance(value.get("curated"), dict)
+        or not isinstance(value.get("status"), str)
+        or not value["status"]
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="semantic.invalid_response",
+        )
+    return value
+
+
+_SEMANTIC_SOURCE_KEYS = {
+    "alias",
+    "schema",
+    "relation",
+    "kind",
+    "assetId",
+}
+_SEMANTIC_SOURCE_KINDS = {
+    "table",
+    "partitioned-table",
+    "view",
+    "materialized-view",
+}
+
+
+def _semantic_source(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+    expected: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _SEMANTIC_SOURCE_KEYS
+        or any(
+            not isinstance(value.get(key), str)
+            or not value[key].strip()
+            for key in _SEMANTIC_SOURCE_KEYS
+        )
+        or value.get("kind") not in _SEMANTIC_SOURCE_KINDS
+        or (
+            expected is not None
+            and any(value.get(key) != item for key, item in expected.items())
+        )
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="semantic.invalid_response",
+        )
+    return value
+
+
+def _semantic_source_sync_response(
+    data: dict[str, Any],
+    *,
+    expected: dict[str, str],
+) -> dict[str, Any]:
+    if (
+        not _has_exact_response_keys(data, {
+            "catalogRevision",
+            "operation",
+            "source",
+            "asset",
+        })
+        or data.get("operation") not in {
+            "register",
+            "refresh",
+            "unchanged",
+        }
+    ):
+        raise _invalid_response(
+            "Semantic source synchronization",
+            data,
+            error_code="semantic.invalid_response",
+        )
+    _semantic_revision(data, label="Semantic source synchronization")
+    source = _semantic_source(
+        data.get("source"),
+        data=data,
+        label="Semantic source synchronization",
+        expected=expected,
+    )
+    asset = _semantic_asset(
+        data.get("asset"),
+        data=data,
+        label="Semantic source synchronization",
+        expected_id=source["assetId"],
+    )
+    binding = asset["generated"].get("binding")
+    if (
+        asset.get("status") != "ready"
+        or asset["generated"].get("kind") != source["kind"]
+        or binding != {
+            "adapter": "postgresql",
+            "alias": source["alias"],
+            "schema": source["schema"],
+            "relation": source["relation"],
+        }
+    ):
+        raise _invalid_response(
+            "Semantic source synchronization",
+            data,
+            error_code="semantic.invalid_response",
+        )
+    return data
+
+
+_SEMANTIC_PROFILE_STATES = {
+    "registering",
+    "ready",
+    "retrying",
+    "repair_required",
+    "pending_archive",
+    "archived",
+}
+_SEMANTIC_PROPOSAL_STATES = {"pending", "applied", "declined"}
+_SEMANTIC_DELIVERY_STATES = {
+    "pending",
+    "retrying",
+    "repair_required",
+}
+_SEMANTIC_DELIVERY_OPERATIONS = {
+    "register",
+    "replace",
+    "refresh",
+    "archive",
+}
+
+
+def _semantic_delivery_blocker(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    required = {
+        "name",
+        "relation",
+        "assetId",
+        "eventId",
+        "operation",
+        "generation",
+        "status",
+        "attempts",
+        "lastError",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or any(
+            not isinstance(value.get(key), str)
+            or not value[key].strip()
+            for key in ("name", "relation", "assetId", "eventId")
+        )
+        or value.get("relation") != f"derived_layers.{value.get('name')}"
+        or value.get("operation") not in _SEMANTIC_DELIVERY_OPERATIONS
+        or not _nonnegative_integer(value.get("generation"))
+        or value.get("generation") == 0
+        or value.get("status") not in _SEMANTIC_DELIVERY_STATES
+        or not _nonnegative_integer(value.get("attempts"))
+        or (
+            value.get("lastError") is not None
+            and (
+                not isinstance(value["lastError"], str)
+                or not value["lastError"].strip()
+            )
+        )
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="semantic.invalid_response",
+        )
+    return value
+
+
+def _semantic_delivery_blockers(
+    data: dict[str, Any],
+    *,
+    label: str,
+) -> list[dict[str, Any]]:
+    if "deliveryBlockers" not in data:
+        return []
+    blockers = data["deliveryBlockers"]
+    if not isinstance(blockers, list):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="semantic.invalid_response",
+        )
+    for blocker in blockers:
+        _semantic_delivery_blocker(
+            blocker,
+            data=data,
+            label=label,
+        )
+    return blockers
+
+
+def _semantic_profile(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+    expected_name: str | None = None,
+    require_name: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="semantic.invalid_response",
+        )
+    name = value.get("name")
+    revision = value.get("revision")
+    if (
+        (require_name and name is None)
+        or (
+            name is not None
+            and (
+                not isinstance(name, str)
+                or not name.strip()
+            )
+        )
+        or (
+            expected_name is not None
+            and name != expected_name
+        )
+        or not isinstance(value.get("assetId"), str)
+        or not value["assetId"].strip()
+        or not _nonnegative_integer(value.get("generation"))
+        or value.get("status") not in _SEMANTIC_PROFILE_STATES
+        or (
+            revision is not None
+            and (
+                not isinstance(revision, str)
+                or not revision.isdecimal()
+            )
+        )
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="semantic.invalid_response",
+        )
+    return value
+
+
+def _semantic_proposal(
+    data: dict[str, Any],
+    *,
+    label: str,
+    expected_id: str | None = None,
+) -> dict[str, Any]:
+    proposal = data.get("proposal")
+    explanation = (
+        proposal.get("explanation")
+        if isinstance(proposal, dict)
+        else None
+    )
+    actor = proposal.get("actor") if isinstance(proposal, dict) else None
+    decided_by = (
+        proposal.get("decidedBy")
+        if isinstance(proposal, dict)
+        else None
+    )
+    decided_at = (
+        proposal.get("decidedAt")
+        if isinstance(proposal, dict)
+        else None
+    )
+    if (
+        not isinstance(proposal, dict)
+        or not isinstance(proposal.get("id"), str)
+        or not proposal["id"].strip()
+        or (
+            expected_id is not None
+            and proposal["id"] != expected_id
+        )
+        or not isinstance(proposal.get("assetId"), str)
+        or not proposal["assetId"].strip()
+        or not _nonnegative_integer(proposal.get("baseVersion"))
+        or proposal.get("state") not in _SEMANTIC_PROPOSAL_STATES
+        or not isinstance(proposal.get("operations"), list)
+        or not isinstance(actor, str)
+        or not actor.strip()
+        or "decidedBy" not in proposal
+        or (
+            decided_by is not None
+            and (
+                not isinstance(decided_by, str)
+                or not decided_by.strip()
+            )
+        )
+        or "decidedAt" not in proposal
+        or (
+            decided_at is not None
+            and (
+                not isinstance(decided_at, str)
+                or not decided_at.strip()
+            )
+        )
+        or (
+            proposal.get("state") == "pending"
+            and (
+                decided_by is not None
+                or decided_at is not None
+            )
+        )
+        or (
+            explanation is not None
+            and (
+                not isinstance(explanation, str)
+                or not explanation.strip()
+            )
+        )
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="semantic.invalid_response",
+        )
+    return proposal
+
+
+def _semantic_operations(
+    sets: Sequence[str],
+    unsets: Sequence[str],
+) -> list[dict[str, Any]]:
+    return _require_curated_operations(build_operations(sets, unsets))
+
+
+def _semantic_input_operations(value: Any) -> list[dict[str, Any]]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(item, dict) for item in value)
+    ):
+        raise CliError(
+            "Input operations must be a non-empty array of objects.",
+            EXIT_USAGE,
+            error_code="semantic.operation.invalid_input",
+        )
+    return _require_curated_operations(value)
+
+
+def _semantic_generation_response(
+    data: dict[str, Any],
+    *,
+    asset_id: str,
+    target: dict[str, str],
+    requested_context_options: dict[str, bool] | None = None,
+) -> dict[str, Any]:
+    draft = data.get("draft")
+    generation = data.get("generation")
+    generation_keys = (
+        set(generation)
+        if isinstance(generation, dict)
+        else set()
+    )
+    expected_generation_keys = {
+        "provider",
+        "model",
+        "metadataOnly",
+        "proposalCreated",
+    }
+    response_context_options = (
+        generation.get("contextOptions")
+        if isinstance(generation, dict)
+        else None
+    )
+    expected_context_options = requested_context_options or {
+        "sampleRows": False,
+        "statistics": False,
+    }
+    expected_metadata_only = not any(expected_context_options.values())
+    valid_context_options = (
+        isinstance(response_context_options, dict)
+        and set(response_context_options) == {
+            "sampleRows",
+            "statistics",
+        }
+        and all(
+            isinstance(response_context_options[key], bool)
+            for key in ("sampleRows", "statistics")
+        )
+        and response_context_options == expected_context_options
+    )
+    legacy_metadata_only_response = (
+        requested_context_options is None
+        and generation_keys == expected_generation_keys
+    )
+    if (
+        not isinstance(draft, dict)
+        or set(draft) != {
+            "assetId",
+            "baseVersion",
+            "target",
+            "operations",
+            "explanation",
+        }
+        or draft.get("assetId") != asset_id
+        or not _nonnegative_integer(draft.get("baseVersion"))
+        or draft.get("baseVersion") == 0
+        or draft.get("target") != target
+        or not isinstance(draft.get("explanation"), str)
+        or not draft["explanation"].strip()
+        or not isinstance(generation, dict)
+        or not (
+            legacy_metadata_only_response
+            or (
+                generation_keys
+                == expected_generation_keys | {"contextOptions"}
+                and valid_context_options
+            )
+        )
+        or generation.get("provider") != "gemini"
+        or not isinstance(generation.get("model"), str)
+        or not generation["model"].strip()
+        or generation.get("metadataOnly") is not expected_metadata_only
+        or generation.get("proposalCreated") is not False
+        or "proposal" in data
+        or "check" in data
+    ):
+        raise _invalid_response(
+            "Semantic generation",
+            data,
+            error_code="semantic.invalid_response",
+        )
+
+    raw_operations = draft.get("operations")
+    if not isinstance(raw_operations, list) or not raw_operations:
+        raise _invalid_response(
+            "Semantic generation",
+            data,
+            error_code="semantic.invalid_response",
+        )
+    try:
+        operations = _require_curated_operations(raw_operations)
+    except CliError as exc:
+        raise _invalid_response(
+            "Semantic generation",
+            data,
+            error_code="semantic.invalid_response",
+        ) from exc
+
+    def valid_text(value: Any, *, maximum: int) -> bool:
+        return (
+            isinstance(value, str)
+            and value == value.strip()
+            and 1 <= len(value) <= maximum
+        )
+
+    def valid_text_list(value: Any, *, item_maximum: int) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) <= 12
+            and all(
+                valid_text(item, maximum=item_maximum)
+                for item in value
+            )
+            and len({item.casefold() for item in value}) == len(value)
+        )
+
+    annotation_prefix = "/curated"
+    if target["kind"] == "field":
+        field_id = target["fieldId"]
+        annotation_prefix = (
+            "/curated/fields/"
+            + field_id.replace("~", "~0").replace("/", "~1")
+        )
+    expected_paths = {
+        annotation_prefix + "/displayName": (
+            lambda value: valid_text(value, maximum=120)
+        ),
+        annotation_prefix + "/description": (
+            lambda value: valid_text(value, maximum=2000)
+        ),
+        annotation_prefix + "/tags": (
+            lambda value: valid_text_list(value, item_maximum=80)
+        ),
+        annotation_prefix + "/caveats": (
+            lambda value: valid_text_list(value, item_maximum=400)
+        ),
+    }
+    if (
+        len(operations) > len(expected_paths)
+        or not {operation.get("path") for operation in operations}.issubset(
+            expected_paths
+        )
+        or any(
+            operation.get("op") != "set"
+            or not expected_paths[operation["path"]](
+                operation.get("value")
+            )
+            for operation in operations
+        )
+    ):
+        raise _invalid_response(
+            "Semantic generation",
+            data,
+            error_code="semantic.invalid_response",
+        )
+    return data
+
+
+def _semantic_generation_review(
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    draft = result["draft"]
+    enriched = dict(result)
+    enriched["nextActions"] = [{
+        "id": "semantic.proposal.check",
+        "automatic": False,
+        "command": "config-cli semantic proposals check",
+        "arguments": {
+            "assetId": draft["assetId"],
+            "baseVersion": draft["baseVersion"],
+        },
+        "operationSource": "draft.operations",
+        "explanationSource": "draft.explanation",
+        "note": (
+            "Review the draft, then explicitly check its exact operations. "
+            "Generation did not check, create, or apply a proposal."
+        ),
+    }]
+    return enriched
+
+
+def _require_curated_operations(
+    operations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if len(operations) > 100:
+        raise CliError(
+            "Input operations must contain no more than 100 items.",
+            EXIT_USAGE,
+            details={"count": len(operations), "maximum": 100},
+            error_code="semantic.operation.invalid_input",
+        )
+    paths: set[str] = set()
+    for index, operation in enumerate(operations):
+        op = operation.get("op")
+        if op == "set":
+            expected_keys = {"op", "path", "value"}
+        elif op == "unset":
+            expected_keys = {"op", "path"}
+        else:
+            raise CliError(
+                "Semantic operations must use set or unset.",
+                EXIT_USAGE,
+                details={"index": index, "op": op},
+                error_code="semantic.operation.invalid_input",
+            )
+        if set(operation) != expected_keys:
+            raise CliError(
+                "Semantic operation objects must match the closed set or unset schema.",
+                EXIT_USAGE,
+                details={
+                    "index": index,
+                    "keys": sorted(str(key) for key in operation),
+                },
+                error_code="semantic.operation.invalid_input",
+            )
+        path = operation["path"]
+        if not isinstance(path, str):
+            raise CliError(
+                "Semantic operation paths must be strings.",
+                EXIT_USAGE,
+                details={"index": index},
+                error_code="semantic.operation.invalid_input",
+            )
+        if path != "/curated" and not path.startswith("/curated/"):
+            raise CliError(
+                "Semantic proposal operations may change only the curated profile.",
+                EXIT_USAGE,
+                details={"paths": [path]},
+                error_code="semantic.operation.generated_read_only",
+            )
+        if path != "/curated":
+            raw_parts = path.removeprefix("/curated/").split("/")
+            if any(not part for part in raw_parts):
+                raise CliError(
+                    "Semantic operation paths cannot contain empty keys.",
+                    EXIT_USAGE,
+                    details={"index": index, "path": path},
+                    error_code="semantic.operation.invalid_input",
+                )
+            for part in raw_parts:
+                pointer_index = 0
+                while pointer_index < len(part):
+                    if part[pointer_index] != "~":
+                        pointer_index += 1
+                    elif (
+                        pointer_index + 1 < len(part)
+                        and part[pointer_index + 1] in "01"
+                    ):
+                        pointer_index += 2
+                    else:
+                        raise CliError(
+                            "Semantic operation paths contain an invalid JSON Pointer escape.",
+                            EXIT_USAGE,
+                            details={"index": index, "path": path},
+                            error_code="semantic.operation.invalid_input",
+                        )
+        if path == "/curated" and op == "unset":
+            raise CliError(
+                "The curated root can be replaced but not unset.",
+                EXIT_USAGE,
+                details={"index": index, "path": path},
+                error_code="semantic.operation.invalid_input",
+            )
+        if (
+            path == "/curated"
+            and op == "set"
+            and not isinstance(operation["value"], dict)
+        ):
+            raise CliError(
+                "Setting /curated requires an object value.",
+                EXIT_USAGE,
+                details={"index": index, "path": path},
+                error_code="semantic.operation.invalid_input",
+            )
+        if path in paths:
+            raise CliError(
+                "A semantic proposal cannot operate on the same path more than once.",
+                EXIT_USAGE,
+                details={"index": index, "path": path},
+                error_code="semantic.operation.invalid_input",
+            )
+        paths.add(path)
+    return operations
+
+
+def _semantic_apply_indeterminate(
+    proposal_id: str,
+    *,
+    response: dict[str, Any] | None = None,
+    cause: CliError | None = None,
+    interrupted: bool = False,
+) -> CliError:
+    raw_proposal = response.get("proposal") if response is not None else None
+    raw_asset = response.get("asset") if response is not None else None
+    asset_id = (
+        raw_proposal.get("assetId")
+        if isinstance(raw_proposal, dict)
+        else None
+    )
+    if not isinstance(asset_id, str) or not asset_id.strip():
+        asset_id = (
+            raw_asset.get("id")
+            if isinstance(raw_asset, dict)
+            else None
+        )
+    commands = [{
+        "command": "config-cli semantic proposals show",
+        "arguments": [proposal_id],
+    }]
+    if isinstance(asset_id, str) and asset_id.strip():
+        commands.append({
+            "command": "config-cli semantic catalog show",
+            "arguments": [asset_id],
+        })
+    details: dict[str, Any] = {
+        "proposalId": proposal_id,
+        "proposal": raw_proposal,
+        "reconciliation": {
+            "required": True,
+            "automaticRetry": False,
+            "commands": commands,
+        },
+    }
+    if response is not None:
+        details["response"] = response
+    if cause is not None:
+        details["cause"] = {
+            "code": cause.error_code,
+            "httpStatus": cause.http_status,
+            "details": cause.safe_details,
+        }
+    if interrupted:
+        details["interrupted"] = True
+    return CliError(
+        (
+            "Semantic proposal application outcome is indeterminate. "
+            "Do not retry automatically; reconcile the proposal and asset."
+        ),
+        EXIT_INTERRUPTED if interrupted else EXIT_CONNECTIVITY,
+        details=details,
+        error_code="semantic.apply_indeterminate",
+    )
+
+
+def _workspace_apply_indeterminate(
+    proposal_id: str,
+    *,
+    response: dict[str, Any] | None = None,
+    cause: CliError | None = None,
+    interrupted: bool = False,
+) -> CliError:
+    details: dict[str, Any] = {
+        "proposalId": proposal_id,
+        "reconciliation": {
+            "required": True,
+            "automaticRetry": False,
+            "commands": [
+                {
+                    "command": "config-cli proposals show",
+                    "arguments": [proposal_id],
+                },
+                {"command": "config-cli workspace get", "arguments": []},
+                {"command": "config-cli describe", "arguments": []},
+                {"command": "config-cli xyz status", "arguments": []},
+            ],
+        },
+    }
+    if response is not None:
+        details["response"] = response
+    if cause is not None:
+        details["cause"] = {
+            "code": cause.error_code,
+            "httpStatus": cause.http_status,
+            "details": cause.safe_details,
+        }
+    if interrupted:
+        details["interrupted"] = True
+    return CliError(
+        (
+            "Workspace proposal application outcome is indeterminate. "
+            "Do not retry automatically; reconcile the proposal and live workspace."
+        ),
+        EXIT_INTERRUPTED if interrupted else EXIT_CONNECTIVITY,
+        details=details,
+        error_code="proposal.apply_indeterminate",
+    )
 
 
 def _workspace_from_response(
@@ -864,6 +2594,608 @@ def _auth_from_response(
 
 def _nonnegative_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _finite_nonnegative_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def _derived_spatial_scope(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+    expected_locale: str | None = None,
+) -> dict[str, Any]:
+    def finite_number(candidate: Any) -> bool:
+        return (
+            isinstance(candidate, (int, float))
+            and not isinstance(candidate, bool)
+            and math.isfinite(candidate)
+        )
+
+    if not isinstance(value, dict):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    source_view = value.get("sourceView")
+    source_view_data = source_view if isinstance(source_view, dict) else {}
+    source_zoom: Any = source_view_data.get("z")
+    viewport = value.get("viewport")
+    envelopes = value.get("envelopes")
+    valid_source_view = (
+        isinstance(source_view, dict)
+        and all(
+            finite_number(source_view_data.get(key))
+            for key in ("lng", "lat", "z")
+        )
+        and -180 <= source_view_data["lng"] <= 180
+        and -90 <= source_view_data["lat"] <= 90
+        and 0 <= source_zoom <= 30
+    )
+    valid_viewport = (
+        isinstance(viewport, dict)
+        and viewport.get("width") == 1920
+        and viewport.get("height") == 1080
+        and viewport.get("tileSize") == 256
+    )
+    valid_envelopes = (
+        isinstance(envelopes, list)
+        and 1 <= len(envelopes) <= 2
+        and all(
+            isinstance(envelope, dict)
+            and all(
+                finite_number(envelope.get(key))
+                for key in ("west", "south", "east", "north")
+            )
+            and -180 <= envelope["west"] <= 180
+            and -180 <= envelope["east"] <= 180
+            and -90 <= envelope["south"] <= 90
+            and -90 <= envelope["north"] <= 90
+            and envelope["west"] < envelope["east"]
+            and envelope["south"] < envelope["north"]
+            for envelope in envelopes
+        )
+    )
+    if (
+        value.get("type") != "workspace-map-extent"
+        or not isinstance(value.get("locale"), str)
+        or not value["locale"].strip()
+        or (
+            expected_locale is not None
+            and value.get("locale") != expected_locale
+        )
+        or not valid_source_view
+        or not finite_number(value.get("scopeZoom"))
+        or not 0 <= value["scopeZoom"] <= 30
+        or (
+            valid_source_view
+            and not math.isclose(
+                value["scopeZoom"],
+                max(0, source_zoom - 1),
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+        )
+        or not finite_number(value.get("zoomOffset"))
+        or not -1 <= value["zoomOffset"] <= 0
+        or (
+            valid_source_view
+            and not math.isclose(
+                value["zoomOffset"],
+                value["scopeZoom"] - source_zoom,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+        )
+        or not valid_viewport
+        or value.get("crs") != "EPSG:4326"
+        or not valid_envelopes
+        or value.get("selection") != "intersects-output-geometry"
+        or value.get("clipsGeometry") is not False
+        or not isinstance(value.get("guidance"), str)
+        or not value["guidance"].strip()
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
+def _materialization_guard(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("method"), str)
+        or not value["method"].strip()
+        or not _nonnegative_integer(value.get("maxEstimatedBytes"))
+        or value["maxEstimatedBytes"] == 0
+        or not _nonnegative_integer(value.get("rowOverheadBytes"))
+        or not isinstance(value.get("safetyMultiplier"), (int, float))
+        or isinstance(value["safetyMultiplier"], bool)
+        or not math.isfinite(value["safetyMultiplier"])
+        or value["safetyMultiplier"] < 1
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
+def _materialization_probe(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    integer_fields = (
+        "estimatedRows",
+        "planRowWidthBytes",
+        "rowOverheadBytes",
+        "estimatedBytes",
+        "maxEstimatedBytes",
+    )
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("method"), str)
+        or not value["method"].strip()
+        or any(not _nonnegative_integer(value.get(key)) for key in integer_fields)
+        or value.get("maxEstimatedBytes") == 0
+        or not isinstance(value.get("safetyMultiplier"), (int, float))
+        or isinstance(value["safetyMultiplier"], bool)
+        or not math.isfinite(value["safetyMultiplier"])
+        or value["safetyMultiplier"] < 1
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    expected_bytes = math.ceil(
+        value["estimatedRows"]
+        * (value["planRowWidthBytes"] + value["rowOverheadBytes"])
+        * value["safetyMultiplier"]
+    )
+    if (
+        value["estimatedBytes"] != expected_bytes
+        or value["estimatedBytes"] > value["maxEstimatedBytes"]
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
+def _validate_derived_materialization_probe(
+    derived_layer: dict[str, Any],
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> None:
+    if "materializationProbe" not in derived_layer:
+        return
+    if derived_layer.get("kind") != "materialized":
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    _materialization_probe(
+        derived_layer["materializationProbe"],
+        data=data,
+        label=label,
+    )
+
+
+_QUERY_PLAN_LIMIT_KEYS = {
+    "maxTotalCost",
+    "maxFinalRows",
+    "maxIntermediateRows",
+    "maxIntermediateBytes",
+    "maxJoinExpansionRatio",
+    "maxPlanNodes",
+    "maxPlanDepth",
+    "maxPlannedWorkers",
+}
+_QUERY_GUARD_H3_KEYS = {
+    "maxEstimatedScopeCells",
+    "maxEstimatedExpandedCells",
+    "scopeEstimateSafetyMultiplier",
+    "maxGridDistance",
+}
+_QUERY_GUARD_SHAPE_LIMIT_KEYS = {
+    "maxJoins",
+    "maxCtes",
+    "maxSetOperations",
+    "maxGroupingSets",
+    "maxGeneratedRows",
+}
+_QUERY_GUARD_STAGES = [
+    "postgresql-ast-guard",
+    "postgresql-catalog-guard",
+    "postgresql-explain",
+]
+_QUERY_GUARD_ERROR_CATEGORIES = {
+    "invalid": {
+        "code": "derived_layer.query_invalid",
+        "httpStatus": 400,
+    },
+    "policy": {
+        "code": "derived_layer.query_not_allowed",
+        "httpStatus": 422,
+    },
+    "compute": {
+        "code": "derived_layer.query_too_expensive",
+        "httpStatus": 409,
+    },
+}
+_QUERY_PLAN_H3_EXPANSION_KEYS = {
+    "polygonToCellsCalls",
+    "resolutions",
+    "scopeAreaKm2",
+    "estimatedScopeCells",
+    "maxEstimatedScopeCells",
+    "safetyMultiplier",
+    "gridDiskCalls",
+    "maxGridDistance",
+    "maxAllowedGridDistance",
+    "expansionMultiplier",
+    "estimatedExpandedCells",
+    "maxEstimatedExpandedCells",
+}
+_QUERY_PLAN_PROBE_KEYS = {
+    "method",
+    "estimatedTotalCost",
+    "estimatedFinalRows",
+    "maxIntermediateRows",
+    "maxIntermediateBytes",
+    "maxJoinExpansionRatio",
+    "planNodeCount",
+    "planDepth",
+    "plannedWorkers",
+    "recursivePlan",
+    "h3Expansion",
+    "limits",
+}
+
+
+def _query_plan_limits(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    positive_integer_fields = (
+        "maxFinalRows",
+        "maxIntermediateRows",
+        "maxIntermediateBytes",
+        "maxPlanNodes",
+        "maxPlanDepth",
+    )
+    if (
+        not isinstance(value, dict)
+        or set(value) != _QUERY_PLAN_LIMIT_KEYS
+        or not _finite_nonnegative_number(value.get("maxTotalCost"))
+        or value["maxTotalCost"] == 0
+        or not _finite_nonnegative_number(
+            value.get("maxJoinExpansionRatio")
+        )
+        or value["maxJoinExpansionRatio"] < 1
+        or any(
+            not _nonnegative_integer(value.get(key)) or value[key] == 0
+            for key in positive_integer_fields
+        )
+        or value.get("maxIntermediateRows", 0) < value.get("maxFinalRows", 0)
+        or not _nonnegative_integer(value.get("maxPlannedWorkers"))
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
+def _query_guard_h3(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _QUERY_GUARD_H3_KEYS
+        or not _nonnegative_integer(value.get("maxEstimatedScopeCells"))
+        or value["maxEstimatedScopeCells"] == 0
+        or not _nonnegative_integer(
+            value.get("maxEstimatedExpandedCells")
+        )
+        or value["maxEstimatedExpandedCells"] == 0
+        or value["maxEstimatedExpandedCells"]
+        < value["maxEstimatedScopeCells"]
+        or not _finite_nonnegative_number(
+            value.get("scopeEstimateSafetyMultiplier")
+        )
+        or value["scopeEstimateSafetyMultiplier"] < 1
+        or not _nonnegative_integer(value.get("maxGridDistance"))
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
+def _query_guard(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    legacy_keys = {"method", "limits", "h3"}
+    hardened_keys = legacy_keys | {
+        "stages",
+        "shapeLimits",
+        "errorCategories",
+    }
+    if (
+        not isinstance(value, dict)
+        or frozenset(value) not in {
+            frozenset(legacy_keys),
+            frozenset(hardened_keys),
+        }
+        or value.get("method") != "postgresql-explain"
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    _query_plan_limits(value["limits"], data=data, label=label)
+    _query_guard_h3(value["h3"], data=data, label=label)
+    if set(value) == hardened_keys:
+        shape_limits = value.get("shapeLimits")
+        if (
+            value.get("stages") != _QUERY_GUARD_STAGES
+            or not isinstance(shape_limits, dict)
+            or set(shape_limits) != _QUERY_GUARD_SHAPE_LIMIT_KEYS
+            or any(
+                not _nonnegative_integer(shape_limits.get(key))
+                or shape_limits[key] == 0
+                for key in _QUERY_GUARD_SHAPE_LIMIT_KEYS
+            )
+            or value.get("errorCategories")
+            != _QUERY_GUARD_ERROR_CATEGORIES
+        ):
+            raise _invalid_response(
+                label,
+                data,
+                error_code="derived_layer.invalid_response",
+            )
+    return value
+
+
+def _query_plan_h3_expansion(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    integer_fields = (
+        "polygonToCellsCalls",
+        "estimatedScopeCells",
+        "maxEstimatedScopeCells",
+        "gridDiskCalls",
+        "maxGridDistance",
+        "maxAllowedGridDistance",
+        "estimatedExpandedCells",
+        "maxEstimatedExpandedCells",
+    )
+    if (
+        not isinstance(value, dict)
+        or set(value) != _QUERY_PLAN_H3_EXPANSION_KEYS
+        or any(
+            not _nonnegative_integer(value.get(key))
+            for key in integer_fields
+        )
+        or value["maxEstimatedScopeCells"] == 0
+        or value["maxEstimatedExpandedCells"] == 0
+        or value["maxEstimatedExpandedCells"]
+        < value["maxEstimatedScopeCells"]
+        or not _finite_nonnegative_number(value.get("scopeAreaKm2"))
+        or not _finite_nonnegative_number(value.get("safetyMultiplier"))
+        or value["safetyMultiplier"] < 1
+        or not _nonnegative_integer(value.get("expansionMultiplier"))
+        or value["expansionMultiplier"] < 1
+        or not isinstance(value.get("resolutions"), list)
+        or any(
+            not _nonnegative_integer(resolution) or resolution > 15
+            for resolution in value.get("resolutions", [])
+        )
+        or len(value["resolutions"]) != value["polygonToCellsCalls"]
+        or value["estimatedScopeCells"] > value["maxEstimatedScopeCells"]
+        or value["estimatedExpandedCells"]
+        != value["estimatedScopeCells"] * value["expansionMultiplier"]
+        or value["estimatedExpandedCells"]
+        > value["maxEstimatedExpandedCells"]
+        or value["maxGridDistance"] > value["maxAllowedGridDistance"]
+        or (
+            value["gridDiskCalls"] == 0
+            and value["maxGridDistance"] != 0
+        )
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
+def _query_plan_probe(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    integer_fields = (
+        "estimatedFinalRows",
+        "maxIntermediateRows",
+        "maxIntermediateBytes",
+        "planNodeCount",
+        "planDepth",
+        "plannedWorkers",
+    )
+    if (
+        not isinstance(value, dict)
+        or set(value) != _QUERY_PLAN_PROBE_KEYS
+        or value.get("method") != "postgresql-explain"
+        or not _finite_nonnegative_number(value.get("estimatedTotalCost"))
+        or not _finite_nonnegative_number(
+            value.get("maxJoinExpansionRatio")
+        )
+        or value["maxJoinExpansionRatio"] < 1
+        or any(
+            not _nonnegative_integer(value.get(key))
+            for key in integer_fields
+        )
+        or value["planNodeCount"] == 0
+        or value["planDepth"] == 0
+        or value["planNodeCount"] < value["planDepth"]
+        or value["maxIntermediateRows"] < value["estimatedFinalRows"]
+        or not isinstance(value.get("recursivePlan"), bool)
+        or value["recursivePlan"]
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+
+    limits = _query_plan_limits(value["limits"], data=data, label=label)
+    _query_plan_h3_expansion(
+        value["h3Expansion"],
+        data=data,
+        label=label,
+    )
+    if (
+        value["estimatedTotalCost"] > limits["maxTotalCost"]
+        or value["estimatedFinalRows"] > limits["maxFinalRows"]
+        or value["maxIntermediateRows"] > limits["maxIntermediateRows"]
+        or value["maxIntermediateBytes"] > limits["maxIntermediateBytes"]
+        or value["maxJoinExpansionRatio"]
+        > limits["maxJoinExpansionRatio"]
+        or value["planNodeCount"] > limits["maxPlanNodes"]
+        or value["planDepth"] > limits["maxPlanDepth"]
+        or value["plannedWorkers"] > limits["maxPlannedWorkers"]
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
+def _validate_derived_query_plan_probe(
+    derived_layer: dict[str, Any],
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> None:
+    # Older compatible servers do not return universal query-plan evidence.
+    if "queryPlanProbe" not in derived_layer:
+        return
+    _query_plan_probe(
+        derived_layer["queryPlanProbe"],
+        data=data,
+        label=label,
+    )
+
+
+def _validate_derived_layer_response(
+    data: dict[str, Any],
+    *,
+    expected_name: str,
+    require_spatial_scope: bool,
+    expected_locale: str | None = None,
+    validate_probes: bool = True,
+) -> None:
+    derived_layer = data.get("derivedLayer")
+    if (
+        not isinstance(derived_layer, dict)
+        or not isinstance(derived_layer.get("name"), str)
+        or not derived_layer["name"]
+        or derived_layer["name"] != expected_name
+    ):
+        raise _invalid_response(
+            "Derived layer",
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    spatial_scope = derived_layer.get("spatialScope")
+    if require_spatial_scope or spatial_scope is not None:
+        _derived_spatial_scope(
+            spatial_scope,
+            data=data,
+            label="Derived-layer spatial scope",
+            expected_locale=expected_locale,
+        )
+    if "semanticProfile" in derived_layer:
+        _semantic_profile(
+            derived_layer["semanticProfile"],
+            data=data,
+            label="Derived-layer semantic profile",
+            require_name=False,
+        )
+    if validate_probes:
+        _validate_derived_materialization_probe(
+            derived_layer,
+            data=data,
+            label="Derived layer",
+        )
+        _validate_derived_query_plan_probe(
+            derived_layer,
+            data=data,
+            label="Derived layer",
+        )
+
+
+def _validate_semantic_status(data: dict[str, Any]) -> dict[str, Any]:
+    capabilities = data.get("capabilities")
+    schema_version = data.get("schemaVersion")
+    if (
+        data.get("ok") is not True
+        or not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version < 1
+        or not isinstance(capabilities, (dict, list))
+    ):
+        raise _invalid_response(
+            "Semantic status",
+            data,
+            error_code="semantic.invalid_response",
+        )
+    _semantic_revision(data, label="Semantic status")
+    return data
 
 
 def _validate_xyz_status(
@@ -989,23 +3321,512 @@ def _validate_candidate_visual_evidence(
     return _validate_visual_evidence(data, layer=layer)
 
 
+def _validate_requested_visual_evidence(
+    data: dict[str, Any],
+    *,
+    action: str,
+    panels: list[str] | None = None,
+    expected_info_text: list[str] | None = None,
+    hover: bool | None = None,
+    expected_hover_text: list[str] | None = None,
+) -> dict[str, Any]:
+    visual = data.get("visual")
+    if not isinstance(visual, dict):
+        raise _invalid_response(
+            "Proposal candidate visual evidence",
+            data,
+            error_code="visual.invalid_response",
+        )
+    missing: list[dict[str, Any]] = []
+    artifacts = visual.get("artifacts")
+    artifacts = artifacts if isinstance(artifacts, dict) else {}
+    comparison = visual.get("comparison")
+    comparison = comparison if isinstance(comparison, dict) else {}
+    plan = data.get("plan")
+    applicability = plan.get("evidenceApplicability") if isinstance(plan, dict) else None
+    applicability = applicability if isinstance(applicability, dict) else {}
+
+    for panel in panels or []:
+        artifact_name = (
+            "FilteringPanel" if panel == "filtering" else "StylingPanel"
+        )
+        for side, report_key, artifact_prefix in (
+            ("original", "original", "before"),
+            ("candidate", "candidate", "after"),
+        ):
+            if applicability.get(side) is False:
+                continue
+            report = comparison.get(report_key)
+            panel_reports = (
+                report.get("panels") if isinstance(report, dict) else None
+            )
+            evidence = (
+                panel_reports.get(panel)
+                if isinstance(panel_reports, dict)
+                else None
+            )
+            artifact = artifacts.get(f"{artifact_prefix}{artifact_name}")
+            if (
+                not isinstance(evidence, dict)
+                or evidence.get("passed") is not True
+                or not isinstance(artifact, str)
+                or not artifact
+            ):
+                missing.append({
+                    "kind": "panel",
+                    "panel": panel,
+                    "side": side,
+                    "evidence": evidence,
+                    "artifact": artifact,
+                })
+
+    planned = (
+        plan.get("featureInfoEvidence")
+        if isinstance(plan, dict)
+        else None
+    )
+    planned_candidate = (
+        planned.get("candidate") if isinstance(planned, dict) else None
+    )
+    info_requested = bool(expected_info_text) or (
+        isinstance(planned_candidate, dict)
+        and planned_candidate.get("requested") is True
+    )
+    if info_requested and action == "preview-test":
+        interaction = visual.get("interaction")
+        found = (
+            interaction.get("expectedInfoPanelTextFound")
+            if isinstance(interaction, dict)
+            else None
+        )
+        expected = expected_info_text or (
+            planned_candidate.get("expectedText", [])
+            if isinstance(planned_candidate, dict)
+            else []
+        )
+        artifact = artifacts.get("infoPanel")
+        if (
+            not isinstance(interaction, dict)
+            or interaction.get("infoPanelExpanded") is not True
+            or not isinstance(found, dict)
+            or any(found.get(text) is not True for text in expected)
+            or not isinstance(artifact, str)
+            or not artifact
+        ):
+            missing.append({
+                "kind": "feature-info",
+                "side": "candidate",
+                "evidence": interaction,
+                "artifact": artifact,
+            })
+    elif info_requested and action == "preview-screenshot":
+        observations = comparison.get("featureInfoEvidence")
+        observations = observations if isinstance(observations, dict) else {}
+        for side, artifact_name in (
+            ("original", "beforeInfoPanel"),
+            ("candidate", "afterInfoPanel"),
+        ):
+            side_plan = planned.get(side) if isinstance(planned, dict) else None
+            if not isinstance(side_plan, dict) or side_plan.get("requested") is not True:
+                continue
+            evidence = observations.get(side)
+            artifact = artifacts.get(artifact_name)
+            if (
+                not isinstance(evidence, dict)
+                or evidence.get("captured") is not True
+                or evidence.get("passed") is not True
+                or not isinstance(artifact, str)
+                or not artifact
+            ):
+                missing.append({
+                    "kind": "feature-info",
+                    "side": side,
+                    "evidence": evidence,
+                    "artifact": artifact,
+                })
+
+    if hover is not False:
+        hover_reports: list[tuple[str, Any, str]] = (
+            [("candidate", visual, "hoverTooltip")]
+            if action == "preview-test"
+            else [
+                ("original", comparison.get("original"), "beforeHoverTooltip"),
+                ("candidate", comparison.get("candidate"), "afterHoverTooltip"),
+            ]
+            if action == "preview-screenshot"
+            else []
+        )
+        for side, report, artifact_name in hover_reports:
+            if applicability.get(side) is False:
+                continue
+            evidence = report.get("hover") if isinstance(report, dict) else None
+            requested = (
+                hover is True
+                or bool(expected_hover_text)
+                or (
+                    isinstance(evidence, dict)
+                    and evidence.get("requested") is True
+                )
+            )
+            if not requested:
+                continue
+            artifact = artifacts.get(artifact_name)
+            if (
+                not isinstance(evidence, dict)
+                or evidence.get("requested") is not True
+                or evidence.get("attempted") is not True
+                or evidence.get("opened") is not True
+                or evidence.get("passed") is not True
+                or not isinstance(artifact, str)
+                or not artifact
+            ):
+                missing.append({
+                    "kind": "hover",
+                    "side": side,
+                    "evidence": evidence,
+                    "artifact": artifact,
+                })
+
+    if missing:
+        raise CliError(
+            "Requested proposal visual evidence was not captured.",
+            EXIT_VISUAL,
+            details={**data, "missingEvidence": missing},
+            error_code="visual.evidence_incomplete",
+        )
+    return data
+
+
 def _artifact_paths(data: dict[str, Any]) -> dict[str, str]:
     visual = data.get("visual")
     artifacts = visual.get("artifacts") if isinstance(visual, dict) else None
     if not isinstance(artifacts, dict):
-        return {}
-    output = {}
+        raise CliError(
+            "Visual response did not provide a downloadable artifact map.",
+            EXIT_CONNECTIVITY,
+            details={"reason": "missing-or-malformed"},
+            error_code="visual.artifacts_unavailable",
+        )
+    if not artifacts:
+        raise CliError(
+            "Visual response did not provide any downloadable artifacts.",
+            EXIT_CONNECTIVITY,
+            details={"reason": "empty"},
+            error_code="visual.artifacts_unavailable",
+        )
+    if len(artifacts) > MAX_VISUAL_ARTIFACTS:
+        raise CliError(
+            "Visual response exceeds the artifact-count limit.",
+            EXIT_CONNECTIVITY,
+            details={
+                "artifactCount": len(artifacts),
+                "maxArtifacts": MAX_VISUAL_ARTIFACTS,
+            },
+            error_code="visual.artifact_count_exceeded",
+        )
+    output: dict[str, str] = {}
+    invalid: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
     for name, path in artifacts.items():
-        if (
-            isinstance(name, str)
-            and name
-            and isinstance(path, str)
-            and path
-            and not path.startswith("/")
-            and ".." not in Path(path).parts
+        reason = None
+        if not isinstance(name, str) or not name:
+            reason = "artifact name is not a non-empty string"
+        elif not isinstance(path, str) or not path:
+            reason = "artifact path is not a non-empty string"
+        elif any(
+            ord(character) < 0x20
+            or ord(character) == 0x7F
+            or 0x80 <= ord(character) <= 0x9F
+            for character in path
         ):
-            output[name] = path
+            reason = "artifact path contains control characters"
+        elif "\\" in path:
+            reason = "artifact path contains a Windows separator"
+        elif (
+            PurePosixPath(path).is_absolute()
+            or PureWindowsPath(path).is_absolute()
+            or bool(PureWindowsPath(path).drive)
+        ):
+            reason = "artifact path is absolute or drive-qualified"
+        else:
+            parts = path.split("/")
+            if any(part in {"", ".", ".."} for part in parts):
+                reason = "artifact path contains an empty, dot, or traversal segment"
+            elif any(":" in part for part in parts):
+                reason = "artifact path contains a Windows drive or stream separator"
+            elif path in seen_paths:
+                reason = "artifact path is duplicated"
+        if reason is not None:
+            invalid.append({
+                "artifact": name if isinstance(name, str) else None,
+                "path": path if isinstance(path, str) else None,
+                "reason": reason,
+            })
+            continue
+        output[name] = path
+        seen_paths.add(path)
+    if invalid:
+        raise CliError(
+            "Visual artifact response contains an unsafe local path.",
+            EXIT_CONNECTIVITY,
+            details={"invalidArtifacts": invalid},
+            error_code="visual.artifact_path_invalid",
+        )
     return output
+
+
+def _artifact_directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _open_artifact_root(destination: str) -> tuple[Path, int | None]:
+    expanded = Path(destination).expanduser()
+    root = Path(os.path.abspath(os.fspath(expanded)))
+    if os.name != "posix":  # pragma: no cover - Windows fallback
+        current = Path(root.anchor)
+        for part in root.parts[1:]:
+            current /= part
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                current.mkdir(mode=0o700)
+                os.chmod(current, 0o700)
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise CliError(
+                    "Artifact destination must contain only real directories.",
+                    EXIT_CONNECTIVITY,
+                    details={"path": str(current)},
+                    error_code="visual.artifact_destination_unsafe",
+                )
+        return root, None
+
+    descriptor = os.open(root.anchor, _artifact_directory_flags())
+    try:
+        for part in root.parts[1:]:
+            try:
+                child = os.open(
+                    part,
+                    _artifact_directory_flags(),
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                os.mkdir(part, 0o700, dir_fd=descriptor)
+                child = os.open(
+                    part,
+                    _artifact_directory_flags(),
+                    dir_fd=descriptor,
+                )
+                os.fchmod(child, 0o700)
+            os.close(descriptor)
+            descriptor = child
+        return root, descriptor
+    except OSError as exc:
+        os.close(descriptor)
+        raise CliError(
+            "Artifact destination must contain only real directories.",
+            EXIT_CONNECTIVITY,
+            details={"path": str(root), "exception": type(exc).__name__},
+            error_code="visual.artifact_destination_unsafe",
+        ) from exc
+
+
+def _open_artifact_parent(root_descriptor: int, parts: list[str]) -> int:
+    descriptor = os.dup(root_descriptor)
+    try:
+        for part in parts:
+            try:
+                child = os.open(
+                    part,
+                    _artifact_directory_flags(),
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                os.mkdir(part, 0o700, dir_fd=descriptor)
+                child = os.open(
+                    part,
+                    _artifact_directory_flags(),
+                    dir_fd=descriptor,
+                )
+                os.fchmod(child, 0o700)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except OSError:
+        os.close(descriptor)
+        raise
+
+
+def _write_artifact_descriptor(
+    root_descriptor: int,
+    artifact_path: str,
+    body: bytes,
+) -> None:
+    parts = artifact_path.split("/")
+    parent_descriptor = _open_artifact_parent(root_descriptor, parts[:-1])
+    temporary_name = ""
+    descriptor = -1
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        for _ in range(10):
+            candidate = f".{parts[-1]}.{os.urandom(8).hex()}.tmp"
+            try:
+                descriptor = os.open(
+                    candidate,
+                    flags,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if descriptor < 0:
+            raise OSError("unable to allocate a unique artifact temporary file")
+        os.fchmod(descriptor, 0o600)
+        remaining = memoryview(body)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("artifact write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.link(
+            temporary_name,
+            parts[-1],
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary_name, dir_fd=parent_descriptor)
+        temporary_name = ""
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_name:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+        os.close(parent_descriptor)
+
+
+def _write_artifact_fallback(
+    root: Path,
+    artifact_path: str,
+    body: bytes,
+) -> None:  # pragma: no cover - Windows fallback
+    target = root.joinpath(*artifact_path.split("/"))
+    current = root
+    for part in artifact_path.split("/")[:-1]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+            os.chmod(current, 0o700)
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("artifact directory component is not a real directory")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary_name, target, follow_symlinks=False)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
+def _artifact_failure(
+    name: str,
+    artifact_path: str,
+    error: CliError,
+) -> dict[str, Any]:
+    failure: dict[str, Any] = {
+        "artifact": name,
+        "path": artifact_path,
+        "error": error.message,
+        "code": error.error_code,
+    }
+    if error.http_status is not None:
+        failure["httpStatus"] = error.http_status
+    if error.safe_details not in (None, {}, []):
+        failure["details"] = error.safe_details
+    return failure
+
+
+def _artifact_total_limit_error(
+    name: str,
+    artifact_path: str,
+    downloaded_bytes: int,
+) -> CliError:
+    return CliError(
+        "Visual artifacts exceed the cumulative 64 MiB download limit.",
+        EXIT_CONNECTIVITY,
+        details={
+            "artifact": name,
+            "path": artifact_path,
+            "downloadedBytes": downloaded_bytes,
+            "maxTotalBytes": MAX_VISUAL_ARTIFACT_TOTAL_BYTES,
+        },
+        error_code="visual.artifact_total_too_large",
+    )
+
+
+def _store_visual_artifact(
+    root: Path,
+    root_descriptor: int | None,
+    artifact_path: str,
+    body: bytes,
+) -> None:
+    try:
+        if root_descriptor is not None:
+            _write_artifact_descriptor(root_descriptor, artifact_path, body)
+        else:
+            _write_artifact_fallback(root, artifact_path, body)
+    except FileExistsError as exc:
+        raise CliError(
+            "Artifact destination already exists; refusing to overwrite it.",
+            EXIT_CONNECTIVITY,
+            details={"path": str(root / artifact_path)},
+            error_code="visual.artifact_exists",
+        ) from exc
+    except OSError as exc:
+        raise CliError(
+            "Unable to store visual artifact safely.",
+            EXIT_CONNECTIVITY,
+            details={
+                "path": str(root / artifact_path),
+                "exception": type(exc).__name__,
+            },
+            error_code="visual.artifact_write_failed",
+        ) from exc
 
 
 def _download_visual_artifacts(
@@ -1017,37 +3838,115 @@ def _download_visual_artifacts(
 ) -> dict[str, Any]:
     if not destination:
         return data
-    artifacts = _artifact_paths(data)
-    if not artifacts:
-        return data
-    root = Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
-    local = {}
-    download_errors = []
-    for name, artifact_path in artifacts.items():
+    try:
+        artifacts = _artifact_paths(data)
+    except CliError as exc:
+        if not preserve_download_failures:
+            raise
+        enriched = dict(data)
+        enriched["artifactDownloadErrors"] = [{
+            "artifact": None,
+            "path": None,
+            "error": exc.message,
+            "code": exc.error_code,
+            "details": exc.safe_details,
+        }]
+        return enriched
+    root: Path | None = None
+    root_descriptor: int | None = None
+    if preserve_download_failures:
         try:
-            body, _ = client.request_bytes(
-                f"/api/artifacts/{urllib.parse.quote(artifact_path, safe='/')}"
-            )
+            root, root_descriptor = _open_artifact_root(destination)
         except CliError as exc:
-            if not preserve_download_failures:
-                raise
-            failure: dict[str, Any] = {
-                "artifact": name,
-                "path": artifact_path,
+            enriched = dict(data)
+            enriched["artifactDownloadErrors"] = [{
+                "artifact": None,
+                "path": destination,
                 "error": exc.message,
                 "code": exc.error_code,
-            }
-            if exc.http_status is not None:
-                failure["httpStatus"] = exc.http_status
-            if exc.safe_details not in (None, {}, []):
-                failure["details"] = exc.safe_details
-            download_errors.append(failure)
-            continue
-        target = root / artifact_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(body)
-        local[name] = str(target)
+                "details": exc.safe_details,
+            }]
+            return enriched
+    local: dict[str, str] = {}
+    download_errors: list[dict[str, Any]] = []
+    pending: list[tuple[str, str, bytes]] = []
+    downloaded_bytes = 0
+    try:
+        for name, artifact_path in artifacts.items():
+            remaining_bytes = (
+                MAX_VISUAL_ARTIFACT_TOTAL_BYTES - downloaded_bytes
+            )
+            if remaining_bytes <= 0:
+                error = _artifact_total_limit_error(
+                    name,
+                    artifact_path,
+                    downloaded_bytes,
+                )
+                if not preserve_download_failures:
+                    raise error
+                download_errors.append(
+                    _artifact_failure(name, artifact_path, error)
+                )
+                break
+            response_limit = min(MAX_RESPONSE_BYTES, remaining_bytes)
+            try:
+                body, _ = client.request_bytes(
+                    f"/api/artifacts/{urllib.parse.quote(artifact_path, safe='/')}",
+                    max_response_bytes=response_limit,
+                )
+            except CliError as exc:
+                error = (
+                    _artifact_total_limit_error(
+                        name,
+                        artifact_path,
+                        downloaded_bytes,
+                    )
+                    if exc.error_code == "api.response_too_large"
+                    and response_limit == remaining_bytes
+                    else exc
+                )
+                if not preserve_download_failures:
+                    raise error
+                download_errors.append(
+                    _artifact_failure(name, artifact_path, error)
+                )
+                break
+            downloaded_bytes += len(body)
+            pending.append((name, artifact_path, body))
+            if preserve_download_failures:
+                assert root is not None
+                try:
+                    _store_visual_artifact(
+                        root,
+                        root_descriptor,
+                        artifact_path,
+                        body,
+                    )
+                except CliError as exc:
+                    download_errors.append(
+                        _artifact_failure(name, artifact_path, exc)
+                    )
+                    break
+                pending.pop()
+                local[name] = str(
+                    root.joinpath(*artifact_path.split("/"))
+                )
+
+        if not preserve_download_failures:
+            root, root_descriptor = _open_artifact_root(destination)
+            for name, artifact_path, body in pending:
+                _store_visual_artifact(
+                    root,
+                    root_descriptor,
+                    artifact_path,
+                    body,
+                )
+                local[name] = str(
+                    root.joinpath(*artifact_path.split("/"))
+                )
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
     enriched = dict(data)
     if local:
         enriched["localArtifacts"] = local
@@ -1060,10 +3959,17 @@ def _strict_json_file(path: str) -> Any:
     def reject_constant(value: str):
         raise ValueError(f"{value} is not valid JSON")
 
-    file_path = Path(path)
+    file_path = Path(path).expanduser()
     try:
         return json.loads(
-            file_path.read_text(encoding="utf-8"),
+            _read_bounded_local_text(
+                file_path,
+                label="validation file",
+                exit_code=EXIT_VALIDATION,
+                unavailable_code="validation.file_unavailable",
+                too_large_code="validation.file_too_large",
+                invalid_utf8_code="validation.invalid_json",
+            ),
             parse_constant=reject_constant,
         )
     except json.JSONDecodeError as exc:
@@ -1079,13 +3985,6 @@ def _strict_json_file(path: str) -> Any:
             EXIT_VALIDATION,
             details={"path": str(file_path)},
             error_code="validation.invalid_json",
-        ) from exc
-    except OSError as exc:
-        raise CliError(
-            f"Unable to read validation file: {exc}",
-            EXIT_VALIDATION,
-            details={"path": str(file_path)},
-            error_code="validation.file_unavailable",
         ) from exc
 
 
@@ -1309,6 +4208,15 @@ def _initialize(
         )
     contract_version = require_compatible_contract(contract.get("contractVersion"))
     api_version = require_compatible_api(contract.get("apiVersion"))
+    connection = client.request("/api/connect")
+    if connection.get("authenticated") is not True:
+        raise CliError(
+            "Configuration service did not confirm the credential.",
+            EXIT_AUTHENTICATION,
+            details=connection,
+            error_code="auth.connection_not_confirmed",
+        )
+    actor, scopes = _auth_from_response(connection)
     profile = Profile(
         name,
         endpoint,
@@ -1332,6 +4240,9 @@ def _initialize(
         "contractVersion": contract_version,
         "apiVersion": api_version,
         "compatible": True,
+        "actor": actor,
+        "scopes": scopes,
+        "expires": connection.get("expires"),
     }
     if previous is not None:
         result["replacement"] = {
@@ -1365,15 +4276,13 @@ def _setup(args, store: ConfigStore) -> dict[str, Any]:
         else None
     )
     if previous_profile is not None:
-        previous_token = store.token_for(previous_profile)
         print(
             "Current profile:\n"
-            f"  Name: {previous_profile.name}\n"
-            f"  Endpoint: {previous_profile.endpoint}\n"
-            f"  Instance: {previous_profile.instance_id}\n"
-            f"  Contract: {previous_profile.contract_version}\n"
-            f"  Allow HTTP: {'yes' if previous_profile.allow_http else 'no'}\n"
-            f"  Token prefix: {previous_token[:6]}…",
+            f"  Name: {sanitize_terminal_text(previous_profile.name)}\n"
+            f"  Endpoint: {sanitize_terminal_text(previous_profile.endpoint)}\n"
+            f"  Instance: {sanitize_terminal_text(previous_profile.instance_id)}\n"
+            f"  Contract: {sanitize_terminal_text(previous_profile.contract_version)}\n"
+            f"  Allow HTTP: {'yes' if previous_profile.allow_http else 'no'}",
             file=prompt_stream,
         )
         if not args.force:
@@ -1419,7 +4328,7 @@ def _setup(args, store: ConfigStore) -> dict[str, Any]:
         normalized = normalize_endpoint(endpoint, allow_http=allow_http)
         identity_timeout = min(args.timeout, 10.0)
         print(
-            f"Checking target identity at {normalized} "
+            f"Checking target identity at {sanitize_terminal_text(normalized)} "
             f"(timeout {identity_timeout:g}s)…",
             file=prompt_stream,
             flush=True,
@@ -1438,8 +4347,11 @@ def _setup(args, store: ConfigStore) -> dict[str, Any]:
                 error_code="instance.invalid_identity",
             )
         print(
-            f"Replace {previous_profile.endpoint} ({previous_profile.instance_id})\n"
-            f"with    {normalized} ({new_instance})",
+            "Replace "
+            f"{sanitize_terminal_text(previous_profile.endpoint)} "
+            f"({sanitize_terminal_text(previous_profile.instance_id)})\n"
+            f"with    {sanitize_terminal_text(normalized)} "
+            f"({sanitize_terminal_text(new_instance)})",
             file=prompt_stream,
         )
         answer = prompt("Replace this profile? [y/N]: ", prompt_stream)
@@ -1487,21 +4399,174 @@ def _setup(args, store: ConfigStore) -> dict[str, Any]:
     return result
 
 
+def _device_scope_set(
+    value: Any,
+    *,
+    label: str,
+    exit_code: int,
+    error_code: str,
+) -> frozenset[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(scope, str)
+            or not scope.strip()
+            or scope != scope.strip()
+            or scope not in _DEVICE_SCOPES
+            for scope in value
+        )
+        or len(set(value)) != len(value)
+    ):
+        raise CliError(
+            f"{label} are invalid.",
+            exit_code,
+            details={"scopes": value},
+            error_code=error_code,
+        )
+    return frozenset(value)
+
+
+def _device_response_scopes(
+    value: Any,
+    *,
+    requested: list[str],
+    label: str,
+) -> list[str]:
+    returned = _device_scope_set(
+        value,
+        label=label,
+        exit_code=EXIT_CONNECTIVITY,
+        error_code="auth.device_invalid_response",
+    )
+    if returned != frozenset(requested):
+        raise CliError(
+            f"{label} do not match the requested authority.",
+            EXIT_CONNECTIVITY,
+            details={
+                "requestedScopes": requested,
+                "returnedScopes": value,
+            },
+            error_code="auth.device_invalid_response",
+        )
+    return list(value)
+
+
+def _device_default_scopes(contract: dict[str, Any]) -> list[str]:
+    fallback = ["inspect", "propose", "visual"]
+    authentication = contract.get("authentication")
+    if isinstance(authentication, dict) and "defaultDeviceScopes" in authentication:
+        advertised = authentication["defaultDeviceScopes"]
+        advertised_set = _device_scope_set(
+            advertised,
+            label="The server's default device scopes",
+            exit_code=EXIT_CONFLICT,
+            error_code="auth.device_invalid_contract",
+        )
+        supported = authentication.get("scopes")
+        if (
+            not advertised_set.issubset(_SAFE_DEFAULT_DEVICE_SCOPES)
+            or (
+                "scopes" in authentication
+                and (
+                    not isinstance(supported, list)
+                    or any(scope not in supported for scope in advertised)
+                )
+            )
+        ):
+            raise CliError(
+                "The server advertises invalid default device scopes.",
+                EXIT_CONFLICT,
+                details={"defaultDeviceScopes": advertised},
+                error_code="auth.device_invalid_contract",
+            )
+        return list(advertised)
+
+    supported = (
+        authentication.get("scopes")
+        if isinstance(authentication, dict)
+        else None
+    )
+    commands = contract.get("commands")
+    semantic_supported = (
+        isinstance(supported, list)
+        and "semantic:inspect" in supported
+    ) or (
+        isinstance(commands, list)
+        and any(
+            isinstance(command, str) and command.startswith("semantic ")
+            for command in commands
+        )
+    )
+    if semantic_supported:
+        fallback.append("semantic:inspect")
+    return fallback
+
+
+def _device_verification_uri(endpoint: str, value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(
+            ord(character) <= 0x20
+            or ord(character) == 0x7F
+            or 0x80 <= ord(character) <= 0x9F
+            for character in value
+        )
+    ):
+        raise CliError(
+            "Device authorization returned an invalid verification URI.",
+            EXIT_CONNECTIVITY,
+            error_code="auth.device_invalid_response",
+        )
+    candidate = urllib.parse.urljoin(endpoint + "/", value)
+    try:
+        expected = urllib.parse.urlsplit(endpoint)
+        parsed = urllib.parse.urlsplit(candidate)
+        expected_port = expected.port or (443 if expected.scheme == "https" else 80)
+        candidate_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise CliError(
+            "Device authorization returned an invalid verification URI.",
+            EXIT_CONNECTIVITY,
+            error_code="auth.device_invalid_response",
+        ) from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.scheme != expected.scheme
+        or parsed.hostname is None
+        or expected.hostname is None
+        or parsed.hostname.lower() != expected.hostname.lower()
+        or candidate_port != expected_port
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise CliError(
+            "Device authorization verification URI must use the configured origin.",
+            EXIT_CONFLICT,
+            error_code="auth.device_origin_mismatch",
+        )
+    return candidate
+
+
 def _device_authorize(args, store: ConfigStore) -> dict[str, Any]:
-    profile, _ = store.connection(args.profile, args.token_file)
+    profile, current_token = store.connection(args.profile, args.token_file)
     client = ApiClient(
         profile.endpoint,
+        current_token,
         timeout=args.timeout,
         allow_http=profile.allow_http,
     )
-    identity = client.request("/api/public/identity", authenticated=False)
-    if identity.get("instanceId") != profile.instance_id:
-        raise CliError(
-            "Live configuration instance does not match the selected profile.",
-            EXIT_CONFLICT,
-            error_code="instance.mismatch",
-        )
-    scopes = args.device_scopes or ["inspect", "propose", "visual"]
+    target = verify_target(client, profile)
+    require_contract_command(target.contract, args)
+    scopes = args.device_scopes or _device_default_scopes(target.contract)
+    _device_scope_set(
+        scopes,
+        label="Requested device scopes",
+        exit_code=EXIT_USAGE,
+        error_code="auth.device_invalid_scopes",
+    )
     started = client.request(
         "/api/auth/device",
         method="POST",
@@ -1530,12 +4595,22 @@ def _device_authorize(args, store: ConfigStore) -> dict[str, Any]:
             EXIT_CONNECTIVITY,
             error_code="auth.device_invalid_response",
         )
-    verification_uri = urllib.parse.urljoin(
-        profile.endpoint + "/",
-        str(started.get("verificationUri") or "/"),
+    _device_response_scopes(
+        started.get("scopes"),
+        requested=scopes,
+        label="Device authorization start scopes",
+    )
+    verification_uri = _device_verification_uri(
+        profile.endpoint,
+        started.get("verificationUri"),
     )
     prompt_stream = getattr(args, "prompt_stream", sys.stderr)
-    print(f"Approve device code {user_code} at {verification_uri}", file=prompt_stream)
+    print(
+        "Approve device code "
+        f"{sanitize_terminal_text(user_code)} at "
+        f"{sanitize_terminal_text(verification_uri)}",
+        file=prompt_stream,
+    )
     if not args.no_browser and sys.stdout.isatty():
         webbrowser.open(verification_uri, new=2)
     deadline = time.monotonic() + expires_in
@@ -1550,12 +4625,34 @@ def _device_authorize(args, store: ConfigStore) -> dict[str, Any]:
         if status == "authorized":
             token = response.get("token")
             record = response.get("record")
-            if not isinstance(token, str) or not token or not isinstance(record, dict):
+            if (
+                not isinstance(token, str)
+                or not token
+                or not isinstance(record, dict)
+            ):
                 raise CliError(
                     "Authorized device response omitted its credential.",
                     EXIT_CONNECTIVITY,
                     error_code="auth.device_invalid_response",
                 )
+            token_id = record.get("id")
+            expires = record.get("expires")
+            if (
+                not isinstance(token_id, str)
+                or not token_id.strip()
+                or not isinstance(expires, str)
+                or not expires.strip()
+            ):
+                raise CliError(
+                    "Authorized device credential metadata is incomplete.",
+                    EXIT_CONNECTIVITY,
+                    error_code="auth.device_invalid_response",
+                )
+            _device_response_scopes(
+                record.get("scopes"),
+                requested=scopes,
+                label="Authorized device record scopes",
+            )
             authenticated = ApiClient(
                 profile.endpoint,
                 token,
@@ -1564,7 +4661,12 @@ def _device_authorize(args, store: ConfigStore) -> dict[str, Any]:
             )
             target = verify_target(authenticated, profile)
             me = authenticated.request("/api/auth/me")
-            actor, granted_scopes = _auth_from_response(me, scopes)
+            actor, _ = _auth_from_response(me, scopes)
+            granted_scopes = _device_response_scopes(
+                me.get("scopes"),
+                requested=scopes,
+                label="Authenticated device scopes",
+            )
             replacement = store.replace_token(profile, token)
             return {
                 "authorized": True,
@@ -1573,8 +4675,8 @@ def _device_authorize(args, store: ConfigStore) -> dict[str, Any]:
                 "instanceId": target.live_instance_id,
                 "actor": actor,
                 "scopes": granted_scopes,
-                "expires": record.get("expires"),
-                "tokenId": record.get("id"),
+                "expires": expires,
+                "tokenId": token_id,
             }
         if status in {"expired", "invalid", "consumed"}:
             raise CliError(
@@ -1610,8 +4712,80 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
 
     if args.command == "capabilities":
         result = client.request("/api/capabilities")
+        capability_contract = require_compatible_contract(
+            result.get("contractVersion")
+        )
+        capability_api = require_compatible_api(result.get("apiVersion"))
+        expected_contract = str(target.contract.get("contractVersion"))
+        expected_api = str(target.contract.get("apiVersion"))
+        if (
+            result.get("instanceId") != target.live_instance_id
+            or capability_contract != expected_contract
+            or capability_api != expected_api
+        ):
+            raise CliError(
+                "Capability discovery does not match the verified server contract.",
+                EXIT_CONFLICT,
+                details={
+                    "expectedInstanceId": target.live_instance_id,
+                    "capabilityInstanceId": result.get("instanceId"),
+                    "expectedContractVersion": expected_contract,
+                    "capabilityContractVersion": capability_contract,
+                    "expectedApiVersion": expected_api,
+                    "capabilityApiVersion": capability_api,
+                },
+                error_code="capability.target_mismatch",
+            )
         actions = result.get("actions")
-        if not isinstance(actions, list) or any(not isinstance(item, dict) for item in actions):
+        action_ids: set[str] = set()
+        malformed_action = False
+        if isinstance(actions, list):
+            for item in actions:
+                if not isinstance(item, dict):
+                    malformed_action = True
+                    break
+                action_id = item.get("id")
+                path_keys = set(item) & {"path", "pathTemplate"}
+                path_value = item.get(next(iter(path_keys))) if len(path_keys) == 1 else None
+                if (
+                    not isinstance(action_id, str)
+                    or not action_id.strip()
+                    or action_id in action_ids
+                    or item.get("method") not in {"GET", "POST", "PUT", "PATCH", "DELETE"}
+                    or not isinstance(item.get("risk"), str)
+                    or not item["risk"].strip()
+                    or not isinstance(item.get("scope"), str)
+                    or not item["scope"].strip()
+                    or len(path_keys) != 1
+                    or not isinstance(path_value, str)
+                    or not path_value.startswith("/")
+                    or (
+                        "inputSchema" in item
+                        and not isinstance(item["inputSchema"], dict)
+                    )
+                    or (
+                        "operationKind" in item
+                        and (
+                            not isinstance(item["operationKind"], str)
+                            or not item["operationKind"].strip()
+                        )
+                    )
+                    or (
+                        "requiredScopes" in item
+                        and (
+                            not isinstance(item["requiredScopes"], list)
+                            or not item["requiredScopes"]
+                            or any(
+                                not isinstance(scope, str) or not scope.strip()
+                                for scope in item["requiredScopes"]
+                            )
+                        )
+                    )
+                ):
+                    malformed_action = True
+                    break
+                action_ids.add(action_id)
+        if not isinstance(actions, list) or not actions or malformed_action:
             raise _invalid_response(
                 "Capabilities",
                 result,
@@ -1755,20 +4929,20 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             }:
                 if args.action == "wait" and operation["status"] != "succeeded":
                     status = operation["status"]
-                    raise CliError(
-                        (
-                            "Operation failed."
-                            if status == "failed"
-                            else "Operation reached an indeterminate state; inspect authoritative server state before recovery."
-                        ),
-                        (
+                    raise _terminal_operation_error(
+                        operation,
+                        details=result,
+                        failed_exit_code=(
                             EXIT_VISUAL
                             if status == "failed"
                             and "visual" in str(operation.get("kind", ""))
                             else EXIT_CONNECTIVITY
                         ),
-                        details=result,
-                        error_code=f"operation.{status}",
+                        failed_message="Operation failed.",
+                        indeterminate_message=(
+                            "Operation reached an indeterminate state; inspect "
+                            "authoritative server state before recovery."
+                        ),
                     )
                 return _with_context(result, context)
             if time.monotonic() >= deadline:
@@ -1784,26 +4958,32 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             time.sleep(args.interval)
 
     if args.command == "doctor":
-        auth = client.request("/api/auth/me")
-        authentication = target.contract.get("authentication")
-        fallback_scopes = (
-            authentication.get("scopes")
-            if isinstance(authentication, dict)
-            else None
-        )
-        actor, scopes = _auth_from_response(auth, fallback_scopes)
-        workspace_data = client.request("/api/workspace")
-        workspace, revision = _workspace_from_response(workspace_data)
-        workspace_key = workspace.get("key")
-        if not isinstance(workspace_key, str) or not workspace_key:
-            raise _invalid_response(
-                "Workspace",
-                workspace_data,
-                error_code="workspace.invalid_response",
-            )
+        actor, scopes = _auth_from_response(target.connection)
+        can_inspect = "full" in scopes or "inspect" in scopes
+        workspace_key = None
+        revision = None
+        if can_inspect:
+            workspace_data = client.request("/api/workspace")
+            workspace, revision = _workspace_from_response(workspace_data)
+            workspace_key = workspace.get("key")
+            if not isinstance(workspace_key, str) or not workspace_key:
+                raise _invalid_response(
+                    "Workspace",
+                    workspace_data,
+                    error_code="workspace.invalid_response",
+                )
 
         commands = target.contract.get("commands")
         advertised = commands if isinstance(commands, list) else []
+        semantic_advertised = "semantic status" in advertised
+        semantic_authorized = (
+            "full" in scopes
+            or "semantic:inspect" in scopes
+        )
+        semantic_status = None
+        if semantic_advertised and semantic_authorized:
+            semantic_status = client.request("/api/semantic/status")
+            _validate_semantic_status(semantic_status)
         credential_source = (
             "tokenFile"
             if args.token_file or os.environ.get("CONFIG_CLI_TOKEN_FILE")
@@ -1841,12 +5021,29 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 "authenticated": True,
                 "actor": actor,
                 "scopes": scopes,
+                "expires": target.connection.get("expires"),
             },
             "workspace": {
-                "accessible": True,
+                "accessible": can_inspect,
                 "key": workspace_key,
                 "revision": revision,
             },
+            "semantic": (
+                {
+                    "advertised": True,
+                    "authorized": True,
+                    "available": True,
+                    "schemaVersion": semantic_status["schemaVersion"],
+                    "catalogRevision": semantic_status["catalogRevision"],
+                    "capabilities": semantic_status["capabilities"],
+                }
+                if semantic_status is not None
+                else {
+                    "advertised": semantic_advertised,
+                    "authorized": semantic_authorized,
+                    "available": False,
+                }
+            ),
             "capabilities": {
                 "sql": {
                     "advertised": "sql capabilities" in advertised,
@@ -1857,6 +5054,15 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     "test": "visual-test" in advertised,
                     "screenshot": "screenshot" in advertised,
                 },
+                "semantic": {
+                    "advertised": semantic_advertised,
+                    "catalog": "semantic catalog export" in advertised,
+                    "generation": (
+                        "semantic generate table" in advertised
+                        and "semantic generate field" in advertised
+                    ),
+                    "proposals": "semantic proposals check" in advertised,
+                },
             },
             "checks": [
                 {"id": "config.permissions", "passed": True},
@@ -1864,29 +5070,57 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 {"id": "target.identity", "passed": True},
                 {"id": "target.compatibility", "passed": True},
                 {"id": "auth.access", "passed": True},
-                {"id": "workspace.access", "passed": True},
+                {
+                    "id": "workspace.access",
+                    "passed": True,
+                    "applicable": can_inspect,
+                },
+                {
+                    "id": "semantic.access",
+                    "passed": (
+                        semantic_status is not None
+                        if semantic_advertised and semantic_authorized
+                        else True
+                    ),
+                    "applicable": (
+                        semantic_advertised and semantic_authorized
+                    ),
+                },
             ],
         }
 
     if args.command == "describe":
-        workspace_data = client.request("/api/workspace")
-        auth = client.request("/api/auth/me")
-        authentication = target.contract.get("authentication")
-        fallback_scopes = (
-            authentication.get("scopes")
-            if isinstance(authentication, dict)
-            else None
+        actor, scopes = _auth_from_response(target.connection)
+        can_inspect = "full" in scopes or "inspect" in scopes
+        workspace_key = None
+        revision = None
+        if can_inspect:
+            workspace_data = client.request("/api/workspace")
+            workspace, revision = _workspace_from_response(workspace_data)
+            workspace_key = workspace.get("key")
+            if not isinstance(workspace_key, str) or not workspace_key:
+                raise CliError(
+                    "Workspace response does not contain a workspace key.",
+                    EXIT_CONNECTIVITY,
+                    details=workspace_data,
+                    error_code="workspace.invalid_response",
+                )
+        contract_commands = target.contract.get("commands")
+        semantic_status = None
+        semantic_advertised = (
+            isinstance(contract_commands, list)
+            and "semantic status" in contract_commands
         )
-        actor, scopes = _auth_from_response(auth, fallback_scopes)
-        workspace, revision = _workspace_from_response(workspace_data)
-        workspace_key = workspace.get("key")
-        if not isinstance(workspace_key, str) or not workspace_key:
-            raise CliError(
-                "Workspace response does not contain a workspace key.",
-                EXIT_CONNECTIVITY,
-                details=workspace_data,
-                error_code="workspace.invalid_response",
-            )
+        semantic_authorized = (
+            "full" in scopes
+            or "semantic:inspect" in scopes
+        )
+        if (
+            semantic_advertised
+            and semantic_authorized
+        ):
+            semantic_status = client.request("/api/semantic/status")
+            _validate_semantic_status(semantic_status)
         return {
             "profile": profile.name,
             "endpoint": profile.endpoint,
@@ -1897,6 +5131,24 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             "revision": revision,
             "actor": actor,
             "scopes": scopes if isinstance(scopes, list) else [],
+            "expires": target.connection.get("expires"),
+            "workspaceAccessible": can_inspect,
+            "semantic": (
+                {
+                    "advertised": True,
+                    "authorized": True,
+                    "available": True,
+                    "schemaVersion": semantic_status["schemaVersion"],
+                    "catalogRevision": semantic_status["catalogRevision"],
+                    "capabilities": semantic_status["capabilities"],
+                }
+                if semantic_status is not None
+                else {
+                    "advertised": semantic_advertised,
+                    "authorized": semantic_authorized,
+                    "available": False,
+                }
+            ),
             "versions": {
                 "client": __version__,
                 "api": target.contract.get("apiVersion"),
@@ -2192,6 +5444,611 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             )
         return _with_context(result, context)
 
+    if args.command == "semantic":
+        base = "/api/semantic"
+        area = args.semantic_area
+        action = getattr(args, "semantic_action", None)
+
+        if area == "status":
+            result = client.request(f"{base}/status")
+            _validate_semantic_status(result)
+        elif area == "source":
+            if action == "relations":
+                path, page_limit = _paginated_path(
+                    f"{base}/source/relations",
+                    contract=target.contract,
+                    args=args,
+                )
+                result = client.request(path)
+                _validate_pagination_response(
+                    result,
+                    label="Semantic source relations",
+                    expected_limit=page_limit,
+                    error_code="semantic.invalid_response",
+                )
+                relations = result.get("relations")
+                if (
+                    not _has_exact_response_keys(
+                        result,
+                        {"relations"}
+                        | ({"pagination"} if page_limit is not None else set()),
+                    )
+                    or not isinstance(relations, list)
+                ):
+                    raise _invalid_response(
+                        "Semantic source relations",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+                identities = set()
+                for source in relations:
+                    validated = _semantic_source(
+                        source,
+                        data=result,
+                        label="Semantic source relations",
+                    )
+                    identity = (
+                        validated["alias"],
+                        validated["schema"],
+                        validated["relation"],
+                    )
+                    if identity in identities:
+                        raise _invalid_response(
+                            "Semantic source relations",
+                            result,
+                            error_code="semantic.invalid_response",
+                    )
+                    identities.add(identity)
+            elif action == "archive-excluded":
+                result = client.request(
+                    f"{base}/source/archive-excluded",
+                    method="POST",
+                    payload={"confirmed": True},
+                )
+                archived = result.get("archived")
+                if (
+                    not _has_exact_response_keys(result, {"archived"})
+                    or not isinstance(archived, list)
+                    or any(
+                        not isinstance(item, dict)
+                        or set(item) != {"id", "binding"}
+                        or not isinstance(item.get("id"), str)
+                        or not item["id"].strip()
+                        or not isinstance(item.get("binding"), dict)
+                        or set(item["binding"])
+                        != {"adapter", "alias", "schema", "relation"}
+                        or item["binding"].get("adapter") != "postgresql"
+                        or any(
+                            not isinstance(item["binding"].get(key), str)
+                            or not item["binding"][key].strip()
+                            for key in ("alias", "schema", "relation")
+                        )
+                        for item in archived
+                    )
+                    or len({item["id"] for item in archived}) != len(archived)
+                ):
+                    raise _invalid_response(
+                        "Excluded semantic source archival",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+            else:
+                source_identity = {
+                    "alias": args.alias,
+                    "schema": args.schema,
+                    "relation": args.relation,
+                }
+                result = client.request(
+                    f"{base}/source/sync",
+                    method="POST",
+                    payload=source_identity,
+                )
+                _semantic_source_sync_response(
+                    result,
+                    expected=source_identity,
+                )
+        elif area == "generate":
+            generation_kind = "field" if action == "field" else "table"
+            generation_target: dict[str, str] = {
+                "kind": generation_kind,
+            }
+            if action == "field":
+                generation_target["fieldId"] = args.field_id
+            requested_context_options = (
+                {
+                    "sampleRows": args.sample_rows,
+                    "statistics": args.statistics,
+                }
+                if args.sample_rows or args.statistics
+                else None
+            )
+            request_payload: dict[str, Any] = {
+                "assetId": args.asset_id,
+                "target": generation_target,
+            }
+            if requested_context_options is not None:
+                request_payload["contextOptions"] = (
+                    requested_context_options
+                )
+            result = client.request(
+                f"{base}/generate",
+                method="POST",
+                payload=request_payload,
+            )
+            _semantic_generation_response(
+                result,
+                asset_id=args.asset_id,
+                target=generation_target,
+                requested_context_options=requested_context_options,
+            )
+            result = _semantic_generation_review(result)
+        elif area == "catalog":
+            if action == "export":
+                path, page_limit = _paginated_path(
+                    f"{base}/catalog",
+                    contract=target.contract,
+                    args=args,
+                )
+                result = client.request(path)
+                _validate_pagination_response(
+                    result,
+                    label="Semantic catalog",
+                    expected_limit=page_limit,
+                    error_code="semantic.invalid_response",
+                )
+                _semantic_revision(result, label="Semantic catalog")
+                assets = result.get("assets")
+                if not isinstance(assets, list):
+                    raise _invalid_response(
+                        "Semantic catalog",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+                for asset in assets:
+                    _semantic_asset(
+                        asset,
+                        data=result,
+                        label="Semantic catalog",
+                    )
+            elif action == "search":
+                path, page_limit = _paginated_path(
+                    f"{base}/catalog/search",
+                    contract=target.contract,
+                    args=args,
+                    parameters={"q": args.query},
+                    legacy_limit=True,
+                )
+                result = client.request(path)
+                _validate_pagination_response(
+                    result,
+                    label="Semantic catalog search",
+                    expected_limit=page_limit,
+                    error_code="semantic.invalid_response",
+                )
+                _semantic_revision(result, label="Semantic catalog search")
+                results = result.get("results")
+                if (
+                    result.get("query") != args.query
+                    or not isinstance(results, list)
+                    or any(
+                        not isinstance(item, dict)
+                        or not isinstance(item.get("id"), str)
+                        or not item["id"].strip()
+                        or not _nonnegative_integer(item.get("version"))
+                        for item in results
+                    )
+                ):
+                    raise _invalid_response(
+                        "Semantic catalog search",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+            elif action == "history":
+                path, page_limit = _paginated_path(
+                    f"{base}/catalog/objects/"
+                    f"{quote_segment(args.id)}/history",
+                    contract=target.contract,
+                    args=args,
+                )
+                result = client.request(path)
+                _validate_pagination_response(
+                    result,
+                    label="Semantic asset history",
+                    expected_limit=page_limit,
+                    error_code="semantic.invalid_response",
+                )
+                _semantic_revision(result, label="Semantic asset history")
+                history = result.get("history")
+                if (
+                    result.get("assetId") != args.id
+                    or not isinstance(history, list)
+                ):
+                    raise _invalid_response(
+                        "Semantic asset history",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+                for item in history:
+                    if (
+                        not isinstance(item, dict)
+                        or not _nonnegative_integer(item.get("version"))
+                        or item["version"] == 0
+                        or not _nonnegative_integer(item.get("generation"))
+                        or item["generation"] == 0
+                        or not _nonnegative_integer(
+                            item.get("catalogRevision")
+                        )
+                        or item.get("changeType") not in {
+                            "register",
+                            "replace",
+                            "refresh",
+                            "archive",
+                            "curated",
+                        }
+                        or not isinstance(item.get("actor"), str)
+                        or not item["actor"].strip()
+                        or not isinstance(item.get("changedAt"), str)
+                        or not item["changedAt"].strip()
+                    ):
+                        raise _invalid_response(
+                            "Semantic asset history",
+                            result,
+                            error_code="semantic.invalid_response",
+                        )
+                    snapshot = _semantic_asset(
+                        item.get("asset"),
+                        data=result,
+                        label="Semantic asset history",
+                        expected_id=args.id,
+                    )
+                    if (
+                        snapshot["version"] != item["version"]
+                        or snapshot.get("generation") != item["generation"]
+                        or snapshot.get("catalogRevision")
+                        != item["catalogRevision"]
+                    ):
+                        raise _invalid_response(
+                            "Semantic asset history",
+                            result,
+                            error_code="semantic.invalid_response",
+                        )
+            elif action == "archive":
+                result = client.request(
+                    f"{base}/catalog/objects/"
+                    f"{quote_segment(args.id)}/archive",
+                    method="POST",
+                    payload={"confirmed": True},
+                )
+                archived_asset = _semantic_asset(
+                    result.get("asset"),
+                    data=result,
+                    label="Semantic asset archive",
+                    expected_id=args.id,
+                )
+                if (
+                    not _has_exact_response_keys(result, {"asset"})
+                    or archived_asset.get("status") != "archived"
+                ):
+                    raise _invalid_response(
+                        "Semantic asset archive",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+            else:
+                result = client.request(
+                    f"{base}/catalog/objects/{quote_segment(args.id)}"
+                )
+                _semantic_revision(result, label="Semantic asset")
+                _semantic_asset(
+                    result.get("asset"),
+                    data=result,
+                    label="Semantic asset",
+                    expected_id=args.id,
+                )
+        elif area == "derived-profiles":
+            if action == "list":
+                path, page_limit = _paginated_path(
+                    f"{base}/derived-profiles",
+                    contract=target.contract,
+                    args=args,
+                )
+                result = client.request(path)
+                _validate_pagination_response(
+                    result,
+                    label="Derived semantic profiles",
+                    expected_limit=page_limit,
+                    error_code="semantic.invalid_response",
+                )
+                _semantic_revision(result, label="Derived semantic profiles")
+                profiles = result.get("derivedProfiles")
+                if not isinstance(profiles, list):
+                    raise _invalid_response(
+                        "Derived semantic profiles",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+                for profile_item in profiles:
+                    _semantic_profile(
+                        profile_item,
+                        data=result,
+                        label="Derived semantic profiles",
+                    )
+                _semantic_delivery_blockers(
+                    result,
+                    label="Derived semantic profiles",
+                )
+            else:
+                path = (
+                    f"{base}/derived-profiles/"
+                    f"{quote_segment(args.name)}"
+                )
+                if action == "repair":
+                    result = client.request(
+                        path + "/repair",
+                        method="POST",
+                        payload={"confirmed": True},
+                    )
+                else:
+                    result = client.request(path)
+                _semantic_revision(result, label="Derived semantic profile")
+                _semantic_profile(
+                    result.get("derivedProfile"),
+                    data=result,
+                    label="Derived semantic profile",
+                    expected_name=args.name,
+                )
+        else:
+            proposals_base = f"{base}/proposals"
+            if action == "list":
+                path, page_limit = _paginated_path(
+                    proposals_base,
+                    contract=target.contract,
+                    args=args,
+                )
+                result = client.request(path)
+                _validate_pagination_response(
+                    result,
+                    label="Semantic proposal list",
+                    expected_limit=page_limit,
+                    error_code="semantic.invalid_response",
+                )
+                _semantic_revision(result, label="Semantic proposal list")
+                proposals = result.get("proposals")
+                if not isinstance(proposals, list):
+                    raise _invalid_response(
+                        "Semantic proposal list",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+                for item in proposals:
+                    _semantic_proposal(
+                        {"proposal": item},
+                        label="Semantic proposal list",
+                    )
+            elif action == "show":
+                result = client.request(
+                    f"{proposals_base}/{quote_segment(args.id)}"
+                )
+                _semantic_revision(result, label="Semantic proposal")
+                _semantic_proposal(
+                    result,
+                    label="Semantic proposal",
+                    expected_id=args.id,
+                )
+            elif action == "check":
+                supplied = input_object(args)
+                operations = (
+                    _semantic_operations(args.sets, args.unsets)
+                    if args.sets or args.unsets
+                    else _semantic_input_operations(
+                        supplied.get("operations")
+                    )
+                )
+                request_payload = {
+                    "assetId": args.asset_id,
+                    "baseVersion": args.base_version,
+                    "operations": operations,
+                }
+                if args.explanation is not None:
+                    request_payload["explanation"] = args.explanation
+                request_payload = merge_supplied_input(
+                    supplied,
+                    request_payload,
+                )
+                explanation = request_payload.get("explanation")
+                result = client.request(
+                    f"{proposals_base}/check",
+                    method="POST",
+                    payload=request_payload,
+                )
+                _semantic_revision(result, label="Semantic proposal check")
+                check = result.get("check")
+                fingerprint = (
+                    check.get("fingerprint")
+                    if isinstance(check, dict)
+                    else None
+                )
+                if (
+                    not isinstance(check, dict)
+                    or check.get("assetId") != args.asset_id
+                    or not _canonical_json_equal(
+                        check.get("baseVersion"), args.base_version
+                    )
+                    or not _canonical_json_equal(
+                        check.get("operations"), operations
+                    )
+                    or check.get("explanation") != explanation
+                    or not isinstance(check.get("diff"), list)
+                    or not isinstance(fingerprint, str)
+                    or len(fingerprint) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in fingerprint
+                    )
+                ):
+                    raise _invalid_response(
+                        "Semantic proposal check",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+                store.save_check(
+                    profile,
+                    {
+                        **check,
+                        "explanation": explanation,
+                    },
+                    domain="semantic",
+                )
+            elif action == "create":
+                cached = store.load_check(
+                    profile,
+                    args.from_check,
+                    domain="semantic",
+                )
+                request_payload = {
+                    "assetId": cached["assetId"],
+                    "baseVersion": cached["revision"],
+                    "operations": cached["operations"],
+                    "fingerprint": args.from_check,
+                }
+                if cached.get("explanation") is not None:
+                    request_payload["explanation"] = cached["explanation"]
+                result = client.request(
+                    proposals_base,
+                    method="POST",
+                    payload=request_payload,
+                )
+                _semantic_revision(result, label="Semantic proposal creation")
+                proposal = _semantic_proposal(
+                    result,
+                    label="Semantic proposal creation",
+                )
+                if (
+                    proposal["state"] != "pending"
+                    or proposal["assetId"] != cached["assetId"]
+                    or not _canonical_json_equal(
+                        proposal["baseVersion"], cached["revision"]
+                    )
+                    or not _canonical_json_equal(
+                        proposal["operations"], cached["operations"]
+                    )
+                    or proposal.get("explanation")
+                    != cached.get("explanation")
+                ):
+                    raise _invalid_response(
+                        "Semantic proposal creation",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+            elif action == "apply":
+                try:
+                    result = client.request(
+                        (
+                            f"{proposals_base}/"
+                            f"{quote_segment(args.id)}/apply"
+                        ),
+                        method="POST",
+                        payload={"confirmed": True},
+                    )
+                except KeyboardInterrupt as exc:
+                    raise _semantic_apply_indeterminate(
+                        args.id,
+                        interrupted=True,
+                    ) from exc
+                except CliError as exc:
+                    if exc.error_code == "semantic.apply_indeterminate":
+                        raise _semantic_apply_indeterminate(
+                            args.id,
+                            response=(
+                                exc.safe_details
+                                if isinstance(exc.safe_details, dict)
+                                else None
+                            ),
+                            cause=exc,
+                        ) from exc
+                    if (
+                        exc.http_status is not None
+                        and 400 <= exc.http_status < 500
+                        and exc.http_status != 408
+                    ):
+                        raise
+                    if (
+                        exc.error_code in {
+                            "api.invalid_response",
+                            "api.non_json_response",
+                            "api.response_too_large",
+                            "api.transport_error",
+                            "api.unreachable",
+                        }
+                        or exc.http_status is not None
+                    ):
+                        raise _semantic_apply_indeterminate(
+                            args.id,
+                            cause=exc,
+                        ) from exc
+                    raise
+                try:
+                    _semantic_revision(
+                        result,
+                        label="Semantic proposal application",
+                    )
+                    proposal = _semantic_proposal(
+                        result,
+                        label="Semantic proposal application",
+                        expected_id=args.id,
+                    )
+                    applied_asset = _semantic_asset(
+                        result.get("asset"),
+                        data=result,
+                        label="Semantic proposal application",
+                        expected_id=proposal["assetId"],
+                    )
+                    if (
+                        proposal["state"] != "applied"
+                        or not _nonnegative_integer(
+                            proposal.get("appliedVersion")
+                        )
+                        or applied_asset["version"]
+                        != proposal["appliedVersion"]
+                    ):
+                        raise _invalid_response(
+                            "Semantic proposal application",
+                            result,
+                            error_code="semantic.invalid_response",
+                        )
+                except CliError as exc:
+                    if exc.error_code != "semantic.invalid_response":
+                        raise
+                    raise _semantic_apply_indeterminate(
+                        args.id,
+                        response=result,
+                    ) from exc
+            else:
+                decline_payload: dict[str, Any] = {"confirmed": True}
+                if args.reason is not None:
+                    decline_payload["reason"] = args.reason
+                result = client.request(
+                    (
+                        f"{proposals_base}/"
+                        f"{quote_segment(args.id)}/decline"
+                    ),
+                    method="POST",
+                    payload=decline_payload,
+                )
+                _semantic_revision(result, label="Semantic proposal decline")
+                proposal = _semantic_proposal(
+                    result,
+                    label="Semantic proposal decline",
+                    expected_id=args.id,
+                )
+                if proposal["state"] != "declined":
+                    raise _invalid_response(
+                        "Semantic proposal decline",
+                        result,
+                        error_code="semantic.invalid_response",
+                    )
+        return _with_context(result, context)
+
     if args.command == "derived-layers":
         base = "/api/derived-layers"
         if args.action == "capabilities":
@@ -2206,6 +6063,18 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     result,
                     error_code="derived_layer.invalid_response",
                 )
+            if "materializationGuard" in result:
+                _materialization_guard(
+                    result["materializationGuard"],
+                    data=result,
+                    label="Derived-layer capabilities",
+                )
+            if "queryGuard" in result:
+                _query_guard(
+                    result["queryGuard"],
+                    data=result,
+                    label="Derived-layer capabilities",
+                )
         elif args.action == "list":
             result = client.request(base)
             if not isinstance(result.get("derivedLayers"), list):
@@ -2214,15 +6083,49 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     result,
                     error_code="derived_layer.invalid_response",
                 )
+            for derived_layer in result["derivedLayers"]:
+                if (
+                    isinstance(derived_layer, dict)
+                    and "semanticProfile" in derived_layer
+                ):
+                    _semantic_profile(
+                        derived_layer["semanticProfile"],
+                        data=result,
+                        label="Derived-layer semantic profile",
+                        require_name=False,
+                    )
+                if (
+                    isinstance(derived_layer, dict)
+                    and derived_layer.get("spatialScope") is not None
+                ):
+                    _derived_spatial_scope(
+                        derived_layer["spatialScope"],
+                        data=result,
+                        label="Derived-layer spatial scope",
+                    )
+        elif args.action == "map-extent":
+            query = (
+                "?" + urllib.parse.urlencode({"locale": args.locale})
+                if args.locale is not None
+                else ""
+            )
+            result = client.request(f"{base}/map-extent{query}")
+            _derived_spatial_scope(
+                result.get("spatialScope"),
+                data=result,
+                label="Derived-layer map extent",
+                expected_locale=args.locale,
+            )
         elif args.action == "show":
             result = client.request(f"{base}/{quote_segment(args.name)}")
-            if not isinstance(result.get("derivedLayer"), dict):
-                raise _invalid_response(
-                    "Derived layer",
-                    result,
-                    error_code="derived_layer.invalid_response",
-                )
+            _validate_derived_layer_response(
+                result,
+                expected_name=args.name,
+                require_spatial_scope=False,
+            )
         elif args.action in {"create", "replace"}:
+            if args.background:
+                _validate_background_wait(args.wait_timeout, args.interval)
             payload: dict[str, Any] = {}
             for key, value in (
                 ("name", args.name),
@@ -2233,19 +6136,25 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             ):
                 if value is not None:
                     payload[key] = value
+            payload["spatialScope"] = {
+                "type": "workspace-map-extent",
+                **(
+                    {"locale": args.locale}
+                    if args.locale is not None
+                    else {}
+                ),
+            }
             if args.source:
                 payload["sources"] = args.source
             if args.query_file:
-                try:
-                    payload["query"] = Path(args.query_file).read_text(
-                        encoding="utf-8"
-                    )
-                except (OSError, UnicodeError) as exc:
-                    raise CliError(
-                        f"Unable to read SQL query file: {exc}",
-                        EXIT_USAGE,
-                        error_code="derived_layer.query_file",
-                    ) from exc
+                payload["query"] = _read_bounded_local_text(
+                    Path(args.query_file),
+                    label="SQL query file",
+                    exit_code=EXIT_USAGE,
+                    unavailable_code="derived_layer.query_file",
+                    too_large_code="derived_layer.query_file_too_large",
+                    invalid_utf8_code="derived_layer.query_file",
+                )
             payload = merge_input(args, payload)
             required = {
                 "name", "query", "sources", "idColumn", "geometryColumn"
@@ -2262,50 +6171,113 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 payload["confirmed"] = True
             if args.background:
                 payload["background"] = True
-            result = client.request(
+            result = _request_derived_mutation(
+                client,
                 (
                     f"{base}/{quote_segment(args.name)}/replace"
                     if args.action == "replace"
                     else base
                 ),
-                method="POST",
+                name=args.name,
+                action=args.action,
                 payload=payload,
-                failure_code=EXIT_VALIDATION,
             )
+            background_operation_id = None
             if args.background:
-                result = _complete_background_operation(
-                    client,
+                submitted = result
+                try:
+                    result, background_operation_id = _complete_background_operation(
+                        client,
+                        submitted,
+                        wait_timeout=args.wait_timeout,
+                        interval=args.interval,
+                    )
+                except CliError as exc:
+                    if exc.error_code != "operation.invalid_response":
+                        raise
+                    raise _derived_mutation_indeterminate(
+                        args.name,
+                        args.action,
+                        response=submitted,
+                        cause=exc,
+                    ) from exc
+            requested_spatial_scope = payload["spatialScope"]
+            try:
+                _validate_derived_layer_response(
                     result,
-                    wait_timeout=args.wait_timeout,
-                    interval=args.interval,
+                    expected_name=args.name,
+                    require_spatial_scope=True,
+                    expected_locale=(
+                        requested_spatial_scope.get("locale")
+                        if isinstance(requested_spatial_scope, dict)
+                        and isinstance(
+                            requested_spatial_scope.get("locale"),
+                            str,
+                        )
+                        else None
+                    ),
                 )
-            if not isinstance(result.get("derivedLayer"), dict):
-                raise _invalid_response(
-                    "Derived layer",
-                    result,
-                    error_code="derived_layer.invalid_response",
-                )
+            except CliError as exc:
+                if background_operation_id is not None:
+                    raise _background_poll_error(
+                        background_operation_id,
+                        "succeeded",
+                        cause=exc,
+                    ) from exc
+                raise _derived_mutation_indeterminate(
+                    args.name,
+                    args.action,
+                    response=result,
+                ) from exc
         else:
             background = args.action == "refresh" and args.background
-            result = client.request(
-                f"{base}/{quote_segment(args.name)}/{args.action}",
-                method="POST",
-                payload={"confirmed": True, **({"background": True} if background else {})},
-                failure_code=EXIT_VALIDATION,
-            )
             if background:
-                result = _complete_background_operation(
-                    client,
+                _validate_background_wait(args.wait_timeout, args.interval)
+            result = _request_derived_mutation(
+                client,
+                f"{base}/{quote_segment(args.name)}/{args.action}",
+                name=args.name,
+                action=args.action,
+                payload={"confirmed": True, **({"background": True} if background else {})},
+            )
+            background_operation_id = None
+            if background:
+                submitted = result
+                try:
+                    result, background_operation_id = _complete_background_operation(
+                        client,
+                        submitted,
+                        wait_timeout=args.wait_timeout,
+                        interval=args.interval,
+                    )
+                except CliError as exc:
+                    if exc.error_code != "operation.invalid_response":
+                        raise
+                    raise _derived_mutation_indeterminate(
+                        args.name,
+                        args.action,
+                        response=submitted,
+                        cause=exc,
+                    ) from exc
+            try:
+                _validate_derived_layer_response(
                     result,
-                    wait_timeout=args.wait_timeout,
-                    interval=args.interval,
+                    expected_name=args.name,
+                    require_spatial_scope=False,
+                    validate_probes=args.action == "refresh",
                 )
-            if not isinstance(result.get("derivedLayer"), dict):
-                raise _invalid_response(
-                    "Derived layer",
-                    result,
-                    error_code="derived_layer.invalid_response",
-                )
+            except CliError as exc:
+                if background_operation_id is not None:
+                    raise _background_poll_error(
+                        background_operation_id,
+                        "succeeded",
+                        cause=exc,
+                    ) from exc
+                raise _derived_mutation_indeterminate(
+                    args.name,
+                    args.action,
+                    response=result,
+                ) from exc
         return _with_context(result, context)
 
     if args.command == "validate":
@@ -2459,8 +6431,32 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 result,
                 getattr(args, "artifact_dir", None),
             )
+            if args.action != "preview-plan":
+                _validate_requested_visual_evidence(
+                    result,
+                    action=args.action,
+                    panels=getattr(args, "panel", None),
+                    expected_info_text=getattr(
+                        args, "expect_info_text", None
+                    ),
+                    hover=getattr(args, "hover", None),
+                    expected_hover_text=getattr(
+                        args, "expect_hover_text", None
+                    ),
+                )
         elif args.action == "list":
-            result = client.request("/api/proposals")
+            path, page_limit = _paginated_path(
+                "/api/proposals",
+                contract=target.contract,
+                args=args,
+            )
+            result = client.request(path)
+            _validate_pagination_response(
+                result,
+                label="Proposal list",
+                expected_limit=page_limit,
+                error_code="proposal.invalid_response",
+            )
             proposals = result.get("proposals")
             if (
                 not isinstance(proposals, list)
@@ -2513,12 +6509,27 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 base_revision = args.base_revision
             request_payload = {
                 "operations": operations,
-                "explanation": getattr(args, "explanation", None),
                 "revision": base_revision,
             }
+            explanation = getattr(args, "explanation", None)
+            if explanation is not None:
+                request_payload["explanation"] = explanation
             if check_fingerprint:
                 request_payload["checkFingerprint"] = check_fingerprint
             request_payload = merge_input(args, request_payload)
+            expected_operations = request_payload["operations"]
+            expected_revision = request_payload["revision"]
+            explanation_supplied = "explanation" in request_payload
+            expected_explanation = request_payload.get("explanation")
+            expected_check_fingerprint = request_payload.get(
+                "checkFingerprint"
+            )
+
+            def explanation_matches(value: Any) -> bool:
+                if explanation_supplied:
+                    return value == expected_explanation
+                return isinstance(value, str) and bool(value.strip())
+
             try:
                 result = client.request(
                     "/api/proposals" if args.action == "create" else "/api/proposals/check",
@@ -2535,7 +6546,11 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     not isinstance(check, dict)
                     or check.get("valid") is not True
                     or check.get("proposalCreated") is not False
-                    or check.get("originalRevision") != base_revision
+                    or check.get("originalRevision") != expected_revision
+                    or not _canonical_json_equal(
+                        check.get("operations"), expected_operations
+                    )
+                    or not explanation_matches(check.get("explanation"))
                     or not isinstance(check.get("diff"), list)
                 ):
                     raise _invalid_response(
@@ -2553,7 +6568,16 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 )
                 if (
                     proposal["status"] != "pending"
-                    or proposal["originalRevision"] != base_revision
+                    or proposal["originalRevision"] != expected_revision
+                    or not _canonical_json_equal(
+                        proposal.get("operations"), expected_operations
+                    )
+                    or not explanation_matches(proposal.get("explanation"))
+                    or (
+                        "checkFingerprint" in proposal
+                        and proposal.get("checkFingerprint")
+                        != expected_check_fingerprint
+                    )
                 ):
                     raise _invalid_response(
                         "Proposal creation",
@@ -2569,6 +6593,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 label="Proposal",
                 expected_id=args.id,
                 require_original_revision=True,
+                require_candidate_hash=True,
             )
             if proposal["status"] not in {"pending", "applying"}:
                 raise CliError(
@@ -2580,7 +6605,8 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     },
                     error_code="proposal.not_applicable",
                 )
-            proposal_revision = proposal.get("originalRevision")
+            proposal_revision = str(proposal["originalRevision"])
+            proposal_candidate_hash = str(proposal["candidateHash"])
             if proposal["status"] == "pending":
                 workspace_data = client.request("/api/workspace")
                 current_revision = workspace_data.get("revision")
@@ -2602,23 +6628,53 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                         },
                         error_code="proposal.revision_conflict",
                     )
-            result = client.request(
-                proposal_path + "/apply",
-                method="POST",
-                payload={"approved": True},
-            )
-            applied = _proposal_from_response(
-                result,
-                label="Proposal application",
-                expected_id=args.id,
-                require_applied_revision=True,
-            )
-            if applied["status"] != "applied":
-                raise _invalid_response(
-                    "Proposal application",
-                    result,
-                    error_code="proposal.invalid_response",
+            try:
+                result = client.request(
+                    proposal_path + "/apply",
+                    method="POST",
+                    payload={"approved": True},
                 )
+            except KeyboardInterrupt as exc:
+                raise _workspace_apply_indeterminate(
+                    args.id,
+                    interrupted=True,
+                ) from exc
+            except CliError as exc:
+                if (
+                    exc.http_status is not None
+                    and 400 <= exc.http_status < 500
+                    and exc.http_status != 408
+                ):
+                    raise
+                if (
+                    exc.error_code in {
+                        "api.invalid_response",
+                        "api.non_json_response",
+                        "api.response_too_large",
+                        "api.transport_error",
+                        "api.unreachable",
+                    }
+                    or exc.http_status is not None
+                ):
+                    raise _workspace_apply_indeterminate(
+                        args.id,
+                        cause=exc,
+                    ) from exc
+                raise
+            try:
+                _proposal_apply_from_response(
+                    result,
+                    expected_id=args.id,
+                    original_revision=proposal_revision,
+                    expected_candidate_hash=proposal_candidate_hash,
+                )
+            except CliError as exc:
+                if exc.error_code != "proposal.invalid_response":
+                    raise
+                raise _workspace_apply_indeterminate(
+                    args.id,
+                    response=result,
+                ) from exc
         else:
             result = client.request(
                 f"/api/proposals/{quote_segment(args.id)}/decline",
@@ -2685,6 +6741,16 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             result,
             getattr(args, "artifact_dir", None),
         )
+        if args.command != "visual-plan":
+            _validate_requested_visual_evidence(
+                result,
+                action="preview-test",
+                expected_info_text=getattr(args, "expect_info_text", None),
+                hover=getattr(args, "hover", None),
+                expected_hover_text=getattr(
+                    args, "expect_hover_text", None
+                ),
+            )
         return _with_context(result, context)
 
     if args.command == "xyz":
@@ -2714,14 +6780,8 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
         return _with_context(result, context)
 
     if args.command == "auth":
-        result = client.request("/api/auth/me")
-        authentication = target.contract.get("authentication")
-        fallback_scopes = (
-            authentication.get("scopes")
-            if isinstance(authentication, dict)
-            else None
-        )
-        _auth_from_response(result, fallback_scopes)
+        result = target.connection
+        _auth_from_response(result)
         return _with_context(result, context)
 
     raise CliError(
@@ -2744,6 +6804,9 @@ def run(args, store: ConfigStore | None = None) -> dict[str, Any]:
             "check", "create", "preview-plan", "preview-test",
             "preview-screenshot",
         }
+        or args.command == "semantic"
+        and args.semantic_area == "proposals"
+        and args.semantic_action == "check"
     )
     if args.input and not input_supported:
         raise CliError(
@@ -2873,14 +6936,26 @@ def main(
             return 0
         result = run(args, store)
         command = (
-            f"{args.command} {args.action}"
-            if hasattr(args, "action") and args.action
-            else args.command
+            required_contract_command(args)
+            if args.command == "semantic"
+            else (
+                f"{args.command} {args.action}"
+                if hasattr(args, "action") and args.action
+                else args.command
+            )
         )
         if args.extract:
-            content = extract_response_value(result, args.extract) + "\n"
+            extracted = extract_response_value(result, args.extract)
+            if not args.out and _is_terminal(stdout):
+                extracted = sanitize_terminal_text(extracted)
+            content = extracted + "\n"
         else:
             content = render(result, command=command, output=args.output)
+            if not args.out and _is_terminal(stdout):
+                content = sanitize_terminal_text(
+                    content,
+                    preserve_newlines=True,
+                )
         if args.out:
             write_private_output(args.out, content)
             stdout.write(json.dumps({

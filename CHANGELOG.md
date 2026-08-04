@@ -10,10 +10,37 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Live and proposal evidence controls for required hover-tooltip and
+  clicked-feature text, with strict verification of dedicated hover,
+  information, Filtering, and Styling artifacts before the CLI reports
+  requested evidence as complete.
+- Capability-gated semantic status, catalog discovery/history, derived-profile
+  readiness/repair, and curated proposal commands with strict response
+  validation and catalog-revision context.
+- Separately scoped source-relation discovery and confirmed semantic
+  synchronization for registering or refreshing generated schema metadata
+  without accepting SQL or table rows, including an explicit unchanged
+  catalog no-op.
+- Capability-gated, confirmed `semantic catalog archive` and `semantic source
+  archive-excluded` commands for hiding semantic profiles without changing
+  database data, while preserving exact-ID administrator audit history.
+- Capability-gated Gemini semantic draft generation for whole assets and
+  stable field IDs, with metadata-only defaults, explicit server-bounded 5%
+  sample/statistics opt-ins guarded by `semantic:data`, exact context response
+  validation, and no automatic proposal or retry behavior.
 - Server-authoritative `plugins list` and `plugins show` inspection for pinned
   registry, dynamic loading, dispatch, prerequisites, and security behavior.
 - Optional `--background` derived-layer create, replace, and refresh polling
   for known slow jobs, while retaining synchronous operation by default.
+- Server-resolved map-extent previews and mandatory fixed map-bounded
+  derived-layer creation/replacement, with `--map-extent` retained for command
+  compatibility.
+- Server-advertised materialization-size guard and returned probe/error
+  handling, including an explicit approval boundary before substituting the
+  recommended ordinary-view fallback.
+- Server-advertised universal query-plan guard validation and evidence for every
+  derived kind, including bounded H3 expansion and an explicit prohibition on
+  treating an unsafe query as eligible for the ordinary-view fallback.
 - Confirmed `derived-layers replace` for atomic definition updates and
   view/materialized-view conversion with structured in-use feedback.
 - Documented H3-derived layer practices for candidate-cell expansion, exact
@@ -26,8 +53,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   XYZ Styling-panel controls and panel visibility.
 - Added `layers filters` inspection with framework-compatible inference,
   include/exclude behavior, and fixed-filter safety guidance.
-- Capability discovery, operation show/wait commands, JSON file/stdin request
-  input, scalar extraction, private output files, request correlation, and
+- Capability discovery—including exact live-visual and durable derived-layer
+  action metadata—operation show/wait commands, JSON file/stdin request input,
+  scalar extraction, private output files, request correlation, and
   browser-approved scoped device credential rotation without changing the
   revision-bound proposal model.
 - Interactive `config-cli setup` wizard with hidden token entry and verified
@@ -61,6 +89,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Preserved hardened derived-layer validation, policy, compute, storage, and
+  indeterminate-operation guidance through automatic background polling and
+  `operations wait`, including stable server codes and safe primary messages
+  without promoting technical database detail; strictly validated the 1.3
+  query-guard stages, shape limits, and error categories while retaining the
+  exact earlier 1.x capability shape.
 - Added manifest-backed external plugin inspection, validation, workspace usage,
   catalogue fingerprints, configuration schemas, and preview requirements to
   the server-authoritative `plugins` commands.
@@ -119,6 +153,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- Namespaced checked-operation caches by workspace or semantic domain,
+  preserved `semantic.*` server errors, restricted semantic edits to curated
+  paths, and added only `semantic:inspect` to default device authority.
+  `semantic:generate` and optional generation data access via `semantic:data`
+  remain separate explicit grants.
 - Rejected every HTTP redirect so bearer authorization cannot be forwarded to
   another origin.
 - Rejected endpoint user information, non-root paths, queries, and fragments.

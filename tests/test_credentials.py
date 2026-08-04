@@ -29,6 +29,13 @@ class CredentialRotationTests(unittest.TestCase):
                 old,
                 {"instanceId": "instance"},
                 {"instanceId": "instance", "contractVersion": "1.0"},
+                {
+                    "authenticated": True,
+                    "actor": "token:rotation",
+                    "tokenId": "rotation",
+                    "scopes": ["full"],
+                    "expires": None,
+                },
             )
             with patch("mapp_config_cli.credentials.verify_target", return_value=target):
                 replacement, verified = verify_and_replace_token(

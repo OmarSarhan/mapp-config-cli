@@ -8,7 +8,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mapp_config_cli.cli import main, parser
+from mapp_config_cli.cli import (
+    _DEVICE_SCOPE_CHOICES,
+    _SAFE_DEFAULT_DEVICE_SCOPES,
+    MAX_LOCAL_FILE_BYTES,
+    MAX_VISUAL_ARTIFACTS,
+    _canonical_json_equal,
+    _strict_json_file,
+    _validate_requested_visual_evidence,
+    input_object,
+    main,
+    parser,
+)
+from mapp_config_cli.client import ApiClient
 from mapp_config_cli.config import ConfigStore, Profile
 from mapp_config_cli.errors import (
     CliError,
@@ -24,6 +36,198 @@ from mapp_config_cli.errors import (
 from tests.support import JsonServer, standard_routes
 
 
+DEVICE_SCOPES = (
+    "inspect",
+    "propose",
+    "visual",
+    "apply",
+    "reload",
+    "derive",
+    "semantic:inspect",
+    "semantic:source",
+    "semantic:generate",
+    "semantic:data",
+    "semantic:propose",
+    "semantic:apply",
+    "semantic:admin",
+)
+SAFE_DEFAULT_DEVICE_SCOPES = (
+    "inspect",
+    "propose",
+    "visual",
+    "semantic:inspect",
+)
+WORKSPACE_CANDIDATE_HASH = "c" * 64
+
+
+def map_extent_scope(locale: str = "Leeds") -> dict:
+    return {
+        "type": "workspace-map-extent",
+        "locale": locale,
+        "sourceView": {"lng": -1.549, "lat": 53.8, "z": 11},
+        "scopeZoom": 10,
+        "zoomOffset": -1,
+        "viewport": {"width": 1920, "height": 1080, "tileSize": 256},
+        "crs": "EPSG:4326",
+        "envelopes": [{
+            "west": -2.5,
+            "south": 53.3,
+            "east": -0.6,
+            "north": 54.3,
+        }],
+        "selection": "intersects-output-geometry",
+        "clipsGeometry": False,
+        "guidance": (
+            "This is an output-row guard only; it keeps complete output "
+            "features intersecting the fixed extent. It is not a security "
+            "boundary and does not scope source-side aggregates, clip "
+            "geometry, or follow later map movements. Add the envelope inside "
+            "source-side SQL before aggregation when metrics must be "
+            "map-scoped."
+        ),
+    }
+
+
+def materialization_probe() -> dict:
+    return {
+        "method": "postgresql-explain",
+        "estimatedRows": 100,
+        "planRowWidthBytes": 68,
+        "rowOverheadBytes": 32,
+        "safetyMultiplier": 1.2,
+        "estimatedBytes": 12000,
+        "maxEstimatedBytes": 1024 ** 3,
+    }
+
+
+def query_plan_limits() -> dict:
+    return {
+        "maxTotalCost": 50_000_000,
+        "maxFinalRows": 10_000_000,
+        "maxIntermediateRows": 100_000_000,
+        "maxIntermediateBytes": 16 * 1024 ** 3,
+        "maxJoinExpansionRatio": 1_000,
+        "maxPlanNodes": 150,
+        "maxPlanDepth": 32,
+        "maxPlannedWorkers": 8,
+    }
+
+
+def query_guard() -> dict:
+    return {
+        "method": "postgresql-explain",
+        "stages": [
+            "postgresql-ast-guard",
+            "postgresql-catalog-guard",
+            "postgresql-explain",
+        ],
+        "limits": query_plan_limits(),
+        "shapeLimits": {
+            "maxJoins": 24,
+            "maxCtes": 16,
+            "maxSetOperations": 8,
+            "maxGroupingSets": 64,
+            "maxGeneratedRows": 1_000_000,
+        },
+        "h3": {
+            "maxEstimatedScopeCells": 2_000_000,
+            "maxEstimatedExpandedCells": 10_000_000,
+            "scopeEstimateSafetyMultiplier": 1.5,
+            "maxGridDistance": 25,
+        },
+        "errorCategories": {
+            "invalid": {
+                "code": "derived_layer.query_invalid",
+                "httpStatus": 400,
+            },
+            "policy": {
+                "code": "derived_layer.query_not_allowed",
+                "httpStatus": 422,
+            },
+            "compute": {
+                "code": "derived_layer.query_too_expensive",
+                "httpStatus": 409,
+            },
+        },
+    }
+
+
+def query_plan_probe() -> dict:
+    return {
+        "method": "postgresql-explain",
+        "estimatedTotalCost": 250_000.5,
+        "estimatedFinalRows": 100_000,
+        "maxIntermediateRows": 250_000,
+        "maxIntermediateBytes": 128 * 1024 ** 2,
+        "maxJoinExpansionRatio": 2.5,
+        "planNodeCount": 12,
+        "planDepth": 5,
+        "plannedWorkers": 2,
+        "recursivePlan": False,
+        "h3Expansion": {
+            "polygonToCellsCalls": 1,
+            "resolutions": [9],
+            "scopeAreaKm2": 124.25,
+            "estimatedScopeCells": 250_000,
+            "maxEstimatedScopeCells": 2_000_000,
+            "safetyMultiplier": 1.5,
+            "gridDiskCalls": 1,
+            "maxGridDistance": 2,
+            "maxAllowedGridDistance": 25,
+            "expansionMultiplier": 19,
+            "estimatedExpandedCells": 4_750_000,
+            "maxEstimatedExpandedCells": 10_000_000,
+        },
+        "limits": query_plan_limits(),
+    }
+
+
+def workspace_apply_response(
+    *,
+    candidate_hash: str = WORKSPACE_CANDIDATE_HASH,
+    target_candidate_hash: str | None = WORKSPACE_CANDIDATE_HASH,
+) -> dict:
+    fingerprint = "a" * 64
+    proposal = {
+        "id": "proposal-1",
+        "status": "applied",
+        "originalRevision": "rev-1",
+        "appliedRevision": "rev-2",
+        "candidateHash": candidate_hash,
+        "appliedFingerprint": fingerprint,
+        "requestedGeneration": 2,
+    }
+    reload_result = {
+        "requestedGeneration": 2,
+        "expectedWorkspaceFingerprint": fingerprint,
+        "status": {
+            "requestedGeneration": 2,
+            "appliedGeneration": 2,
+            "workspaceFingerprint": fingerprint,
+            "healthy": True,
+            "completed": True,
+        },
+    }
+    target = {"proposalId": "proposal-1"}
+    if target_candidate_hash is not None:
+        target["candidateHash"] = target_candidate_hash
+    return {
+        "proposal": proposal,
+        "reload": reload_result,
+        "operation": {
+            "id": "c" * 32,
+            "kind": "proposal.apply",
+            "status": "succeeded",
+            "target": target,
+            "result": {
+                "proposal": dict(proposal),
+                "reload": reload_result,
+            },
+            "error": None,
+        },
+    }
+
+
 class CliTests(unittest.TestCase):
     def configured_store(
         self,
@@ -32,10 +236,11 @@ class CliTests(unittest.TestCase):
         *,
         instance_id: str = "instance-1",
         token: str = "stored-token",
+        contract_version: str = "1.0",
     ) -> ConfigStore:
         store = ConfigStore(Path(directory) / "config")
         store.save_profile(
-            Profile("test", endpoint, instance_id, "1.0"),
+            Profile("test", endpoint, instance_id, contract_version),
             token,
         )
         return store
@@ -45,6 +250,93 @@ class CliTests(unittest.TestCase):
         stderr = io.StringIO()
         code = main(arguments, stdout=stdout, stderr=stderr, store=store)
         return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_input_and_validation_reads_are_bounded_before_decoding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            oversized = Path(directory) / "oversized.json"
+            with oversized.open("wb") as stream:
+                stream.truncate(MAX_LOCAL_FILE_BYTES + 1)
+
+            arguments = parser().parse_args(
+                ["--input", str(oversized), "describe"]
+            )
+            with self.assertRaises(CliError) as input_error:
+                input_object(arguments)
+            with self.assertRaises(CliError) as validation_error:
+                _strict_json_file(str(oversized))
+
+        self.assertEqual(input_error.exception.error_code, "input.too_large")
+        self.assertEqual(
+            validation_error.exception.error_code,
+            "validation.file_too_large",
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and bool(getattr(os, "O_NOFOLLOW", 0)),
+        "O_NOFOLLOW swap protection required",
+    )
+    def test_input_read_rejects_a_check_open_symlink_swap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "input.json"
+            replacement = Path(directory) / "replacement.json"
+            target.write_text("{}", encoding="utf-8")
+            replacement.write_text('{"unexpected": true}', encoding="utf-8")
+            arguments = parser().parse_args(
+                ["--input", str(target), "describe"]
+            )
+            original_open = os.open
+            swapped = False
+
+            def swap_before_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and os.fspath(path) == str(target):
+                    target.unlink()
+                    target.symlink_to(replacement)
+                    swapped = True
+                return original_open(path, flags, *args, **kwargs)
+
+            with (
+                patch("mapp_config_cli.cli.os.open", side_effect=swap_before_open),
+                self.assertRaises(CliError) as raised,
+            ):
+                input_object(arguments)
+
+        self.assertTrue(swapped)
+        self.assertEqual(raised.exception.error_code, "input.invalid_file")
+
+    def test_validation_read_rejects_symlinks_and_invalid_utf8(self):
+        with tempfile.TemporaryDirectory() as directory:
+            actual = Path(directory) / "actual.json"
+            linked = Path(directory) / "linked.json"
+            invalid = Path(directory) / "invalid.json"
+            actual.write_text("{}", encoding="utf-8")
+            linked.symlink_to(actual)
+            invalid.write_bytes(b"\xff")
+
+            with self.assertRaises(CliError) as symlink_error:
+                _strict_json_file(str(linked))
+            with self.assertRaises(CliError) as encoding_error:
+                _strict_json_file(str(invalid))
+
+        self.assertEqual(
+            symlink_error.exception.error_code,
+            "validation.file_unavailable",
+        )
+        self.assertEqual(
+            encoding_error.exception.error_code,
+            "validation.invalid_json",
+        )
+
+    def test_canonical_json_equality_is_type_sensitive_and_finite(self):
+        self.assertFalse(_canonical_json_equal(True, 1))
+        self.assertFalse(_canonical_json_equal(1, 1.0))
+        self.assertFalse(_canonical_json_equal(float("nan"), float("nan")))
+        self.assertTrue(
+            _canonical_json_equal(
+                {"operation": {"value": True}},
+                {"operation": {"value": True}},
+            )
+        )
 
     def test_describe_includes_target_workspace_auth_and_versions(self):
         routes = standard_routes()
@@ -61,6 +353,39 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["scopes"], ["full"])
         self.assertTrue(payload["compatibility"]["compatible"])
         self.assertIn("client", payload["versions"])
+
+    def test_describe_connects_without_inspect_and_reports_token_capabilities(self):
+        routes = standard_routes()
+        routes[("GET", "/api/connect")] = (
+            200,
+            {
+                "authenticated": True,
+                "actor": "token:visual-only",
+                "tokenId": "visual-only",
+                "scopes": ["visual"],
+                "expires": "2030-01-01T00:00:00Z",
+            },
+        )
+        requests = []
+
+        def record_workspace(request):
+            requests.append(request)
+            return 500, {"error": "workspace must not be inspected"}
+
+        routes[("GET", "/api/workspace")] = record_workspace
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(["describe"], store)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual([], requests)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["actor"], "token:visual-only")
+        self.assertEqual(payload["scopes"], ["visual"])
+        self.assertEqual(payload["expires"], "2030-01-01T00:00:00Z")
+        self.assertFalse(payload["workspaceAccessible"])
+        self.assertIsNone(payload["workspaceKey"])
+        self.assertIsNone(payload["revision"])
 
     def test_doctor_reports_safe_readiness_and_advertised_capabilities(self):
         routes = standard_routes()
@@ -105,12 +430,16 @@ class CliTests(unittest.TestCase):
 
     def test_derived_layer_create_forwards_definition(self):
         captured = {}
+        resolved_scope = map_extent_scope()
 
         def create(request):
             captured.update(request["body"])
             return 201, {"derivedLayer": {
                 "name": request["body"]["name"],
                 "kind": request["body"]["kind"],
+                "spatialScope": resolved_scope,
+                "materializationProbe": materialization_probe(),
+                "queryPlanProbe": query_plan_probe(),
             }}
 
         routes = standard_routes()
@@ -139,13 +468,608 @@ class CliTests(unittest.TestCase):
         self.assertEqual(captured["sources"], [
             "leeds.h3_cells", "leeds.definitive_paths"
         ])
+        self.assertEqual(captured["spatialScope"], {
+            "type": "workspace-map-extent",
+        })
         self.assertEqual(
             json.loads(stdout)["derivedLayer"]["name"],
             "paths_h3_r9",
         )
+        self.assertEqual(
+            json.loads(stdout)["derivedLayer"]["materializationProbe"],
+            materialization_probe(),
+        )
+        self.assertEqual(
+            json.loads(stdout)["derivedLayer"]["queryPlanProbe"],
+            query_plan_probe(),
+        )
+
+    def test_derived_query_file_rejects_oversize_and_symlink_inputs(self):
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            oversized = Path(directory) / "oversized.sql"
+            with oversized.open("wb") as stream:
+                stream.truncate(MAX_LOCAL_FILE_BYTES + 1)
+            actual = Path(directory) / "actual.sql"
+            linked = Path(directory) / "linked.sql"
+            actual.write_text("SELECT id, geom FROM source", encoding="utf-8")
+            linked.symlink_to(actual)
+            store = self.configured_store(directory, server.endpoint)
+
+            results = []
+            for query_path in (oversized, linked):
+                results.append(self.invoke(
+                    [
+                        "derived-layers", "create", "bounded_input",
+                        "--query-file", str(query_path),
+                        "--source", "source",
+                        "--id-column", "id",
+                        "--geometry-column", "geom",
+                    ],
+                    store,
+                ))
+            mutation_requests = [
+                request
+                for request in server.requests
+                if request["method"] == "POST"
+            ]
+
+        self.assertEqual(mutation_requests, [])
+        self.assertEqual(results[0][0], EXIT_USAGE)
+        self.assertEqual(
+            json.loads(results[0][2])["code"],
+            "derived_layer.query_file_too_large",
+        )
+        self.assertEqual(results[1][0], EXIT_USAGE)
+        self.assertEqual(
+            json.loads(results[1][2])["code"],
+            "derived_layer.query_file",
+        )
+
+    def test_derived_layer_capabilities_validate_materialization_guard(self):
+        guard = {
+            "method": "postgresql-explain",
+            "maxEstimatedBytes": 1024 ** 3,
+            "rowOverheadBytes": 32,
+            "safetyMultiplier": 1.2,
+        }
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            {
+                "configured": True,
+                "schema": "derived_layers",
+                "kinds": ["view", "materialized"],
+                "materializationGuard": guard,
+                "queryGuard": query_guard(),
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "capabilities"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            guard,
+            json.loads(stdout)["materializationGuard"],
+        )
+        self.assertEqual(
+            query_guard(),
+            json.loads(stdout)["queryGuard"],
+        )
+
+    def test_derived_layer_capabilities_validate_hardened_query_guard(self):
+        invalid_stages = query_guard()
+        invalid_stages["stages"] = list(reversed(invalid_stages["stages"]))
+        invalid_shape_limit = query_guard()
+        invalid_shape_limit["shapeLimits"]["maxJoins"] = 0
+        invalid_category = query_guard()
+        invalid_category["errorCategories"]["policy"]["httpStatus"] = 409
+        unknown_field = query_guard()
+        unknown_field["futureGuard"] = True
+
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            for guard in (
+                invalid_stages,
+                invalid_shape_limit,
+                invalid_category,
+                unknown_field,
+            ):
+                with self.subTest(guard=guard):
+                    routes[("GET", "/api/derived-layers/capabilities")] = (
+                        200,
+                        {
+                            "configured": True,
+                            "schema": "derived_layers",
+                            "kinds": ["view", "materialized"],
+                            "queryGuard": guard,
+                        },
+                    )
+                    code, stdout, stderr = self.invoke(
+                        ["derived-layers", "capabilities"],
+                        store,
+                    )
+                    self.assertEqual(EXIT_CONNECTIVITY, code)
+                    self.assertEqual("", stdout)
+                    self.assertEqual(
+                        "derived_layer.invalid_response",
+                        json.loads(stderr)["code"],
+                    )
+
+    def test_derived_layer_capabilities_accept_legacy_query_guard(self):
+        guard = query_guard()
+        for key in ("stages", "shapeLimits", "errorCategories"):
+            guard.pop(key)
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            {
+                "configured": True,
+                "schema": "derived_layers",
+                "kinds": ["view", "materialized"],
+                "queryGuard": guard,
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "capabilities"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(guard, json.loads(stdout)["queryGuard"])
+
+    def test_derived_layer_rejects_malformed_materialization_evidence(self):
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            {
+                "configured": True,
+                "schema": "derived_layers",
+                "kinds": ["view", "materialized"],
+                "materializationGuard": {
+                    "method": "postgresql-explain",
+                    "maxEstimatedBytes": 1024 ** 3,
+                    "rowOverheadBytes": 32,
+                    "safetyMultiplier": True,
+                },
+            },
+        )
+        malformed_probe = materialization_probe()
+        malformed_probe["estimatedBytes"] += 1
+        routes[("POST", "/api/derived-layers/places/refresh")] = (
+            200,
+            {
+                "derivedLayer": {
+                    "name": "places",
+                    "kind": "materialized",
+                    "spatialScope": map_extent_scope(),
+                    "materializationProbe": malformed_probe,
+                }
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            capability_result = self.invoke(
+                ["derived-layers", "capabilities"],
+                store,
+            )
+            refresh_result = self.invoke(
+                ["derived-layers", "refresh", "places", "--confirm"],
+                store,
+            )
+
+        code, stdout, stderr = capability_result
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(
+            "derived_layer.invalid_response",
+            json.loads(stderr)["code"],
+        )
+        code, stdout, stderr = refresh_result
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        failure = json.loads(stderr)
+        self.assertEqual(
+            "derived_layer.mutation_indeterminate",
+            failure["code"],
+        )
+        self.assertFalse(
+            failure["details"]["reconciliation"]["automaticRetry"]
+        )
+
+    def test_derived_layer_rejects_nonclosed_query_plan_evidence(self):
+        malformed_guard = query_guard()
+        malformed_guard["limits"]["futureLimit"] = 1
+        malformed_probe = query_plan_probe()
+        malformed_probe["futureMetric"] = 1
+        oversized_h3_probe = query_plan_probe()
+        oversized_h3_probe["h3Expansion"]["estimatedExpandedCells"] = (
+            oversized_h3_probe["h3Expansion"]["maxEstimatedExpandedCells"]
+            + 1
+        )
+        inconsistent_h3_probe = query_plan_probe()
+        inconsistent_h3_probe["h3Expansion"]["expansionMultiplier"] = 18
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            {
+                "configured": True,
+                "schema": "derived_layers",
+                "kinds": ["view", "materialized"],
+                "queryGuard": malformed_guard,
+            },
+        )
+        routes[("POST", "/api/derived-layers/places/refresh")] = (
+            200,
+            {"derivedLayer": {
+                "name": "places",
+                "kind": "materialized",
+                "spatialScope": map_extent_scope(),
+                "queryPlanProbe": malformed_probe,
+            }},
+        )
+        routes[("POST", "/api/derived-layers/expanded/refresh")] = (
+            200,
+            {"derivedLayer": {
+                "name": "expanded",
+                "kind": "materialized",
+                "spatialScope": map_extent_scope(),
+                "queryPlanProbe": oversized_h3_probe,
+            }},
+        )
+        routes[("POST", "/api/derived-layers/inconsistent/refresh")] = (
+            200,
+            {"derivedLayer": {
+                "name": "inconsistent",
+                "kind": "materialized",
+                "spatialScope": map_extent_scope(),
+                "queryPlanProbe": inconsistent_h3_probe,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            results = (
+                self.invoke(["derived-layers", "capabilities"], store),
+                self.invoke(
+                    ["derived-layers", "refresh", "places", "--confirm"],
+                    store,
+                ),
+                self.invoke(
+                    ["derived-layers", "refresh", "expanded", "--confirm"],
+                    store,
+                ),
+                self.invoke(
+                    [
+                        "derived-layers", "refresh", "inconsistent",
+                        "--confirm",
+                    ],
+                    store,
+                ),
+            )
+
+        code, stdout, stderr = results[0]
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(
+            "derived_layer.invalid_response",
+            json.loads(stderr)["code"],
+        )
+        for code, stdout, stderr in results[1:]:
+            self.assertEqual(EXIT_CONNECTIVITY, code)
+            self.assertEqual("", stdout)
+            failure = json.loads(stderr)
+            self.assertEqual(
+                "derived_layer.mutation_indeterminate",
+                failure["code"],
+            )
+            self.assertFalse(
+                failure["details"]["reconciliation"]["automaticRetry"]
+            )
+
+    def test_derived_layer_refresh_preserves_query_plan_probe(self):
+        probe = query_plan_probe()
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers/places/refresh")] = (
+            200,
+            {"derivedLayer": {
+                "name": "places",
+                "kind": "materialized",
+                "spatialScope": map_extent_scope(),
+                "materializationProbe": materialization_probe(),
+                "queryPlanProbe": probe,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "refresh", "places", "--confirm"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            probe,
+            json.loads(stdout)["derivedLayer"]["queryPlanProbe"],
+        )
+
+    def test_derived_layer_create_forwards_map_extent_scope(self):
+        captured = {}
+        resolved_scope = map_extent_scope()
+
+        def create(request):
+            captured.update(request["body"])
+            return 201, {"derivedLayer": {
+                "name": "bounded_places",
+                "kind": "view",
+                "spatialScope": resolved_scope,
+            }}
+
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers")] = create
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT id, geom FROM leeds.places",
+                encoding="utf-8",
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "bounded_places",
+                "--kind", "view",
+                "--query-file", str(query_file),
+                "--source", "leeds.places",
+                "--id-column", "id",
+                "--geometry-column", "geom",
+                "--map-extent",
+                "--locale", "Leeds",
+            ], store)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(captured["spatialScope"], {
+            "type": "workspace-map-extent",
+            "locale": "Leeds",
+        })
+        self.assertEqual(
+            json.loads(stdout)["derivedLayer"]["spatialScope"],
+            resolved_scope,
+        )
+
+    def test_derived_layer_map_extent_encodes_locale_and_preserves_plan(self):
+        locale = "Leeds city / north & west"
+        resolved_scope = map_extent_scope(locale)
+        captured = {}
+
+        def preview(request):
+            captured["query"] = request["query"]
+            return 200, {"spatialScope": resolved_scope}
+
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/map-extent")] = preview
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "map-extent", "--locale", locale,
+            ], store)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            captured["query"],
+            "locale=Leeds+city+%2F+north+%26+west",
+        )
+        self.assertEqual(json.loads(stdout)["spatialScope"], resolved_scope)
+
+    def test_derived_layer_map_extent_accepts_clamped_low_zoom(self):
+        resolved_scope = map_extent_scope()
+        resolved_scope["sourceView"]["z"] = 0.5
+        resolved_scope["scopeZoom"] = 0
+        resolved_scope["zoomOffset"] = -0.5
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/map-extent")] = (
+            200,
+            {"spatialScope": resolved_scope},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "map-extent"],
+                store,
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["spatialScope"], resolved_scope)
+
+    def test_derived_layer_map_extent_rejects_malformed_plan(self):
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/map-extent")] = (
+            200,
+            {"spatialScope": {"type": "workspace-map-extent"}},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "map-extent"],
+                store,
+            )
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr)["code"],
+            "derived_layer.invalid_response",
+        )
+
+    def test_derived_layer_map_extent_rejects_different_locale(self):
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/map-extent")] = (
+            200,
+            {"spatialScope": map_extent_scope("Bradford")},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "map-extent", "--locale", "Leeds"],
+                store,
+            )
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr)["code"],
+            "derived_layer.invalid_response",
+        )
+
+    def test_derived_layer_list_preserves_resolved_map_extent(self):
+        resolved_scope = map_extent_scope()
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers")] = (
+            200,
+            {"derivedLayers": [{
+                "name": "bounded_places",
+                "spatialScope": resolved_scope,
+            }]},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "list"],
+                store,
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            json.loads(stdout)["derivedLayers"][0]["spatialScope"],
+            resolved_scope,
+        )
+
+    def test_derived_layer_show_rejects_malformed_map_extent(self):
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/bounded_places")] = (
+            200,
+            {"derivedLayer": {
+                "name": "bounded_places",
+                "spatialScope": {"type": "workspace-map-extent"},
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "show", "bounded_places"],
+                store,
+            )
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr)["code"],
+            "derived_layer.invalid_response",
+        )
+
+    def test_derived_layer_show_rejects_a_different_returned_name(self):
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/requested")] = (
+            200,
+            {"derivedLayer": {"name": "substituted"}},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "show", "requested"],
+                store,
+            )
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr)["code"],
+            "derived_layer.invalid_response",
+        )
+
+    def test_derived_layer_mutation_locale_selects_scope_without_compatibility_flag(self):
+        captured = {}
+        resolved_scope = map_extent_scope()
+
+        def create(request):
+            captured.update(request["body"])
+            return 201, {"derivedLayer": {
+                "name": "places",
+                "kind": "view",
+                "spatialScope": resolved_scope,
+            }}
+
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers")] = create
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT id, geom FROM leeds.places",
+                encoding="utf-8",
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "places",
+                "--kind", "view",
+                "--query-file", str(query_file),
+                "--source", "leeds.places",
+                "--id-column", "id",
+                "--geometry-column", "geom",
+                "--locale", "Leeds",
+            ], store)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(captured["spatialScope"], {
+            "type": "workspace-map-extent",
+            "locale": "Leeds",
+        })
+        self.assertEqual(
+            json.loads(stdout)["derivedLayer"]["spatialScope"],
+            resolved_scope,
+        )
+
+    def test_derived_create_requires_resolved_scope(self):
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers")] = (
+            201,
+            {"derivedLayer": {
+                "name": "places",
+                "spatialScope": None,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT id, geom FROM leeds.places",
+                encoding="utf-8",
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "places",
+                "--query-file", str(query_file),
+                "--source", "leeds.places",
+                "--id-column", "id",
+                "--geometry-column", "geom",
+            ], store)
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        failure = json.loads(stderr)
+        self.assertEqual(
+            failure["code"],
+            "derived_layer.mutation_indeterminate",
+        )
+        self.assertFalse(
+            failure["details"]["reconciliation"]["automaticRetry"],
+        )
 
     def test_derived_layer_replace_forwards_complete_confirmed_definition(self):
         captured = {}
+        resolved_scope = map_extent_scope()
 
         def replace(request):
             captured.update(request["body"])
@@ -153,6 +1077,9 @@ class CliTests(unittest.TestCase):
                 "name": "paths_h3_r9",
                 "kind": "materialized",
                 "replacedKind": "view",
+                "spatialScope": resolved_scope,
+                "materializationProbe": materialization_probe(),
+                "queryPlanProbe": query_plan_probe(),
             }}
 
         routes = standard_routes()
@@ -177,13 +1104,73 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertTrue(captured["confirmed"])
         self.assertEqual(captured["kind"], "materialized")
-        self.assertEqual(json.loads(stdout)["derivedLayer"]["replacedKind"], "view")
+        self.assertEqual(captured["spatialScope"], {
+            "type": "workspace-map-extent",
+        })
+        derived_layer = json.loads(stdout)["derivedLayer"]
+        self.assertEqual(derived_layer["replacedKind"], "view")
+        self.assertEqual(
+            derived_layer["materializationProbe"],
+            materialization_probe(),
+        )
+        self.assertEqual(
+            derived_layer["queryPlanProbe"],
+            query_plan_probe(),
+        )
+
+    def test_derived_layer_replace_forwards_map_extent_scope(self):
+        captured = {}
+        resolved_scope = map_extent_scope()
+
+        def replace(request):
+            captured.update(request["body"])
+            return 200, {"derivedLayer": {
+                "name": "paths_h3_r9",
+                "kind": "materialized",
+                "replacedKind": "view",
+                "spatialScope": resolved_scope,
+            }}
+
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers/paths_h3_r9/replace")] = replace
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT cell_id, geom_3857 FROM leeds.h3_cells",
+                encoding="utf-8",
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "replace", "paths_h3_r9",
+                "--kind", "materialized",
+                "--query-file", str(query_file),
+                "--source", "leeds.h3_cells",
+                "--id-column", "cell_id",
+                "--geometry-column", "geom_3857",
+                "--map-extent",
+                "--locale", "Leeds",
+                "--confirm",
+            ], store)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(captured["confirmed"])
+        self.assertEqual(captured["spatialScope"], {
+            "type": "workspace-map-extent",
+            "locale": "Leeds",
+        })
+        derived_layer = json.loads(stdout)["derivedLayer"]
+        self.assertEqual(derived_layer["replacedKind"], "view")
+        self.assertEqual(derived_layer["spatialScope"], resolved_scope)
 
     def test_derived_create_waits_for_background_operation(self):
         polls = {"count": 0}
+        resolved_scope = map_extent_scope()
 
         def create(request):
             self.assertTrue(request["body"]["background"])
+            self.assertEqual(request["body"]["spatialScope"], {
+                "type": "workspace-map-extent",
+            })
             return 202, {"operation": {
                 "id": "derived-op-1",
                 "kind": "derived-layer.create",
@@ -199,6 +1186,7 @@ class CliTests(unittest.TestCase):
                 "result": {"derivedLayer": {
                     "name": "slow_places",
                     "kind": "materialized",
+                    "spatialScope": resolved_scope,
                 }},
             }}
 
@@ -224,7 +1212,445 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(0, code, stderr)
         self.assertEqual(1, polls["count"])
-        self.assertEqual("slow_places", json.loads(stdout)["derivedLayer"]["name"])
+        derived_layer = json.loads(stdout)["derivedLayer"]
+        self.assertEqual("slow_places", derived_layer["name"])
+        self.assertEqual(resolved_scope, derived_layer["spatialScope"])
+
+    def test_derived_mutations_reject_wrong_names_after_sync_and_background_success(self):
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers/requested/refresh")] = (
+            200,
+            {"derivedLayer": {"name": "substituted"}},
+        )
+        routes[("POST", "/api/derived-layers/background/refresh")] = (
+            202,
+            {"operation": {
+                "id": "derived-op-wrong-name",
+                "kind": "derived-layer.refresh",
+                "status": "running",
+            }},
+        )
+        routes[("GET", "/api/operations/derived-op-wrong-name")] = (
+            200,
+            {"operation": {
+                "id": "derived-op-wrong-name",
+                "kind": "derived-layer.refresh",
+                "status": "succeeded",
+                "result": {"derivedLayer": {"name": "substituted"}},
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            synchronous = self.invoke(
+                ["derived-layers", "refresh", "requested", "--confirm"],
+                store,
+            )
+            background = self.invoke(
+                [
+                    "derived-layers", "refresh", "background", "--confirm",
+                    "--background", "--interval", "0.001",
+                ],
+                store,
+            )
+
+        self.assertEqual(synchronous[0], EXIT_CONNECTIVITY)
+        self.assertEqual(synchronous[1], "")
+        self.assertEqual(
+            json.loads(synchronous[2])["code"],
+            "derived_layer.mutation_indeterminate",
+        )
+        self.assertEqual(background[0], EXIT_CONNECTIVITY)
+        self.assertEqual(background[1], "")
+        background_error = json.loads(background[2])
+        self.assertEqual(background_error["code"], "operation.poll_failed")
+        self.assertEqual(
+            background_error["details"]["cause"]["code"],
+            "derived_layer.invalid_response",
+        )
+        self.assertEqual(
+            background_error["details"]["operationId"],
+            "derived-op-wrong-name",
+        )
+
+    def test_derived_create_surfaces_structured_background_guidance(self):
+        reason = {
+            "code": "custom_routine",
+            "message": "The query calls an unapproved database routine.",
+            "suggestedAction": (
+                "Use an approved PostgreSQL, PostGIS, or H3 routine directly."
+            ),
+        }
+        operation_error = {
+            "error": "The derived query is not allowed.",
+            "userMessage": (
+                "This query uses a database object outside the derived-layer "
+                "allowlist."
+            ),
+            "suggestedAction": reason["suggestedAction"],
+            "code": "derived_layer.query_not_allowed",
+            "category": "policy",
+            "status": 422,
+            "blocked": True,
+            "stateUnchanged": True,
+            "safeState": "No derived layer was created.",
+            "reasons": [reason],
+        }
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers")] = (
+            202,
+            {"operation": {
+                "id": "derived-op-policy",
+                "kind": "derived-layer.create",
+                "status": "failed",
+                "error": operation_error,
+            }},
+        )
+
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT id, geom FROM etl.places", encoding="utf-8"
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "unsafe_places",
+                "--kind", "view",
+                "--query-file", str(query_file),
+                "--source", "etl.places",
+                "--id-column", "id",
+                "--geometry-column", "geom",
+                "--background",
+            ], store)
+
+        self.assertEqual(EXIT_VALIDATION, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("derived_layer.query_not_allowed", payload["code"])
+        self.assertEqual(operation_error["userMessage"], payload["error"])
+        preserved = payload["details"]["operation"]["error"]
+        self.assertEqual(operation_error["suggestedAction"], preserved["suggestedAction"])
+        self.assertEqual([reason], preserved["reasons"])
+
+    def test_invalid_background_waits_stop_before_the_mutation_request(self):
+        for option, value in (
+            ("--wait-timeout", "0"),
+            ("--wait-timeout", "-1"),
+            ("--interval", "0"),
+            ("--interval", "-0.5"),
+        ):
+            with self.subTest(option=option, value=value):
+                routes = standard_routes()
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        [
+                            "derived-layers", "refresh", "slow_places",
+                            "--confirm", "--background", option, value,
+                        ],
+                        store,
+                    )
+                    mutation_requests = [
+                        request
+                        for request in server.requests
+                        if request["method"] == "POST"
+                    ]
+
+                self.assertEqual(code, EXIT_USAGE)
+                self.assertEqual(stdout, "")
+                self.assertEqual(
+                    json.loads(stderr)["code"],
+                    "operation.invalid_wait",
+                )
+                self.assertEqual(mutation_requests, [])
+
+    def test_background_poll_failure_retains_reconciliation_identity(self):
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
+            202,
+            {"operation": {
+                "id": "derived-op-poll",
+                "kind": "derived-layer.refresh",
+                "status": "running",
+            }},
+        )
+        routes[("GET", "/api/operations/derived-op-poll")] = (
+            503,
+            {"error": "Polling is temporarily unavailable."},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch("mapp_config_cli.cli.time.sleep", return_value=None):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "derived-layers", "refresh", "slow_places",
+                        "--confirm", "--background", "--interval", "0.001",
+                    ],
+                    store,
+                )
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["code"], "operation.poll_failed")
+        self.assertEqual(payload["details"]["operationId"], "derived-op-poll")
+        reconciliation = payload["details"]["reconciliation"]
+        self.assertTrue(reconciliation["required"])
+        self.assertFalse(reconciliation["automaticRetry"])
+        self.assertEqual(
+            reconciliation["commands"][0]["arguments"],
+            ["derived-op-poll"],
+        )
+
+    def test_background_poll_interruption_retains_reconciliation_identity(self):
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
+            202,
+            {"operation": {
+                "id": "derived-op-interrupted",
+                "kind": "derived-layer.refresh",
+                "status": "running",
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch(
+                "mapp_config_cli.cli.time.sleep",
+                side_effect=KeyboardInterrupt,
+            ):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "derived-layers", "refresh", "slow_places",
+                        "--confirm", "--background",
+                    ],
+                    store,
+                )
+
+        self.assertEqual(code, EXIT_INTERRUPTED)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["code"], "operation.poll_interrupted")
+        self.assertEqual(
+            payload["details"]["operationId"],
+            "derived-op-interrupted",
+        )
+        self.assertTrue(payload["details"]["reconciliation"]["required"])
+
+    def test_background_malformed_poll_retains_reconciliation_identity(self):
+        operation_id = "derived-op-malformed"
+        poll_responses = (
+            {"operation": {"id": "different-operation", "status": "running"}},
+            {
+                "operation": {
+                    "id": operation_id,
+                    "kind": "derived-layer.refresh",
+                    "status": "succeeded",
+                    "result": [],
+                }
+            },
+            {
+                "operation": {
+                    "id": operation_id,
+                    "kind": "derived-layer.refresh",
+                    "status": "succeeded",
+                    "result": {},
+                }
+            },
+        )
+        for poll_response in poll_responses:
+            with self.subTest(poll_response=poll_response):
+                routes = standard_routes()
+                routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
+                    202,
+                    {"operation": {
+                        "id": operation_id,
+                        "kind": "derived-layer.refresh",
+                        "status": "running",
+                    }},
+                )
+                routes[("GET", f"/api/operations/{operation_id}")] = (
+                    200,
+                    poll_response,
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    with patch(
+                        "mapp_config_cli.cli.time.sleep",
+                        return_value=None,
+                    ):
+                        code, stdout, stderr = self.invoke(
+                            [
+                                "derived-layers", "refresh", "slow_places",
+                                "--confirm", "--background", "--interval", "0.001",
+                            ],
+                            store,
+                        )
+                    mutation_requests = [
+                        request
+                        for request in server.requests
+                        if request["method"] == "POST"
+                    ]
+
+                self.assertEqual(code, EXIT_CONNECTIVITY)
+                self.assertEqual(stdout, "")
+                payload = json.loads(stderr)
+                self.assertEqual(payload["code"], "operation.poll_failed")
+                self.assertEqual(payload["details"]["operationId"], operation_id)
+                self.assertIn(
+                    payload["details"]["cause"]["code"],
+                    {
+                        "operation.invalid_response",
+                        "derived_layer.invalid_response",
+                    },
+                )
+                reconciliation = payload["details"]["reconciliation"]
+                self.assertTrue(reconciliation["required"])
+                self.assertFalse(reconciliation["automaticRetry"])
+                self.assertEqual(
+                    reconciliation["commands"][0]["arguments"],
+                    [operation_id],
+                )
+                self.assertEqual(len(mutation_requests), 1)
+
+    def test_background_malformed_initial_operation_prohibits_resubmission(self):
+        route = ("POST", "/api/derived-layers/slow_places/refresh")
+        malformed_operations = (
+            {"status": "running"},
+            {"id": "", "status": "running"},
+            {"id": 7, "status": "running"},
+        )
+        for operation in malformed_operations:
+            with self.subTest(operation=operation):
+                routes = standard_routes()
+                routes[route] = (202, {"operation": operation})
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        [
+                            "derived-layers", "refresh", "slow_places",
+                            "--confirm", "--background",
+                        ],
+                        store,
+                    )
+                    mutation_requests = [
+                        request
+                        for request in server.requests
+                        if (request["method"], request["path"]) == route
+                    ]
+
+                self.assertEqual(code, EXIT_CONNECTIVITY)
+                self.assertEqual(stdout, "")
+                failure = json.loads(stderr)
+                self.assertEqual(
+                    failure["code"],
+                    "derived_layer.mutation_indeterminate",
+                )
+                self.assertEqual(
+                    failure["details"]["cause"]["code"],
+                    "operation.invalid_response",
+                )
+                self.assertFalse(
+                    failure["details"]["reconciliation"]["automaticRetry"]
+                )
+                self.assertEqual(len(mutation_requests), 1)
+
+    def test_derived_mutation_ambiguous_http_status_is_indeterminate(self):
+        route = ("POST", "/api/derived-layers/slow_places/refresh")
+        responses = (
+            (
+                408,
+                {
+                    "error": "Refresh response timed out after submission.",
+                    "code": "derived_layer.refresh_timeout",
+                },
+            ),
+            (
+                307,
+                {"error": "Refresh endpoint moved."},
+                {"Location": "/moved"},
+            ),
+        )
+        for response in responses:
+            with self.subTest(status=response[0]):
+                routes = standard_routes()
+                routes[route] = response
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        [
+                            "derived-layers", "refresh", "slow_places",
+                            "--confirm",
+                        ],
+                        store,
+                    )
+                    attempts = [
+                        request
+                        for request in server.requests
+                        if (request["method"], request["path"]) == route
+                    ]
+
+                self.assertEqual(code, EXIT_CONNECTIVITY)
+                self.assertEqual(stdout, "")
+                failure = json.loads(stderr)
+                self.assertEqual(
+                    failure["code"],
+                    "derived_layer.mutation_indeterminate",
+                )
+                self.assertEqual(
+                    failure["details"]["cause"]["httpStatus"],
+                    response[0],
+                )
+                self.assertFalse(
+                    failure["details"]["reconciliation"]["automaticRetry"]
+                )
+                self.assertEqual(len(attempts), 1)
+
+    def test_derived_mutation_interruption_is_indeterminate(self):
+        routes = standard_routes()
+        original_request = ApiClient.request
+        mutation_attempts = 0
+
+        def interrupt_refresh(client, path, *args, **kwargs):
+            nonlocal mutation_attempts
+            if path == "/api/derived-layers/slow_places/refresh":
+                mutation_attempts += 1
+                raise KeyboardInterrupt
+            return original_request(client, path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch.object(ApiClient, "request", new=interrupt_refresh):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "derived-layers", "refresh", "slow_places",
+                        "--confirm",
+                    ],
+                    store,
+                )
+
+        self.assertEqual(code, EXIT_INTERRUPTED)
+        self.assertEqual(stdout, "")
+        failure = json.loads(stderr)
+        self.assertEqual(
+            failure["code"],
+            "derived_layer.mutation_indeterminate",
+        )
+        self.assertTrue(failure["details"]["interrupted"])
+        self.assertFalse(
+            failure["details"]["reconciliation"]["automaticRetry"]
+        )
+        self.assertEqual(mutation_attempts, 1)
 
     def test_derived_layer_in_use_feedback_preserves_detected_uses(self):
         routes = standard_routes()
@@ -399,6 +1825,8 @@ class CliTests(unittest.TestCase):
                         "id": "proposal-1",
                         "status": "pending",
                         "originalRevision": request["body"]["revision"],
+                        "operations": request["body"]["operations"],
+                        "explanation": request["body"].get("explanation"),
                     }
                 },
             )
@@ -516,6 +1944,7 @@ class CliTests(unittest.TestCase):
                     "checkFingerprint": "a" * 64,
                     "originalRevision": request["body"]["revision"],
                     "operations": request["body"]["operations"],
+                    "explanation": request["body"].get("explanation"),
                     "diff": [{"path": "/locale/view/z", "old": 10, "value": 12}],
                     "warnings": ["Review map scale."],
                 }
@@ -544,6 +1973,80 @@ class CliTests(unittest.TestCase):
         self.assertEqual(captured["revision"], "rev-1")
         self.assertEqual(captured["explanation"], "Change only the zoom.")
 
+    def test_proposal_check_accepts_a_generated_explanation_when_omitted(self):
+        captured = {}
+        generated_explanation = "Set locale view zoom to 12."
+
+        def check(request):
+            captured.update(request["body"])
+            return 200, {"check": {
+                "valid": True,
+                "proposalCreated": False,
+                "checkFingerprint": "e" * 64,
+                "originalRevision": request["body"]["revision"],
+                "operations": request["body"]["operations"],
+                "explanation": generated_explanation,
+                "diff": [],
+                "warnings": [],
+            }}
+
+        routes = standard_routes()
+        routes[("POST", "/api/proposals/check")] = check
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "proposals", "check", "--base-revision", "rev-1",
+                    "--set", "/locale/view/z=12",
+                ],
+                store,
+            )
+            cached = store.load_check(
+                store.selected_profile("test"),
+                "e" * 64,
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("explanation", captured)
+        self.assertEqual(
+            json.loads(stdout)["check"]["explanation"],
+            generated_explanation,
+        )
+        self.assertEqual(cached["explanation"], generated_explanation)
+
+    def test_direct_proposal_create_accepts_a_generated_explanation_when_omitted(self):
+        captured = {}
+        generated_explanation = "Set locale view zoom to 12."
+
+        def create(request):
+            captured.update(request["body"])
+            return 201, {"proposal": {
+                "id": "proposal-generated",
+                "status": "pending",
+                "originalRevision": request["body"]["revision"],
+                "operations": request["body"]["operations"],
+                "explanation": generated_explanation,
+            }}
+
+        routes = standard_routes()
+        routes[("POST", "/api/proposals")] = create
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "proposals", "create", "--base-revision", "rev-1",
+                    "--set", "/locale/view/z=12",
+                ],
+                store,
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("explanation", captured)
+        self.assertEqual(
+            json.loads(stdout)["proposal"]["explanation"],
+            generated_explanation,
+        )
+
     def test_proposal_create_from_check_reuses_exact_cached_operations(self):
         fingerprint = "b" * 64
         routes = standard_routes()
@@ -555,6 +2058,7 @@ class CliTests(unittest.TestCase):
                 "originalRevision": "rev-1",
                 "checkFingerprint": fingerprint,
                 "operations": [{"op": "set", "path": "/locale/view/z", "value": 12}],
+                "explanation": "Set locale view zoom to 12.",
                 "diff": [{"path": "/locale/view/z", "old": 10, "value": 12}],
                 "warnings": [],
             }},
@@ -567,6 +2071,8 @@ class CliTests(unittest.TestCase):
                 "id": "proposal-checked",
                 "status": "pending",
                 "originalRevision": "rev-1",
+                "operations": request["body"]["operations"],
+                "explanation": request["body"].get("explanation"),
             }}
 
         routes[("POST", "/api/proposals")] = create
@@ -584,6 +2090,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(captured["checkFingerprint"], fingerprint)
         self.assertEqual(captured["revision"], "rev-1")
         self.assertEqual(captured["operations"][0]["value"], 12)
+        self.assertEqual(captured["explanation"], "Set locale view zoom to 12.")
+        check_request = next(
+            request
+            for request in server.requests
+            if request["path"] == "/api/proposals/check"
+        )
+        self.assertNotIn("explanation", check_request["body"])
         with self.assertRaises(CliError):
             parser().parse_args(
                 [
@@ -595,6 +2108,141 @@ class CliTests(unittest.TestCase):
                     "/locale/view/z=12",
                 ]
             )
+
+    def test_proposal_create_rejects_a_returned_mismatched_check_fingerprint(self):
+        fingerprint = "b" * 64
+        routes = standard_routes()
+        routes[("POST", "/api/proposals/check")] = (
+            200,
+            {"check": {
+                "valid": True,
+                "proposalCreated": False,
+                "originalRevision": "rev-1",
+                "checkFingerprint": fingerprint,
+                "operations": [
+                    {"op": "set", "path": "/locale/view/z", "value": 12}
+                ],
+                "explanation": "Set locale view zoom to 12.",
+                "diff": [{"path": "/locale/view/z", "old": 10, "value": 12}],
+                "warnings": [],
+            }},
+        )
+
+        def create(request):
+            return 201, {"proposal": {
+                "id": "proposal-checked",
+                "status": "pending",
+                "originalRevision": request["body"]["revision"],
+                "operations": request["body"]["operations"],
+                "explanation": request["body"].get("explanation"),
+                "checkFingerprint": "c" * 64,
+            }}
+
+        routes[("POST", "/api/proposals")] = create
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            check_code, _, check_error = self.invoke(
+                [
+                    "proposals", "check", "--base-revision", "rev-1",
+                    "--set", "/locale/view/z=12",
+                ],
+                store,
+            )
+            code, stdout, stderr = self.invoke(
+                ["proposals", "create", "--from-check", fingerprint],
+                store,
+            )
+
+        self.assertEqual(check_code, 0, check_error)
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["code"], "proposal.invalid_response")
+
+    def test_proposal_check_rejects_a_substituted_explicit_explanation(self):
+        def check(request):
+            return 200, {"check": {
+                "valid": True,
+                "proposalCreated": False,
+                "originalRevision": request["body"]["revision"],
+                "operations": request["body"]["operations"],
+                "explanation": "Change every field.",
+                "checkFingerprint": "d" * 64,
+                "diff": [],
+            }}
+
+        routes = standard_routes()
+        routes[("POST", "/api/proposals/check")] = check
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "proposals", "check", "--base-revision", "rev-1",
+                    "--set", "/locale/view/z=12",
+                    "--explanation", "Change only the zoom.",
+                ],
+                store,
+            )
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["code"], "proposal.invalid_response")
+
+    def test_workspace_proposal_echoes_reject_bool_number_substitution(self):
+        cases = (
+            (
+                "check",
+                [
+                    "proposals", "check", "--base-revision", "rev-1",
+                    "--set", "/enabled=true", "--explanation", "Enable it.",
+                ],
+                ("POST", "/api/proposals/check"),
+            ),
+            (
+                "create",
+                [
+                    "proposals", "create", "--base-revision", "rev-1",
+                    "--set", "/enabled=true", "--explanation", "Enable it.",
+                ],
+                ("POST", "/api/proposals"),
+            ),
+        )
+        for action, arguments, route in cases:
+            with self.subTest(action=action):
+                def substitute(request):
+                    operations = json.loads(json.dumps(request["body"]["operations"]))
+                    operations[0]["value"] = 1
+                    if action == "check":
+                        return 200, {"check": {
+                            "valid": True,
+                            "proposalCreated": False,
+                            "originalRevision": request["body"]["revision"],
+                            "operations": operations,
+                            "explanation": request["body"]["explanation"],
+                            "diff": [],
+                        }}
+                    return 201, {"proposal": {
+                        "id": "proposal-bool-substitution",
+                        "status": "pending",
+                        "originalRevision": request["body"]["revision"],
+                        "operations": operations,
+                        "explanation": request["body"]["explanation"],
+                    }}
+
+                routes = standard_routes()
+                routes[route] = substitute
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(arguments, store)
+
+                self.assertEqual(code, EXIT_CONNECTIVITY)
+                self.assertEqual(stdout, "")
+                self.assertEqual(
+                    json.loads(stderr)["code"],
+                    "proposal.invalid_response",
+                )
 
     def test_proposal_apply_requires_confirmation(self):
         with self.assertRaises(CliError):
@@ -613,6 +2261,7 @@ class CliTests(unittest.TestCase):
                     "id": "proposal-1",
                     "status": "pending",
                     "originalRevision": "rev-old",
+                    "candidateHash": WORKSPACE_CANDIDATE_HASH,
                 }
             },
         )
@@ -644,6 +2293,7 @@ class CliTests(unittest.TestCase):
                     "id": "proposal-1",
                     "status": "pending",
                     "originalRevision": "rev-1",
+                    "candidateHash": WORKSPACE_CANDIDATE_HASH,
                 }
             },
         )
@@ -676,17 +2326,63 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, EXIT_CONNECTIVITY)
         self.assertEqual(stdout, "")
         error = json.loads(stderr)
-        self.assertEqual(error["code"], "api.http_error")
-        self.assertEqual(error["httpStatus"], 504)
-        self.assertTrue(error["details"]["saved"])
-        self.assertEqual(error["details"]["revision"], "rev-2")
-        self.assertEqual(error["details"]["proposal"]["status"], "applied")
+        self.assertEqual(error["code"], "proposal.apply_indeterminate")
+        reconciliation = error["details"]["reconciliation"]
+        self.assertTrue(reconciliation["required"])
+        self.assertFalse(reconciliation["automaticRetry"])
+        self.assertEqual(error["details"]["proposalId"], "proposal-1")
+        cause = error["details"]["cause"]
+        self.assertEqual(cause["httpStatus"], 504)
+        self.assertTrue(cause["details"]["saved"])
+        self.assertEqual(cause["details"]["revision"], "rev-2")
+        self.assertEqual(cause["details"]["proposal"]["status"], "applied")
         self.assertEqual(
-            error["details"]["proposal"]["appliedRevision"],
+            cause["details"]["proposal"]["appliedRevision"],
             "rev-2",
         )
         self.assertEqual(len(apply_requests), 1)
         self.assertEqual({"approved": True}, apply_requests[0]["body"])
+
+    def test_apply_http_408_is_indeterminate_and_is_not_retried(self):
+        routes = standard_routes()
+        routes[("GET", "/api/proposals/proposal-1")] = (
+            200,
+            {"proposal": {
+                "id": "proposal-1",
+                "status": "pending",
+                "originalRevision": "rev-1",
+                "candidateHash": WORKSPACE_CANDIDATE_HASH,
+            }},
+        )
+        routes[("POST", "/api/proposals/proposal-1/apply")] = (
+            408,
+            {
+                "error": "The apply request timed out after it was submitted.",
+                "code": "proposal.apply_timeout",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["proposals", "apply", "proposal-1", "--confirm"],
+                store,
+            )
+            apply_requests = [
+                request
+                for request in server.requests
+                if request["method"] == "POST"
+                and request["path"] == "/api/proposals/proposal-1/apply"
+            ]
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)
+        self.assertEqual(error["code"], "proposal.apply_indeterminate")
+        self.assertEqual(error["details"]["cause"]["httpStatus"], 408)
+        self.assertFalse(
+            error["details"]["reconciliation"]["automaticRetry"]
+        )
+        self.assertEqual(len(apply_requests), 1)
 
     def test_applying_proposal_can_be_reconciled_without_old_revision_preflight(self):
         routes = standard_routes(revision="rev-2")
@@ -697,19 +2393,50 @@ class CliTests(unittest.TestCase):
                     "id": "proposal-1",
                     "status": "applying",
                     "originalRevision": "rev-1",
+                    "candidateHash": WORKSPACE_CANDIDATE_HASH,
                 }
             },
         )
+        fingerprint = "a" * 64
+        applied_proposal = {
+            "id": "proposal-1",
+            "status": "applied",
+            "originalRevision": "rev-1",
+            "appliedRevision": "rev-2",
+            "candidateHash": WORKSPACE_CANDIDATE_HASH,
+            "appliedFingerprint": fingerprint,
+            "requestedGeneration": 2,
+        }
+        reload_result = {
+            "requestedGeneration": 2,
+            "expectedWorkspaceFingerprint": fingerprint,
+            "status": {
+                "requestedGeneration": 2,
+                "appliedGeneration": 2,
+                "workspaceFingerprint": fingerprint,
+                "healthy": True,
+                "completed": True,
+            },
+        }
         routes[("POST", "/api/proposals/proposal-1/apply")] = (
             200,
             {
-                "proposal": {
-                    "id": "proposal-1",
-                    "status": "applied",
-                    "originalRevision": "rev-1",
-                    "appliedRevision": "rev-2",
+                "proposal": applied_proposal,
+                "reload": reload_result,
+                "operation": {
+                    "id": "c" * 32,
+                    "kind": "proposal.apply",
+                    "status": "succeeded",
+                    "target": {
+                        "proposalId": "proposal-1",
+                        "candidateHash": WORKSPACE_CANDIDATE_HASH,
+                    },
+                    "result": {
+                        "proposal": applied_proposal,
+                        "reload": reload_result,
+                    },
+                    "error": None,
                 },
-                "reload": {"completed": True},
             },
         )
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
@@ -726,6 +2453,275 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertEqual(json.loads(stdout)["proposal"]["status"], "applied")
         self.assertEqual(workspace_requests, [])
+
+    def test_apply_requires_and_binds_a_lowercase_candidate_hash(self):
+        fetched_cases = (None, "A" * 64)
+        for candidate_hash in fetched_cases:
+            with self.subTest(fetched_candidate_hash=candidate_hash):
+                proposal = {
+                    "id": "proposal-1",
+                    "status": "pending",
+                    "originalRevision": "rev-1",
+                }
+                if candidate_hash is not None:
+                    proposal["candidateHash"] = candidate_hash
+                routes = standard_routes()
+                routes[("GET", "/api/proposals/proposal-1")] = (
+                    200,
+                    {"proposal": proposal},
+                )
+                routes[("POST", "/api/proposals/proposal-1/apply")] = (
+                    200,
+                    workspace_apply_response(),
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        ["proposals", "apply", "proposal-1", "--confirm"],
+                        store,
+                    )
+                    apply_requests = [
+                        request
+                        for request in server.requests
+                        if request["path"].endswith("/apply")
+                    ]
+
+                self.assertEqual(code, EXIT_CONNECTIVITY)
+                self.assertEqual(stdout, "")
+                self.assertEqual(
+                    json.loads(stderr)["code"],
+                    "proposal.invalid_response",
+                )
+                self.assertEqual(apply_requests, [])
+
+        response_cases = (
+            workspace_apply_response(candidate_hash="d" * 64),
+            workspace_apply_response(target_candidate_hash=None),
+            workspace_apply_response(target_candidate_hash="d" * 64),
+        )
+        for response in response_cases:
+            with self.subTest(response=response):
+                routes = standard_routes()
+                routes[("GET", "/api/proposals/proposal-1")] = (
+                    200,
+                    {"proposal": {
+                        "id": "proposal-1",
+                        "status": "pending",
+                        "originalRevision": "rev-1",
+                        "candidateHash": WORKSPACE_CANDIDATE_HASH,
+                    }},
+                )
+                routes[("POST", "/api/proposals/proposal-1/apply")] = (
+                    200,
+                    response,
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        ["proposals", "apply", "proposal-1", "--confirm"],
+                        store,
+                    )
+
+                self.assertEqual(code, EXIT_CONNECTIVITY)
+                self.assertEqual(stdout, "")
+                self.assertEqual(
+                    json.loads(stderr)["code"],
+                    "proposal.apply_indeterminate",
+                )
+
+    def test_apply_durable_result_uses_type_sensitive_json_binding(self):
+        response = workspace_apply_response()
+        response["proposal"]["requestedGeneration"] = 1
+        response["operation"]["result"]["proposal"][
+            "requestedGeneration"
+        ] = True
+        routes = standard_routes()
+        routes[("GET", "/api/proposals/proposal-1")] = (
+            200,
+            {"proposal": {
+                "id": "proposal-1",
+                "status": "pending",
+                "originalRevision": "rev-1",
+                "candidateHash": WORKSPACE_CANDIDATE_HASH,
+            }},
+        )
+        routes[("POST", "/api/proposals/proposal-1/apply")] = (
+            200,
+            response,
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["proposals", "apply", "proposal-1", "--confirm"],
+                store,
+            )
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr)["code"],
+            "proposal.apply_indeterminate",
+        )
+
+    def test_apply_partial_success_is_indeterminate_and_is_not_retried(self):
+        routes = standard_routes()
+        routes[("GET", "/api/proposals/proposal-1")] = (
+            200,
+            {
+                "proposal": {
+                    "id": "proposal-1",
+                    "status": "pending",
+                    "originalRevision": "rev-1",
+                    "candidateHash": WORKSPACE_CANDIDATE_HASH,
+                }
+            },
+        )
+        routes[("POST", "/api/proposals/proposal-1/apply")] = (
+            200,
+            {
+                "proposal": {
+                    "id": "proposal-1",
+                    "status": "applied",
+                    "originalRevision": "rev-1",
+                    "appliedRevision": "rev-2",
+                }
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["proposals", "apply", "proposal-1", "--confirm"],
+                store,
+            )
+            apply_requests = [
+                request
+                for request in server.requests
+                if request["method"] == "POST"
+                and request["path"] == "/api/proposals/proposal-1/apply"
+            ]
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)
+        self.assertEqual(error["code"], "proposal.apply_indeterminate")
+        self.assertFalse(error["details"]["reconciliation"]["automaticRetry"])
+        self.assertEqual(len(apply_requests), 1)
+
+    def test_apply_redirect_is_indeterminate_and_is_not_retried(self):
+        routes = standard_routes()
+        routes[("GET", "/api/proposals/proposal-1")] = (
+            200,
+            {
+                "proposal": {
+                    "id": "proposal-1",
+                    "status": "pending",
+                    "originalRevision": "rev-1",
+                    "candidateHash": WORKSPACE_CANDIDATE_HASH,
+                }
+            },
+        )
+        routes[("POST", "/api/proposals/proposal-1/apply")] = (
+            307,
+            {"error": "Apply endpoint moved."},
+            {"Location": "/moved"},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["proposals", "apply", "proposal-1", "--confirm"],
+                store,
+            )
+            apply_requests = [
+                request
+                for request in server.requests
+                if request["method"] == "POST"
+                and request["path"] == "/api/proposals/proposal-1/apply"
+            ]
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)
+        self.assertEqual(error["code"], "proposal.apply_indeterminate")
+        self.assertEqual(error["details"]["cause"]["httpStatus"], 307)
+        self.assertFalse(error["details"]["reconciliation"]["automaticRetry"])
+        self.assertEqual(len(apply_requests), 1)
+
+    def test_apply_interruption_is_indeterminate_and_is_not_retried(self):
+        routes = standard_routes()
+        routes[("GET", "/api/proposals/proposal-1")] = (
+            200,
+            {
+                "proposal": {
+                    "id": "proposal-1",
+                    "status": "pending",
+                    "originalRevision": "rev-1",
+                    "candidateHash": WORKSPACE_CANDIDATE_HASH,
+                }
+            },
+        )
+        original_request = ApiClient.request
+        apply_attempts = 0
+
+        def interrupt_apply(client, path, *args, **kwargs):
+            nonlocal apply_attempts
+            if path == "/api/proposals/proposal-1/apply":
+                apply_attempts += 1
+                raise KeyboardInterrupt
+            return original_request(client, path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch.object(ApiClient, "request", new=interrupt_apply):
+                code, stdout, stderr = self.invoke(
+                    ["proposals", "apply", "proposal-1", "--confirm"],
+                    store,
+                )
+
+        self.assertEqual(code, EXIT_INTERRUPTED)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)
+        self.assertEqual(error["code"], "proposal.apply_indeterminate")
+        self.assertTrue(error["details"]["interrupted"])
+        self.assertFalse(error["details"]["reconciliation"]["automaticRetry"])
+        self.assertEqual(apply_attempts, 1)
+
+    def test_apply_preserves_a_known_server_rejection(self):
+        routes = standard_routes()
+        routes[("GET", "/api/proposals/proposal-1")] = (
+            200,
+            {"proposal": {
+                "id": "proposal-1",
+                "status": "pending",
+                "originalRevision": "rev-1",
+                "candidateHash": WORKSPACE_CANDIDATE_HASH,
+            }},
+        )
+        routes[("POST", "/api/proposals/proposal-1/apply")] = (
+            409,
+            {
+                "error": "Proposal cannot be applied.",
+                "code": "proposal.blocked",
+                "stateUnchanged": True,
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["proposals", "apply", "proposal-1", "--confirm"],
+                store,
+            )
+
+        self.assertEqual(code, EXIT_CONFLICT)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)
+        self.assertEqual(error["code"], "proposal.blocked")
+        self.assertTrue(error["details"]["stateUnchanged"])
 
     def test_direct_mutation_is_always_dry_run(self):
         captured = {}
@@ -909,12 +2905,317 @@ class CliTests(unittest.TestCase):
             after = output / "run-1/after-page.png"
             before_bytes = before.read_bytes()
             after_bytes = after.read_bytes()
+            root_mode = output.stat().st_mode & 0o777
+            run_mode = before.parent.stat().st_mode & 0o777
+            before_mode = before.stat().st_mode & 0o777
+            after_mode = after.stat().st_mode & 0o777
         self.assertEqual(code, 0, stderr)
         payload = json.loads(stdout)
         self.assertEqual(payload["localArtifacts"]["beforePage"], str(before))
         self.assertEqual(payload["localArtifacts"]["afterPage"], str(after))
         self.assertEqual(before_bytes, b"before")
         self.assertEqual(after_bytes, b"after")
+        self.assertEqual(root_mode, 0o700)
+        self.assertEqual(run_mode, 0o700)
+        self.assertEqual(before_mode, 0o600)
+        self.assertEqual(after_mode, 0o600)
+
+    def test_explicit_artifact_export_requires_a_nonempty_artifact_map(self):
+        cases = (
+            (
+                ["visual-test", "--layer", "Bus Stops"],
+                ("POST", "/api/visual-test"),
+                {
+                    "plan": {"layer": "Bus Stops"},
+                    "visual": {"passed": True},
+                },
+            ),
+            (
+                ["visual-test", "--layer", "Bus Stops"],
+                ("POST", "/api/visual-test"),
+                {
+                    "plan": {"layer": "Bus Stops"},
+                    "visual": {"passed": True, "artifacts": []},
+                },
+            ),
+            (
+                [
+                    "proposals", "preview-test", "proposal-1",
+                    "--layer", "Bus Stops",
+                ],
+                ("POST", "/api/proposals/proposal-1/visual-test"),
+                {
+                    "source": "candidate",
+                    "proposalId": "proposal-1",
+                    "candidateHash": "candidate",
+                    "plan": {"layer": "Bus Stops"},
+                    "visual": {"passed": True, "artifacts": {}},
+                },
+            ),
+        )
+        for arguments, route, response in cases:
+            with self.subTest(arguments=arguments, response=response):
+                routes = standard_routes()
+                routes[route] = (200, response)
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    output = Path(directory) / "artifacts"
+                    store = self.configured_store(directory, server.endpoint)
+                    without_export = self.invoke(arguments, store)
+                    with_export = self.invoke(
+                        [*arguments, "--artifact-dir", str(output)],
+                        store,
+                    )
+                    artifact_requests = [
+                        request
+                        for request in server.requests
+                        if request["path"].startswith("/api/artifacts/")
+                    ]
+                    output_exists = output.exists()
+
+                self.assertEqual(without_export[0], 0, without_export[2])
+                self.assertEqual(with_export[0], EXIT_CONNECTIVITY)
+                self.assertEqual(with_export[1], "")
+                self.assertEqual(
+                    json.loads(with_export[2])["code"],
+                    "visual.artifacts_unavailable",
+                )
+                self.assertEqual(artifact_requests, [])
+                self.assertFalse(output_exists)
+
+    def test_visual_artifact_export_rejects_excessive_artifact_count(self):
+        routes = standard_routes()
+        routes[("POST", "/api/visual-test")] = (
+            200,
+            {
+                "plan": {"layer": "Bus Stops"},
+                "visual": {
+                    "passed": True,
+                    "artifacts": {
+                        f"evidence{index}": f"run/{index}.png"
+                        for index in range(MAX_VISUAL_ARTIFACTS + 1)
+                    },
+                },
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            output = Path(directory) / "artifacts"
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "visual-test", "--layer", "Bus Stops",
+                    "--artifact-dir", str(output),
+                ],
+                store,
+            )
+            artifact_requests = [
+                request
+                for request in server.requests
+                if request["path"].startswith("/api/artifacts/")
+            ]
+            output_exists = output.exists()
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)
+        self.assertEqual(error["code"], "visual.artifact_count_exceeded")
+        self.assertEqual(
+            error["details"]["maxArtifacts"],
+            MAX_VISUAL_ARTIFACTS,
+        )
+        self.assertEqual(artifact_requests, [])
+        self.assertFalse(output_exists)
+
+    def test_visual_artifact_total_limit_fails_without_partial_writes(self):
+        routes = standard_routes()
+        routes[("POST", "/api/visual-test")] = (
+            200,
+            {
+                "plan": {"layer": "Bus Stops"},
+                "visual": {
+                    "passed": True,
+                    "artifacts": {
+                        "first": "run/first.png",
+                        "second": "run/second.png",
+                    },
+                },
+            },
+        )
+        routes[("GET", "/api/artifacts/run/first.png")] = (
+            200,
+            b"abc",
+            {"Content-Type": "image/png"},
+        )
+        routes[("GET", "/api/artifacts/run/second.png")] = (
+            200,
+            b"def",
+            {"Content-Type": "image/png"},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            output = Path(directory) / "artifacts"
+            store = self.configured_store(directory, server.endpoint)
+            with patch(
+                "mapp_config_cli.cli.MAX_VISUAL_ARTIFACT_TOTAL_BYTES",
+                5,
+            ):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "visual-test", "--layer", "Bus Stops",
+                        "--artifact-dir", str(output),
+                    ],
+                    store,
+                )
+            output_exists = output.exists()
+            artifact_requests = [
+                request["path"]
+                for request in server.requests
+                if request["path"].startswith("/api/artifacts/")
+            ]
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr)["code"],
+            "visual.artifact_total_too_large",
+        )
+        self.assertEqual(
+            artifact_requests,
+            [
+                "/api/artifacts/run/first.png",
+                "/api/artifacts/run/second.png",
+            ],
+        )
+        self.assertFalse(output_exists)
+
+    def test_visual_artifacts_reject_unsafe_server_paths(self):
+        unsafe_paths = (
+            "../outside.png",
+            "/absolute.png",
+            "C:/drive.png",
+            "run\\windows.png",
+            "run//empty.png",
+            "run/./dot.png",
+        )
+        for artifact_path in unsafe_paths:
+            with self.subTest(path=artifact_path):
+                routes = standard_routes()
+                routes[("POST", "/api/visual-test")] = (
+                    200,
+                    {
+                        "plan": {"layer": "Bus Stops"},
+                        "visual": {
+                            "passed": True,
+                            "artifacts": {"afterPage": artifact_path},
+                        },
+                    },
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    output = Path(directory) / "artifacts"
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        [
+                            "visual-test", "--layer", "Bus Stops",
+                            "--artifact-dir", str(output),
+                        ],
+                        store,
+                    )
+                    artifact_requests = [
+                        request
+                        for request in server.requests
+                        if request["path"].startswith("/api/artifacts/")
+                    ]
+
+                self.assertEqual(code, EXIT_CONNECTIVITY)
+                self.assertEqual(stdout, "")
+                error = json.loads(stderr)
+                self.assertEqual(error["code"], "visual.artifact_path_invalid")
+                self.assertEqual(artifact_requests, [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX path safety required")
+    def test_visual_artifacts_do_not_overwrite_files_or_follow_symlinks(self):
+        routes = standard_routes()
+        routes[("POST", "/api/visual-test")] = (
+            200,
+            {
+                "plan": {"layer": "Bus Stops"},
+                "visual": {
+                    "passed": True,
+                    "artifacts": {"afterPage": "run/after-page.png"},
+                },
+            },
+        )
+        routes[("GET", "/api/artifacts/run/after-page.png")] = (
+            200,
+            b"replacement",
+            {"Content-Type": "image/png"},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            output = Path(directory) / "artifacts"
+            target = output / "run/after-page.png"
+            target.parent.mkdir(parents=True, mode=0o700)
+            os.chmod(output, 0o700)
+            os.chmod(target.parent, 0o700)
+            target.write_bytes(b"sentinel")
+            os.chmod(target, 0o600)
+            store = self.configured_store(directory, server.endpoint)
+
+            code, stdout, stderr = self.invoke(
+                [
+                    "visual-test", "--layer", "Bus Stops",
+                    "--artifact-dir", str(output),
+                ],
+                store,
+            )
+            retained = target.read_bytes()
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["code"], "visual.artifact_exists")
+        self.assertEqual(retained, b"sentinel")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX path safety required")
+    def test_visual_artifacts_reject_a_symlinked_directory_component(self):
+        routes = standard_routes()
+        routes[("POST", "/api/visual-test")] = (
+            200,
+            {
+                "plan": {"layer": "Bus Stops"},
+                "visual": {
+                    "passed": True,
+                    "artifacts": {"afterPage": "run/after-page.png"},
+                },
+            },
+        )
+        routes[("GET", "/api/artifacts/run/after-page.png")] = (
+            200,
+            b"hostile",
+            {"Content-Type": "image/png"},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            output = Path(directory) / "artifacts"
+            outside = Path(directory) / "outside"
+            output.mkdir(mode=0o700)
+            outside.mkdir(mode=0o700)
+            (output / "run").symlink_to(outside, target_is_directory=True)
+            store = self.configured_store(directory, server.endpoint)
+
+            code, stdout, stderr = self.invoke(
+                [
+                    "visual-test", "--layer", "Bus Stops",
+                    "--artifact-dir", str(output),
+                ],
+                store,
+            )
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["code"], "visual.artifact_write_failed")
+        self.assertFalse((outside / "after-page.png").exists())
 
     def test_proposal_candidate_visual_commands_bind_identity_and_route(self):
         captured: list[tuple[str, dict]] = []
@@ -932,6 +3233,59 @@ class CliTests(unittest.TestCase):
             }
             if not request["path"].endswith("/visual-plan"):
                 result["visual"] = {"passed": True}
+            if request["path"].endswith("/screenshot"):
+                result["plan"]["featureInfoEvidence"] = {
+                    "original": {"requested": False},
+                    "candidate": {
+                        "requested": True,
+                        "expectedText": ["ONS Census 2021"],
+                    },
+                }
+                panel_result = {"passed": True}
+                result["visual"] = {
+                    "passed": True,
+                    "artifacts": {
+                        "beforeFilteringPanel": "run-before/filtering.png",
+                        "afterFilteringPanel": "run-after/filtering.png",
+                        "beforeStylingPanel": "run-before/styling.png",
+                        "afterStylingPanel": "run-after/styling.png",
+                        "afterInfoPanel": "run-after/info.png",
+                        "beforeHoverTooltip": "run-before/hover.png",
+                        "afterHoverTooltip": "run-after/hover.png",
+                    },
+                    "comparison": {
+                        "original": {
+                            "hover": {
+                                "requested": True,
+                                "attempted": True,
+                                "opened": True,
+                                "passed": True,
+                            },
+                            "panels": {
+                                "filtering": panel_result,
+                                "styling": panel_result,
+                            },
+                        },
+                        "candidate": {
+                            "hover": {
+                                "requested": True,
+                                "attempted": True,
+                                "opened": True,
+                                "passed": True,
+                            },
+                            "panels": {
+                                "filtering": panel_result,
+                                "styling": panel_result,
+                            },
+                        },
+                        "featureInfoEvidence": {
+                            "candidate": {
+                                "captured": True,
+                                "passed": True,
+                            },
+                        },
+                    },
+                }
             return 200, result
 
         routes = standard_routes()
@@ -959,6 +3313,11 @@ class CliTests(unittest.TestCase):
                                 "styling",
                                 "--expect-panel-text",
                                 "Cost",
+                                "--expect-info-text",
+                                "ONS Census 2021",
+                                "--hover",
+                                "--expect-hover-text",
+                                "Arrival percentage",
                             ]
                             if action == "preview-screenshot"
                             else []
@@ -997,6 +3356,9 @@ class CliTests(unittest.TestCase):
                     "viewMode": "default",
                     "panels": ["filtering", "styling"],
                     "expectedPanelText": ["Cost"],
+                    "expectedInfoPanelText": ["ONS Census 2021"],
+                    "hover": True,
+                    "expectedHoverText": ["Arrival percentage"],
                 },
             ],
         )
@@ -1044,6 +3406,146 @@ class CliTests(unittest.TestCase):
             ["/api/artifacts/report"],
         )
 
+    def test_candidate_visual_rejects_missing_requested_panel_evidence(self):
+        routes = standard_routes()
+        routes[("POST", "/api/proposals/proposal-1/screenshot")] = (
+            200,
+            {
+                "source": "candidate",
+                "proposalId": "proposal-1",
+                "candidateHash": "sha256:candidate",
+                "plan": {"layer": "Bus Stops"},
+                "visual": {
+                    "passed": True,
+                    "artifacts": {},
+                    "comparison": {
+                        "original": {
+                            "panels": {
+                                "filtering": {
+                                    "passed": False,
+                                    "failureReason": "panel-not-found",
+                                },
+                            },
+                        },
+                        "candidate": {
+                            "panels": {
+                                "filtering": {
+                                    "passed": True,
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, _, stderr = self.invoke(
+                [
+                    "proposals",
+                    "preview-screenshot",
+                    "proposal-1",
+                    "--layer",
+                    "Bus Stops",
+                    "--panel",
+                    "filtering",
+                ],
+                store,
+            )
+        self.assertEqual(code, EXIT_VISUAL)
+        payload = json.loads(stderr)
+        self.assertEqual(payload["code"], "visual.evidence_incomplete")
+        self.assertEqual(
+            payload["details"]["missingEvidence"][0]["evidence"][
+                "failureReason"
+            ],
+            "panel-not-found",
+        )
+
+    def test_preview_screenshot_skips_panel_and_hover_for_added_layer_original(self):
+        data = {
+            "plan": {
+                "evidenceApplicability": {
+                    "original": False,
+                    "candidate": True,
+                },
+            },
+            "visual": {
+                "artifacts": {
+                    "afterFilteringPanel": "/api/artifacts/after-filtering.png",
+                    "afterHoverTooltip": "/api/artifacts/after-hover.png",
+                },
+                "comparison": {
+                    "original": {
+                        "panels": {},
+                        "hover": {"requested": False},
+                    },
+                    "candidate": {
+                        "panels": {"filtering": {"passed": True}},
+                        "hover": {
+                            "requested": True,
+                            "attempted": True,
+                            "opened": True,
+                            "passed": True,
+                        },
+                    },
+                },
+            },
+        }
+        self.assertEqual(
+            _validate_requested_visual_evidence(
+                data,
+                action="preview-screenshot",
+                panels=["filtering"],
+                hover=True,
+            ),
+            data,
+        )
+
+    def test_candidate_visual_rejects_missing_requested_hover_evidence(self):
+        routes = standard_routes()
+        routes[("POST", "/api/proposals/proposal-1/visual-test")] = (
+            200,
+            {
+                "source": "candidate",
+                "proposalId": "proposal-1",
+                "candidateHash": "sha256:candidate",
+                "plan": {"layer": "Bus Stops"},
+                "visual": {
+                    "passed": True,
+                    "artifacts": {},
+                    "hover": {
+                        "requested": True,
+                        "configured": True,
+                        "attempted": True,
+                        "opened": False,
+                        "passed": False,
+                        "reason": "No visible hover tooltip was observed.",
+                    },
+                },
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, _, stderr = self.invoke(
+                [
+                    "proposals",
+                    "preview-test",
+                    "proposal-1",
+                    "--layer",
+                    "Bus Stops",
+                    "--hover",
+                ],
+                store,
+            )
+        self.assertEqual(code, EXIT_VISUAL)
+        payload = json.loads(stderr)
+        self.assertEqual(payload["code"], "visual.evidence_incomplete")
+        self.assertEqual(
+            payload["details"]["missingEvidence"][0]["kind"],
+            "hover",
+        )
+
     def test_failed_visual_can_fetch_returned_artifacts_before_exiting(self):
         routes = standard_routes()
         routes[("POST", "/api/visual-test")] = (
@@ -1084,6 +3586,84 @@ class CliTests(unittest.TestCase):
             str(downloaded),
         )
         self.assertEqual(downloaded_bytes, b"failed")
+
+    def test_failed_visual_reports_an_invalid_artifact_path_explicitly(self):
+        routes = standard_routes()
+        routes[("POST", "/api/visual-test")] = (
+            422,
+            {
+                "error": "Browser validation did not pass.",
+                "plan": {"layer": "Bus Stops"},
+                "visual": {
+                    "passed": False,
+                    "artifacts": {"afterPage": "../outside.png"},
+                },
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            output = Path(directory) / "artifacts"
+            store = self.configured_store(directory, server.endpoint)
+            code, _, stderr = self.invoke(
+                [
+                    "visual-test", "--layer", "Bus Stops",
+                    "--artifact-dir", str(output),
+                ],
+                store,
+            )
+
+        self.assertEqual(code, EXIT_VISUAL)
+        payload = json.loads(stderr)
+        download_error = payload["details"]["artifactDownloadErrors"][0]
+        self.assertEqual(download_error["code"], "visual.artifact_path_invalid")
+        self.assertEqual(
+            download_error["details"]["invalidArtifacts"][0]["path"],
+            "../outside.png",
+        )
+
+    def test_visual_planning_timeout_is_machine_readable(self):
+        routes = standard_routes()
+        routes[("POST", "/api/visual-test")] = (
+            422,
+            {
+                "error": (
+                    "Visual planning timed out before browser validation began."
+                ),
+                "code": "visual.planning_timeout",
+                "planningStage": "layer-summary",
+                "queryPurpose": "feature-count-and-extent",
+                "timeoutMilliseconds": 5000,
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, _, stderr = self.invoke(
+                [
+                    "visual-test",
+                    "--layer",
+                    "Bus Stops",
+                    "--lng",
+                    "-1.532",
+                    "--lat",
+                    "53.814",
+                    "--zoom",
+                    "14",
+                ],
+                store,
+            )
+
+        payload = json.loads(stderr)
+        self.assertEqual(EXIT_VISUAL, code)
+        self.assertEqual("visual.planning_timeout", payload["code"])
+        self.assertEqual(
+            "layer-summary",
+            payload["details"]["planningStage"],
+        )
+        self.assertEqual(
+            "feature-count-and-extent",
+            payload["details"]["queryPurpose"],
+        )
 
     def test_failed_proposal_preview_preserves_422_when_artifact_is_missing(self):
         routes = standard_routes()
@@ -1363,6 +3943,50 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertEqual(json.loads(stderr)["code"], "locale.not_found")
 
+    def test_contract_1_4_proposal_list_uses_one_bounded_page(self):
+        routes = standard_routes()
+        routes[("GET", "/api/public/identity")][1]["contractVersion"] = "1.4"
+        contract = routes[("GET", "/api/contract")][1]
+        contract.update({
+            "apiVersion": "1.4",
+            "contractVersion": "1.4",
+            "pagination": {
+                "version": "1",
+                "defaultLimit": 100,
+                "maxLimit": 100,
+                "cursor": "opaque",
+            },
+        })
+        routes[("GET", "/api/proposals")] = (
+            200,
+            {
+                "proposals": [{"id": "proposal-1", "status": "pending"}],
+                "pagination": {"limit": 1, "nextCursor": None},
+            },
+        )
+        cursor = "b" * 64
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(
+                directory,
+                server.endpoint,
+                contract_version="1.4",
+            )
+            code, stdout, stderr = self.invoke(
+                ["proposals", "list", "--limit", "1", "--cursor", cursor],
+                store,
+            )
+            request = next(
+                item for item in server.requests
+                if item["path"] == "/api/proposals"
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            {"limit": 1, "nextCursor": None},
+            json.loads(stdout)["pagination"],
+        )
+        self.assertEqual(f"limit=1&cursor={cursor}", request["query"])
+
     def test_proposal_mutations_reject_malformed_success_responses(self):
         cases = (
             (
@@ -1398,6 +4022,7 @@ class CliTests(unittest.TestCase):
                     "id": "proposal-1",
                     "status": "pending",
                     "originalRevision": "rev-1",
+                    "candidateHash": WORKSPACE_CANDIDATE_HASH,
                 }
             },
         )
@@ -1412,7 +4037,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertEqual(
             json.loads(stderr)["code"],
-            "proposal.invalid_response",
+            "proposal.apply_indeterminate",
         )
 
     def test_safety_evidence_commands_reject_empty_success_responses(self):
@@ -1481,7 +4106,7 @@ class CliTests(unittest.TestCase):
             ),
             (
                 ["auth", "status"],
-                ("GET", "/api/auth/me"),
+                ("GET", "/api/connect"),
                 "auth.invalid_response",
             ),
         )
@@ -1701,7 +4326,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("Configuration service URL: ", stderr.getvalue())
         self.assertNotIn("Profile name [default]: ", stdout.getvalue())
 
-    def test_setup_shows_existing_profile_and_token_prefix_before_override(self):
+    def test_setup_shows_existing_profile_without_token_material_before_override(self):
         routes = standard_routes()
         old_secret = "old-token-secret"
         new_secret = "new-token-secret"
@@ -1748,7 +4373,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("Instance: instance-1", prompts)
         self.assertIn("Contract: 1.0", prompts)
         self.assertIn("Allow HTTP: yes", prompts)
-        self.assertIn("Token prefix: old-to…", prompts)
+        self.assertNotIn("Token prefix:", prompts)
+        self.assertNotIn(old_secret[:6], prompts)
         self.assertIn("Override this profile? [y/N]: ", prompts)
         self.assertIn(
             f"Checking target identity at {server.endpoint} (timeout 10s)…",
@@ -2100,6 +4726,7 @@ class CliTests(unittest.TestCase):
                         "method": "POST",
                         "path": "/api/proposals/check",
                         "risk": "read",
+                        "scope": "propose",
                         "inputSchema": {"type": "object"},
                     }
                 ],
@@ -2139,6 +4766,93 @@ class CliTests(unittest.TestCase):
             json.loads(operation_out)["operation"]["status"],
         )
 
+    def test_capability_discovery_rejects_target_identity_and_version_drift(self):
+        valid_action = {
+            "id": "proposals.check",
+            "method": "POST",
+            "path": "/api/proposals/check",
+            "risk": "read",
+            "scope": "propose",
+        }
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            cases = {
+                "instance": {"instanceId": "different-instance"},
+                "contract": {"contractVersion": "1.1"},
+                "api": {"apiVersion": "1.1"},
+            }
+            for name, override in cases.items():
+                with self.subTest(name=name):
+                    response = {
+                        "apiVersion": "1.0",
+                        "contractVersion": "1.0",
+                        "instanceId": "instance-1",
+                        "actions": [valid_action],
+                        **override,
+                    }
+                    routes[("GET", "/api/capabilities")] = (200, response)
+                    code, stdout, stderr = self.invoke(
+                        ["capabilities", "list"],
+                        store,
+                    )
+
+                    self.assertEqual(EXIT_CONFLICT, code)
+                    self.assertEqual("", stdout)
+                    self.assertEqual(
+                        "capability.target_mismatch",
+                        json.loads(stderr)["code"],
+                    )
+
+    def test_capability_discovery_rejects_duplicate_and_malformed_actions(self):
+        valid_action = {
+            "id": "proposals.check",
+            "method": "POST",
+            "path": "/api/proposals/check",
+            "risk": "read",
+            "scope": "propose",
+            "inputSchema": {"type": "object"},
+        }
+        without_scope = dict(valid_action)
+        without_scope.pop("scope")
+        with_both_paths = {
+            **valid_action,
+            "pathTemplate": "/api/proposals/{id}/check",
+        }
+        malformed_cases = {
+            "blank-id": [{**valid_action, "id": " "}],
+            "duplicate-id": [valid_action, dict(valid_action)],
+            "missing-scope": [without_scope],
+            "invalid-method": [{**valid_action, "method": "post"}],
+            "ambiguous-path": [with_both_paths],
+            "invalid-input-schema": [{**valid_action, "inputSchema": []}],
+        }
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            for name, actions in malformed_cases.items():
+                with self.subTest(name=name):
+                    routes[("GET", "/api/capabilities")] = (
+                        200,
+                        {
+                            "apiVersion": "1.0",
+                            "contractVersion": "1.0",
+                            "instanceId": "instance-1",
+                            "actions": actions,
+                        },
+                    )
+                    code, stdout, stderr = self.invoke(
+                        ["capabilities", "list"],
+                        store,
+                    )
+
+                    self.assertEqual(EXIT_CONNECTIVITY, code)
+                    self.assertEqual("", stdout)
+                    self.assertEqual(
+                        "capability.invalid_response",
+                        json.loads(stderr)["code"],
+                    )
+
     def test_operation_wait_returns_visual_exit_for_terminal_visual_failure(self):
         routes = standard_routes()
         routes[("GET", "/api/operations/op-failed")] = (
@@ -2163,6 +4877,131 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             "operation.failed",
             json.loads(stderr)["code"],
+        )
+
+    def test_operation_wait_preserves_derived_failure_code_and_guidance(self):
+        operation_error = {
+            "error": "Derived query exceeds the compute budget.",
+            "userMessage": "The planned join creates too many intermediate rows.",
+            "suggestedAction": "Reduce the join fan-out before trying again.",
+            "code": "derived_layer.query_too_expensive",
+            "category": "compute",
+            "status": 409,
+            "blocked": True,
+            "stateUnchanged": True,
+            "safeState": "The existing materialized data is unchanged.",
+            "reasons": [{
+                "code": "intermediate_rows",
+                "message": "An intermediate plan node exceeds the row limit.",
+                "suggestedAction": "Filter or pre-aggregate before the join.",
+            }],
+        }
+        routes = standard_routes()
+        routes[("GET", "/api/operations/op-derived-failed")] = (
+            200,
+            {"operation": {
+                "id": "op-derived-failed",
+                "kind": "derived-layer.refresh",
+                "status": "failed",
+                "error": operation_error,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["operations", "wait", "op-derived-failed"],
+                store,
+            )
+
+        self.assertEqual(EXIT_CONFLICT, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("derived_layer.query_too_expensive", payload["code"])
+        self.assertEqual(operation_error["userMessage"], payload["error"])
+        self.assertEqual(
+            operation_error["suggestedAction"],
+            payload["details"]["operation"]["error"]["suggestedAction"],
+        )
+
+    def test_operation_wait_preserves_indeterminate_derived_guidance(self):
+        operation_error = {
+            "error": "The result of the derived-layer operation is uncertain.",
+            "userMessage": (
+                "The server could not confirm whether the derived-layer "
+                "operation committed."
+            ),
+            "suggestedAction": (
+                "Inspect the operation, derived layer, and catalog before retrying."
+            ),
+            "code": "derived_layer.operation_failed",
+            "category": "operation",
+            "status": 500,
+            "blocked": True,
+        }
+        routes = standard_routes()
+        routes[("GET", "/api/operations/op-derived-uncertain")] = (
+            200,
+            {"operation": {
+                "id": "op-derived-uncertain",
+                "kind": "derived-layer.create",
+                "status": "indeterminate",
+                "error": operation_error,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["operations", "wait", "op-derived-uncertain"],
+                store,
+            )
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("derived_layer.operation_failed", payload["code"])
+        self.assertEqual(operation_error["userMessage"], payload["error"])
+        self.assertNotIn("stateUnchanged", operation_error)
+
+    def test_operation_wait_keeps_database_detail_diagnostic(self):
+        operation_error = {
+            "error": "The database could not apply this derived-layer change.",
+            "userMessage": "The database could not apply this derived-layer change.",
+            "suggestedAction": (
+                "Check the query, sources, ID, and geometry fields."
+            ),
+            "code": "derived_layer.database_error",
+            "status": 422,
+            "blocked": True,
+            "technicalDetail": {
+                "sqlstate": "42703",
+                "message": "column missing_field does not exist",
+            },
+        }
+        routes = standard_routes()
+        routes[("GET", "/api/operations/op-derived-database")] = (
+            200,
+            {"operation": {
+                "id": "op-derived-database",
+                "kind": "derived-layer.create",
+                "status": "failed",
+                "error": operation_error,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["operations", "wait", "op-derived-database"],
+                store,
+            )
+
+        self.assertEqual(EXIT_VALIDATION, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("derived_layer.database_error", payload["code"])
+        self.assertEqual(operation_error["userMessage"], payload["error"])
+        self.assertEqual(
+            operation_error["technicalDetail"],
+            payload["details"]["operation"]["error"]["technicalDetail"],
         )
 
     def test_input_extract_and_private_output_file_are_composable(self):
@@ -2203,17 +5042,195 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0o600, mode)
         self.assertEqual("0600", json.loads(stdout)["mode"])
 
+    def test_extract_sanitizes_only_terminal_output(self):
+        class TerminalBuffer(io.StringIO):
+            def isatty(self):
+                return True
+
+        actor = "agent\n\x1b]8;;https://evil.invalid\x07name\u009b"
+        routes = standard_routes()
+        routes[("GET", "/api/connect")] = (
+            200,
+            {
+                "authenticated": True,
+                "actor": actor,
+                "tokenId": "abc",
+                "scopes": ["full"],
+                "expires": None,
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            terminal = TerminalBuffer()
+            terminal_error = io.StringIO()
+            terminal_code = main(
+                ["--extract", "actor", "describe"],
+                stdout=terminal,
+                stderr=terminal_error,
+                store=store,
+            )
+            pipe_code, pipe_output, pipe_error = self.invoke(
+                ["--extract", "actor", "describe"],
+                store,
+            )
+            output_path = Path(directory) / "actor.txt"
+            file_code, file_stdout, file_error = self.invoke(
+                [
+                    "--extract", "actor", "--out", str(output_path),
+                    "describe",
+                ],
+                store,
+            )
+            file_value = output_path.read_text(encoding="utf-8")
+            file_mode = output_path.stat().st_mode & 0o777
+
+        self.assertEqual(terminal_code, 0, terminal_error.getvalue())
+        self.assertEqual(
+            terminal.getvalue(),
+            "agent\\u000a\\u001b]8;;https://evil.invalid\\u0007name\\u009b\n",
+        )
+        self.assertEqual(pipe_code, 0, pipe_error)
+        self.assertEqual(pipe_output, actor + "\n")
+        self.assertEqual(file_code, 0, file_error)
+        self.assertEqual(file_value, actor + "\n")
+        self.assertEqual(json.loads(file_stdout)["mode"], "0600")
+        self.assertEqual(file_mode, 0o600)
+
+    def test_json_output_sanitizes_only_the_terminal_boundary(self):
+        class TerminalBuffer(io.StringIO):
+            def isatty(self):
+                return True
+
+        actor = "agent\n\x1b]8;;https://evil.invalid\x07name\u009b"
+        routes = standard_routes()
+        routes[("GET", "/api/connect")] = (
+            200,
+            {
+                "authenticated": True,
+                "actor": actor,
+                "tokenId": "abc",
+                "scopes": ["full"],
+                "expires": None,
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            terminal = TerminalBuffer()
+            terminal_error = io.StringIO()
+            terminal_code = main(
+                ["describe"],
+                stdout=terminal,
+                stderr=terminal_error,
+                store=store,
+            )
+            pipe_code, pipe_output, pipe_error = self.invoke(
+                ["describe"],
+                store,
+            )
+            output_path = Path(directory) / "describe.json"
+            file_code, file_stdout, file_error = self.invoke(
+                ["--out", str(output_path), "describe"],
+                store,
+            )
+            file_output = output_path.read_text(encoding="utf-8")
+
+        self.assertEqual(terminal_code, 0, terminal_error.getvalue())
+        self.assertEqual(json.loads(terminal.getvalue())["actor"], actor)
+        self.assertFalse(
+            any(
+                (
+                    ord(character) < 0x20 and character != "\n"
+                    or ord(character) == 0x7F
+                    or 0x80 <= ord(character) <= 0x9F
+                )
+                for character in terminal.getvalue()
+            )
+        )
+        self.assertIn("\\u009b", terminal.getvalue())
+        self.assertEqual(pipe_code, 0, pipe_error)
+        self.assertEqual(json.loads(pipe_output)["actor"], actor)
+        self.assertIn("\u009b", pipe_output)
+        self.assertEqual(file_code, 0, file_error)
+        self.assertEqual(json.loads(file_output)["actor"], actor)
+        self.assertIn("\u009b", file_output)
+        self.assertEqual(json.loads(file_stdout)["mode"], "0600")
+
+    def test_error_json_sanitizes_only_the_terminal_boundary(self):
+        class TerminalBuffer(io.StringIO):
+            def isatty(self):
+                return True
+
+        message = "invalid\n\x1b]8;;https://evil.invalid\x07request\u009b"
+        routes = standard_routes()
+        routes[("GET", "/api/layers")] = (
+            400,
+            {"error": message, "code": "locale.not_found"},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            terminal_output = io.StringIO()
+            terminal_error = TerminalBuffer()
+            terminal_code = main(
+                ["layers", "list"],
+                stdout=terminal_output,
+                stderr=terminal_error,
+                store=store,
+            )
+            pipe_code, pipe_output, pipe_error = self.invoke(
+                ["layers", "list"],
+                store,
+            )
+
+        self.assertEqual(terminal_code, EXIT_VALIDATION)
+        self.assertEqual(terminal_output.getvalue(), "")
+        self.assertEqual(json.loads(terminal_error.getvalue())["error"], message)
+        self.assertFalse(
+            any(
+                (
+                    ord(character) < 0x20 and character != "\n"
+                    or ord(character) == 0x7F
+                    or 0x80 <= ord(character) <= 0x9F
+                )
+                for character in terminal_error.getvalue()
+            )
+        )
+        self.assertIn("\\u009b", terminal_error.getvalue())
+        self.assertEqual(pipe_code, EXIT_VALIDATION)
+        self.assertEqual(pipe_output, "")
+        self.assertEqual(json.loads(pipe_error)["error"], message)
+        self.assertIn("\u009b", pipe_error)
+
     def test_device_authorization_replaces_token_only_after_verified_approval(self):
         routes = standard_routes()
+        hostile_user_code = "ABCD\x1b]8;;https://evil.invalid\x07-1234\u009b"
+        routes[("GET", "/api/contract")][1]["authentication"] = {
+            "scopes": [
+                "inspect",
+                "propose",
+                "visual",
+                "semantic:inspect",
+            ],
+            "defaultDeviceScopes": [
+                "inspect",
+                "propose",
+                "visual",
+                "semantic:inspect",
+            ],
+        }
         routes[("POST", "/api/auth/device")] = (
             201,
             {
                 "deviceId": "opaque-device",
-                "userCode": "ABCD-1234",
+                "userCode": hostile_user_code,
                 "verificationUri": "/",
                 "expiresIn": 60,
                 "interval": 1,
-                "scopes": ["inspect", "propose", "visual"],
+                "scopes": [
+                    "inspect",
+                    "propose",
+                    "visual",
+                    "semantic:inspect",
+                ],
             },
         )
         routes[("POST", "/api/auth/device/token")] = (
@@ -2224,7 +5241,12 @@ class CliTests(unittest.TestCase):
                 "record": {
                     "id": "token-device",
                     "expires": "2030-01-01T00:00:00Z",
-                    "scopes": ["inspect", "propose", "visual"],
+                    "scopes": [
+                        "inspect",
+                        "propose",
+                        "visual",
+                        "semantic:inspect",
+                    ],
                 },
             },
         )
@@ -2232,7 +5254,12 @@ class CliTests(unittest.TestCase):
             200,
             {
                 "actor": "token:device",
-                "scopes": ["inspect", "propose", "visual"],
+                "scopes": [
+                    "inspect",
+                    "propose",
+                    "visual",
+                    "semantic:inspect",
+                ],
             },
         )
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
@@ -2247,13 +5274,518 @@ class CliTests(unittest.TestCase):
             )
             selected = store.selected_profile("test")
             stored = store.token_for(selected)
+            started = next(
+                request
+                for request in server.requests
+                if request["path"] == "/api/auth/device"
+            )
         self.assertEqual(code, 0, stderr)
         self.assertEqual("scoped-device-token", stored)
         self.assertNotIn("scoped-device-token", stdout + stderr)
+        self.assertNotIn("\x1b", stderr)
+        self.assertNotIn("\x07", stderr)
+        self.assertNotIn("\u009b", stderr)
+        self.assertIn("\\u001b", stderr)
+        self.assertIn("\\u0007", stderr)
+        self.assertIn("\\u009b", stderr)
         self.assertEqual(
-            ["inspect", "propose", "visual"],
+            ["inspect", "propose", "visual", "semantic:inspect"],
             json.loads(stdout)["scopes"],
         )
+        self.assertEqual(
+            started["body"]["scopes"],
+            ["inspect", "propose", "visual", "semantic:inspect"],
+        )
+
+    def test_device_authorization_requires_the_exact_contract_command(self):
+        routes = standard_routes()
+        contract = routes[("GET", "/api/contract")][1]
+        contract["commands"] = [
+            command
+            for command in contract["commands"]
+            if command != "auth device"
+        ]
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["auth", "device", "--no-browser"],
+                store,
+            )
+            device_requests = [
+                request
+                for request in server.requests
+                if request["path"] == "/api/auth/device"
+            ]
+
+        self.assertEqual(code, EXIT_CONFLICT)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["code"], "capability.missing")
+        self.assertEqual(payload["details"]["requiredCommand"], "auth device")
+        self.assertEqual(device_requests, [])
+
+    def test_device_authorization_rejects_untrusted_verification_uris(self):
+        cases = (
+            (
+                "cross-origin",
+                "https://evil.invalid/approve",
+                EXIT_CONFLICT,
+                "auth.device_origin_mismatch",
+            ),
+            (
+                "non-http",
+                "javascript:alert(1)",
+                EXIT_CONFLICT,
+                "auth.device_origin_mismatch",
+            ),
+            (
+                "terminal-control",
+                "/approve\x1b]8;;https://evil.invalid\x07",
+                EXIT_CONNECTIVITY,
+                "auth.device_invalid_response",
+            ),
+        )
+        for label, verification_uri, expected_exit, expected_code in cases:
+            with self.subTest(label=label):
+                routes = standard_routes()
+                routes[("POST", "/api/auth/device")] = (
+                    201,
+                    {
+                        "deviceId": "opaque-device",
+                        "userCode": "ABCD-1234",
+                        "verificationUri": verification_uri,
+                        "expiresIn": 60,
+                        "interval": 1,
+                        "scopes": ["inspect", "propose", "visual"],
+                    },
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        ["auth", "device", "--no-browser"],
+                        store,
+                    )
+                    polls = [
+                        request
+                        for request in server.requests
+                        if request["path"] == "/api/auth/device/token"
+                    ]
+
+                self.assertEqual(code, expected_exit)
+                self.assertEqual(stdout, "")
+                self.assertEqual(json.loads(stderr)["code"], expected_code)
+                self.assertEqual(polls, [])
+
+    def test_device_authorization_uses_legacy_defaults_and_accepts_every_supported_scope(self):
+        self.assertEqual(DEVICE_SCOPES, _DEVICE_SCOPE_CHOICES)
+        self.assertEqual(
+            frozenset(SAFE_DEFAULT_DEVICE_SCOPES),
+            _SAFE_DEFAULT_DEVICE_SCOPES,
+        )
+        cases = [
+            (
+                ["auth", "device", "--no-browser"],
+                ["inspect", "propose", "visual"],
+            ),
+            *[
+                (
+                    [
+                        "auth",
+                        "device",
+                        "--scope",
+                        scope,
+                        "--no-browser",
+                    ],
+                    [scope],
+                )
+                for scope in DEVICE_SCOPES
+            ],
+        ]
+        for arguments, expected_scopes in cases:
+            with self.subTest(arguments=arguments):
+                routes = standard_routes()
+                routes[("POST", "/api/auth/device")] = (
+                    201,
+                    {
+                        "deviceId": "opaque-device",
+                        "userCode": "ABCD-1234",
+                        "verificationUri": "/",
+                        "expiresIn": 60,
+                        "interval": 1,
+                        "scopes": expected_scopes,
+                    },
+                )
+                routes[("POST", "/api/auth/device/token")] = (
+                    200,
+                    {
+                        "status": "authorized",
+                        "token": "scoped-device-token",
+                        "record": {
+                            "id": "token-device",
+                            "expires": "2030-01-01T00:00:00Z",
+                            "scopes": expected_scopes,
+                        },
+                    },
+                )
+                routes[("GET", "/api/auth/me")] = (
+                    200,
+                    {
+                        "actor": "token:device",
+                        "scopes": expected_scopes,
+                    },
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(
+                        directory,
+                        server.endpoint,
+                        token="legacy-full-token",
+                    )
+                    code, stdout, stderr = self.invoke(arguments, store)
+                    started = next(
+                        request
+                        for request in server.requests
+                        if request["path"] == "/api/auth/device"
+                    )
+
+                self.assertEqual(0, code, stderr)
+                self.assertEqual(expected_scopes, started["body"]["scopes"])
+                self.assertEqual(
+                    expected_scopes,
+                    json.loads(stdout)["scopes"],
+                )
+
+    def test_device_authorization_rejects_unknown_and_legacy_full_explicit_scopes(self):
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            results = [
+                self.invoke(
+                    [
+                        "auth",
+                        "device",
+                        "--scope",
+                        scope,
+                        "--no-browser",
+                    ],
+                    store,
+                )
+                for scope in ("full", "future:scope")
+            ]
+
+        for code, stdout, stderr in results:
+            self.assertEqual(EXIT_USAGE, code)
+            self.assertEqual("", stdout)
+            self.assertEqual(
+                "usage.invalid_arguments",
+                json.loads(stderr)["code"],
+            )
+        self.assertEqual([], server.requests)
+
+    def test_device_authorization_rejects_unsafe_advertised_defaults(self):
+        unsafe_scopes = tuple(
+            scope
+            for scope in DEVICE_SCOPES
+            if scope not in SAFE_DEFAULT_DEVICE_SCOPES
+        )
+        cases = (
+            (
+                "empty",
+                ["inspect", "propose", "visual"],
+                [],
+            ),
+            (
+                "duplicate",
+                ["inspect", "propose", "visual"],
+                ["inspect", "inspect"],
+            ),
+            (
+                "padded",
+                ["inspect", "propose", "visual"],
+                ["inspect", " propose", "visual"],
+            ),
+            *(
+                (
+                    f"elevated {scope}",
+                    [*SAFE_DEFAULT_DEVICE_SCOPES, scope],
+                    [scope],
+                )
+                for scope in unsafe_scopes
+            ),
+            (
+                "unknown",
+                ["inspect", "propose", "visual", "future:scope"],
+                ["inspect", "propose", "visual", "future:scope"],
+            ),
+            (
+                "unsupported",
+                ["inspect", "propose", "visual"],
+                ["inspect", "propose", "visual", "semantic:inspect"],
+            ),
+            (
+                "full",
+                ["full", "inspect", "propose", "visual"],
+                ["full"],
+            ),
+        )
+        for label, supported, defaults in cases:
+            with self.subTest(label=label):
+                routes = standard_routes()
+                routes[("GET", "/api/contract")][1]["authentication"] = {
+                    "scopes": supported,
+                    "defaultDeviceScopes": defaults,
+                }
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        ["auth", "device", "--no-browser"],
+                        store,
+                    )
+                    device_requests = [
+                        request
+                        for request in server.requests
+                        if request["path"] == "/api/auth/device"
+                    ]
+
+                self.assertEqual(EXIT_CONFLICT, code)
+                self.assertEqual("", stdout)
+                self.assertEqual(
+                    "auth.device_invalid_contract",
+                    json.loads(stderr)["code"],
+                )
+                self.assertEqual([], device_requests)
+
+    def test_device_authorization_rejects_scope_substitution_at_every_stage(self):
+        requested = [
+            "inspect",
+            "propose",
+            "visual",
+            "semantic:inspect",
+        ]
+        cases = (
+            (
+                "start overgrant",
+                [*requested, "apply"],
+                requested,
+                requested,
+                0,
+                0,
+            ),
+            (
+                "record duplicate",
+                requested,
+                [*requested, "inspect"],
+                requested,
+                1,
+                0,
+            ),
+            (
+                "record overgrant",
+                requested,
+                [*requested, "apply"],
+                requested,
+                1,
+                0,
+            ),
+            (
+                "authenticated undergrant",
+                requested,
+                requested,
+                requested[:-1],
+                1,
+                1,
+            ),
+            (
+                "authenticated unknown",
+                requested,
+                requested,
+                [*requested[:-1], "future:scope"],
+                1,
+                1,
+            ),
+        )
+        for (
+            label,
+            start_scopes,
+            record_scopes,
+            authenticated_scopes,
+            expected_polls,
+            expected_me,
+        ) in cases:
+            with self.subTest(label=label):
+                routes = standard_routes()
+                routes[("GET", "/api/contract")][1]["authentication"] = {
+                    "scopes": requested,
+                    "defaultDeviceScopes": requested,
+                }
+                routes[("POST", "/api/auth/device")] = (
+                    201,
+                    {
+                        "deviceId": "opaque-device",
+                        "userCode": "ABCD-1234",
+                        "verificationUri": "/",
+                        "expiresIn": 60,
+                        "interval": 1,
+                        "scopes": start_scopes,
+                    },
+                )
+                routes[("POST", "/api/auth/device/token")] = (
+                    200,
+                    {
+                        "status": "authorized",
+                        "token": "new-device-secret",
+                        "record": {
+                            "id": "token-device",
+                            "expires": "2030-01-01T00:00:00Z",
+                            "scopes": record_scopes,
+                        },
+                    },
+                )
+                routes[("GET", "/api/auth/me")] = (
+                    200,
+                    {
+                        "actor": "token:device",
+                        "scopes": authenticated_scopes,
+                    },
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(
+                        directory,
+                        server.endpoint,
+                        token="legacy-full-token",
+                    )
+                    code, stdout, stderr = self.invoke(
+                        ["auth", "device", "--no-browser"],
+                        store,
+                    )
+                    selected = store.selected_profile("test")
+                    stored = store.token_for(selected)
+                    polls = [
+                        request
+                        for request in server.requests
+                        if request["path"] == "/api/auth/device/token"
+                    ]
+                    me_requests = [
+                        request
+                        for request in server.requests
+                        if request["path"] == "/api/auth/me"
+                    ]
+
+                self.assertEqual(EXIT_CONNECTIVITY, code)
+                self.assertEqual("", stdout)
+                self.assertEqual(
+                    "auth.device_invalid_response",
+                    json.loads(stderr[stderr.index("{"):])["code"],
+                )
+                self.assertEqual("legacy-full-token", stored)
+                self.assertNotIn("new-device-secret", stdout + stderr)
+                self.assertEqual(expected_polls, len(polls))
+                self.assertEqual(expected_me, len(me_requests))
+
+    def test_device_authorization_validates_issued_token_metadata(self):
+        requested = ["inspect", "propose", "visual"]
+        cases = (
+            ("blank id", "", "2030-01-01T00:00:00Z"),
+            ("missing expiry", "token-device", None),
+            ("blank expiry", "token-device", " "),
+        )
+        for label, token_id, expires in cases:
+            with self.subTest(label=label):
+                routes = standard_routes()
+                routes[("POST", "/api/auth/device")] = (
+                    201,
+                    {
+                        "deviceId": "opaque-device",
+                        "userCode": "ABCD-1234",
+                        "verificationUri": "/",
+                        "expiresIn": 60,
+                        "interval": 1,
+                        "scopes": requested,
+                    },
+                )
+                routes[("POST", "/api/auth/device/token")] = (
+                    200,
+                    {
+                        "status": "authorized",
+                        "token": "new-device-secret",
+                        "record": {
+                            "id": token_id,
+                            "expires": expires,
+                            "scopes": requested,
+                        },
+                    },
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(
+                        directory,
+                        server.endpoint,
+                        token="legacy-full-token",
+                    )
+                    code, stdout, stderr = self.invoke(
+                        ["auth", "device", "--no-browser"],
+                        store,
+                    )
+                    selected = store.selected_profile("test")
+                    stored = store.token_for(selected)
+                    me_requests = [
+                        request
+                        for request in server.requests
+                        if request["path"] == "/api/auth/me"
+                    ]
+
+                self.assertEqual(EXIT_CONNECTIVITY, code)
+                self.assertEqual("", stdout)
+                self.assertEqual(
+                    "auth.device_invalid_response",
+                    json.loads(stderr[stderr.index("{"):])["code"],
+                )
+                self.assertEqual("legacy-full-token", stored)
+                self.assertNotIn("new-device-secret", stdout + stderr)
+                self.assertEqual([], me_requests)
+
+    def test_device_authorization_rejects_duplicate_explicit_scopes(self):
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "auth",
+                    "device",
+                    "--scope",
+                    "inspect",
+                    "--scope",
+                    "inspect",
+                    "--no-browser",
+                ],
+                store,
+            )
+            device_requests = [
+                request
+                for request in server.requests
+                if request["path"] == "/api/auth/device"
+            ]
+
+        self.assertEqual(EXIT_USAGE, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(
+            "auth.device_invalid_scopes",
+            json.loads(stderr)["code"],
+        )
+        self.assertEqual([], device_requests)
 
 
 if __name__ == "__main__":
