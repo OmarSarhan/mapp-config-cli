@@ -36,6 +36,12 @@ archive repairs remain server-side; repair the displayed batch and refresh the
 list. The CLI rejects malformed or unaccompanied backlog flags instead of
 mistaking an incomplete administrative work queue for a complete result.
 
+Release this contract-1.4-aware CLI before activating the platform's 1.1.0
+legacy collection threshold. Then deploy the semantic service and matching
+`config-ui` image together; that image owns both the gateway and its bundled
+paginating dashboard and is not split into separate dashboard and API release
+steps.
+
 Until the first stable CLI release, minor `0.x` releases may contain breaking
 client-side changes. Review the changelog before upgrading.
 
