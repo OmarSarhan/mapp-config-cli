@@ -194,6 +194,13 @@ non-symlink files and limited to 5 MiB before UTF-8 decoding. Token files are
 limited to 64 KiB, while private configuration/cache JSON is limited to 128
 MiB to accommodate the bounded retained-check cache.
 
+These guarantees depend on POSIX descriptor-relative traversal. Native Windows
+operational execution is therefore unsupported and fails with
+`platform.unsupported` immediately after argument parsing, before configuration
+state is accessed or any remote request is made. Use WSL rather than a weaker
+path-based fallback that could follow a raced ancestor reparse point. The
+Windows CI lane verifies this fail-closed boundary.
+
 Structured errors should retain diagnostic fields such as rule IDs and JSON
 paths while redacting credentials and authorization data. A visual HTTP 422
 may legitimately retain the failed plan, report, and authenticated artifact

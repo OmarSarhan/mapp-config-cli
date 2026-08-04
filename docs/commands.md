@@ -32,7 +32,9 @@ generation; other commands retain JSON.
 `--input` merges a bounded JSON object into supported request-producing
 commands; conflicts with explicit flags fail closed. Use `-` for stdin.
 Credential-like keys are rejected. `--extract` selects one scalar from the
-final response, while `--out` writes it atomically with mode `0600`.
+final response, while `--out` writes it atomically with mode `0600` on
+supported POSIX hosts. Run the CLI under WSL on Windows; native Windows
+operational commands fail before local-state access or a remote request.
 
 Input JSON is limited to 5 MiB and must be an object. A file input must be a
 regular non-symlink file. Keys containing `authorization`, `credential`,
@@ -1401,6 +1403,11 @@ validated before any artifact is written, so a size or transport failure
 cannot leave a partial successful evidence set. These limits are part of the
 client compatibility boundary; servers must stay within them or negotiate a
 future contract revision.
+
+Local artifact export is supported on POSIX hosts. Run the CLI under WSL on
+Windows; native Windows operational execution is rejected before the server is
+contacted because the supported Python filesystem APIs do not provide the
+descriptor-relative traversal required by the client safety contract.
 
 Configured hover is exercised automatically. `--hover` requires it,
 `--no-hover` suppresses it, and repeated `--expect-hover-text` values assert

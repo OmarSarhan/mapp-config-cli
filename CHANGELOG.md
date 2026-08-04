@@ -153,6 +153,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- Explicitly limited operational support to POSIX hosts, including WSL, and
+  added Windows CI that proves native Windows commands fail before local-state
+  access or a remote request. This removes weaker path-based Windows file and
+  artifact handling without pretending it has POSIX descriptor guarantees.
 - Namespaced checked-operation caches by workspace or semantic domain,
   preserved `semantic.*` server errors, restricted semantic edits to curated
   paths, and added only `semantic:inspect` to default device authority.

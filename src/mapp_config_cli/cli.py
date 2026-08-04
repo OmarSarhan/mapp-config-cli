@@ -965,6 +965,18 @@ def extract_response_value(value: Any, path: str) -> str:
 
 def write_private_output(path: str, content: str) -> None:
     target = Path(path).expanduser()
+    if os.name != "posix":  # pragma: no cover - Windows CI
+        raise CliError(
+            "Private file output requires descriptor-relative path safety "
+            "and is not supported on this platform.",
+            EXIT_CONNECTIVITY,
+            details={
+                "path": str(target),
+                "platform": os.name,
+                "action": "Use stdout or run the CLI under Linux or WSL.",
+            },
+            error_code="output.destination_unsafe",
+        )
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.",
@@ -3587,24 +3599,18 @@ def _artifact_directory_flags() -> int:
 def _open_artifact_root(destination: str) -> tuple[Path, int | None]:
     expanded = Path(destination).expanduser()
     root = Path(os.path.abspath(os.fspath(expanded)))
-    if os.name != "posix":  # pragma: no cover - Windows fallback
-        current = Path(root.anchor)
-        for part in root.parts[1:]:
-            current /= part
-            try:
-                metadata = current.lstat()
-            except FileNotFoundError:
-                current.mkdir(mode=0o700)
-                os.chmod(current, 0o700)
-                continue
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                raise CliError(
-                    "Artifact destination must contain only real directories.",
-                    EXIT_CONNECTIVITY,
-                    details={"path": str(current)},
-                    error_code="visual.artifact_destination_unsafe",
-                )
-        return root, None
+    if os.name != "posix":  # pragma: no cover - Windows CI
+        raise CliError(
+            "Local artifact export requires descriptor-relative path safety "
+            "and is not supported on this platform.",
+            EXIT_CONNECTIVITY,
+            details={
+                "path": str(root),
+                "platform": os.name,
+                "action": "Use Linux or WSL for --artifact-dir export.",
+            },
+            error_code="visual.artifact_destination_unsafe",
+        )
 
     descriptor = os.open(root.anchor, _artifact_directory_flags())
     try:
@@ -3728,39 +3734,8 @@ def _write_artifact_fallback(
     root: Path,
     artifact_path: str,
     body: bytes,
-) -> None:  # pragma: no cover - Windows fallback
-    target = root.joinpath(*artifact_path.split("/"))
-    current = root
-    for part in artifact_path.split("/")[:-1]:
-        current /= part
-        try:
-            metadata = current.lstat()
-        except FileNotFoundError:
-            current.mkdir(mode=0o700)
-            os.chmod(current, 0o700)
-            continue
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise OSError("artifact directory component is not a real directory")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-        dir=target.parent,
-    )
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            descriptor = -1
-            stream.write(body)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary_name, target, follow_symlinks=False)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
+) -> None:  # pragma: no cover - guarded by _open_artifact_root
+    raise OSError("secure artifact export is unsupported on this platform")
 
 
 def _artifact_failure(
@@ -6920,6 +6895,10 @@ def run(args, store: ConfigStore | None = None) -> dict[str, Any]:
         ) from exc
 
 
+def _is_native_windows() -> bool:
+    return os.name == "nt"
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -6930,6 +6909,17 @@ def main(
     try:
         args = parser().parse_args(argv)
         args.prompt_stream = stderr
+        if _is_native_windows():
+            raise CliError(
+                "Native Windows execution is not supported safely; run "
+                "config-cli under WSL.",
+                EXIT_CONNECTIVITY,
+                details={
+                    "platform": "nt",
+                    "action": "Install and run config-cli under WSL.",
+                },
+                error_code="platform.unsupported",
+            )
         if args.command == "completion":
             stdout.write(generate_completion(parser(), args.shell))
             stdout.flush()
