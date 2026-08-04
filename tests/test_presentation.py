@@ -1,3 +1,4 @@
+import json
 import shlex
 import subprocess
 import unittest
@@ -32,6 +33,7 @@ class CompletionTests(unittest.TestCase):
             self.assertEqual(first, generate_completion(parser(), shell))
             self.assertIn("config-cli", first)
             self.assertIn("proposals", first)
+            self.assertIn("semantic", first)
             self.assertIn("base-revision", first)
 
     def test_bash_ignores_global_option_values_when_finding_command_path(self):
@@ -51,6 +53,28 @@ class CompletionTests(unittest.TestCase):
                 3,
             ),
         )
+
+    def test_bash_completes_three_level_semantic_commands(self):
+        self.assertEqual(
+            self.bash_completions(
+                ["config-cli", "semantic", "catalog", "se"],
+                3,
+            ),
+            ["search"],
+        )
+        self.assertIn(
+            "--from-check",
+            self.bash_completions(
+                ["config-cli", "semantic", "proposals", "create", "--f"],
+                4,
+            ),
+        )
+        generation_options = self.bash_completions(
+            ["config-cli", "semantic", "generate", "field", "--s"],
+            4,
+        )
+        self.assertIn("--sample-rows", generation_options)
+        self.assertIn("--statistics", generation_options)
 
     def test_bash_completes_reload_xyz_alias_confirmation(self):
         self.assertIn(
@@ -86,11 +110,18 @@ class HumanOutputTests(unittest.TestCase):
             "profile": {"name": "prod", "endpoint": "https://example.invalid"},
             "authentication": {"authenticated": True, "actor": "agent"},
             "workspace": {"accessible": True, "key": "map", "revision": "r1"},
+            "semantic": {
+                "advertised": True,
+                "authorized": True,
+                "available": True,
+                "catalogRevision": 4,
+            },
             "checks": [{"id": "auth.access", "passed": True}],
         }
         output = render(data, command="doctor", output="human")
         self.assertIn("Status: healthy", output)
         self.assertIn("PASS  auth.access", output)
+        self.assertIn("catalogRevision: 4", output)
         self.assertNotIn("token", output.lower())
 
     def test_proposal_human_output_uses_only_response(self):
@@ -103,6 +134,36 @@ class HumanOutputTests(unittest.TestCase):
         self.assertIn("Proposal check", output)
         self.assertIn('"path":"/x"', output)
         self.assertIn("warnings: 1", output)
+
+    def test_human_output_escapes_all_terminal_control_families(self):
+        hostile = "safe\n\x1b]8;;https://evil.invalid\x07link\x1b\\\u009b31mred"
+        data = {
+            "healthy": False,
+            "profile": {"name": hostile},
+            "checks": [{"id": hostile, "passed": False}],
+        }
+
+        output = render(data, command="doctor", output="human")
+
+        self.assertIn("\\u000a", output)
+        self.assertIn("\\u001b", output)
+        self.assertIn("\\u0007", output)
+        self.assertIn("\\u009b", output)
+        self.assertFalse(
+            any(
+                ord(character) < 0x20 and character != "\n"
+                or ord(character) == 0x7F
+                or 0x80 <= ord(character) <= 0x9F
+                for character in output
+            )
+        )
+
+    def test_json_output_preserves_control_character_value_semantics(self):
+        data = {"value": "line\n\x1b\x07\u009b"}
+
+        output = render(data, command="doctor")
+
+        self.assertEqual(json.loads(output), data)
 
 
 if __name__ == "__main__":

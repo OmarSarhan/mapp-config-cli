@@ -11,6 +11,12 @@
 The CLI does not need Docker, PostgreSQL tools, a checkout of XYZ, or access to
 the remote server's filesystem.
 
+Native Windows operational execution is not supported. Install and run the CLI
+under WSL so local profiles, credentials, inputs, outputs, and downloaded
+artifacts receive the same descriptor-relative filesystem protections as
+Linux. A native Windows invocation fails before reading local state or sending
+a remote request; it does not fall back to path-based filesystem checks.
+
 ## Install with pipx
 
 `pipx` is the recommended installation method for a workstation or an

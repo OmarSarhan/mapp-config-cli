@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -43,7 +44,17 @@ GENERATED_CREDENTIAL = re.compile(
     r"credential:([A-Za-z0-9._-]+):[0-9a-f]{32}"
 )
 CHECK_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
+CHECK_DOMAINS = {"workspace", "semantic"}
+MAX_TOKEN_FILE_BYTES = 64 * 1024
+MAX_CONFIG_FILE_BYTES = 128 * 1024 * 1024
 _PROFILE_UNCHECKED = object()
+
+
+def _posix_fchmod(descriptor: int, mode: int) -> None:
+    fchmod = getattr(os, "fchmod", None)
+    if os.name != "posix" or fchmod is None:
+        raise OSError("secure descriptor permissions require POSIX fchmod")
+    fchmod(descriptor, mode)
 
 
 def config_home() -> Path:
@@ -66,51 +77,182 @@ def validate_profile_name(name: str) -> str:
     return name
 
 
-def _require_regular_private_file(path: Path, purpose: str) -> None:
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise CliError(
-            f"Unable to inspect {purpose}: {exc}",
-            EXIT_AUTHENTICATION if purpose == "token file" else EXIT_CONNECTIVITY,
-            error_code="config.file_unavailable",
-        ) from exc
+def _private_file_exit_code(purpose: str) -> int:
+    return EXIT_AUTHENTICATION if purpose == "token file" else EXIT_CONNECTIVITY
+
+
+def _validate_regular_private_file(
+    path: Path,
+    purpose: str,
+    metadata: os.stat_result,
+) -> None:
     if stat.S_ISLNK(metadata.st_mode):
         raise CliError(
             f"{purpose.capitalize()} must not be a symbolic link.",
-            EXIT_AUTHENTICATION if purpose == "token file" else EXIT_CONNECTIVITY,
+            _private_file_exit_code(purpose),
             error_code="config.symlink_rejected",
         )
     if not stat.S_ISREG(metadata.st_mode):
         raise CliError(
             f"{purpose.capitalize()} must be a regular file.",
-            EXIT_AUTHENTICATION if purpose == "token file" else EXIT_CONNECTIVITY,
+            _private_file_exit_code(purpose),
             error_code="config.not_regular",
         )
     if os.name == "posix" and stat.S_IMODE(metadata.st_mode) != 0o600:
         raise CliError(
             f"{purpose.capitalize()} must have mode 0600.",
-            EXIT_AUTHENTICATION if purpose == "token file" else EXIT_CONNECTIVITY,
+            _private_file_exit_code(purpose),
             details={"path": str(path), "mode": f"{stat.S_IMODE(metadata.st_mode):04o}"},
             error_code="config.insecure_permissions",
         )
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
         raise CliError(
             f"{purpose.capitalize()} must be owned by the current user.",
-            EXIT_AUTHENTICATION if purpose == "token file" else EXIT_CONNECTIVITY,
+            _private_file_exit_code(purpose),
             details={"path": str(path)},
             error_code="config.wrong_owner",
         )
 
 
-def read_token_file(path: str | Path) -> str:
-    token_path = Path(path).expanduser()
-    _require_regular_private_file(token_path, "token file")
+def _require_regular_private_file(path: Path, purpose: str) -> None:
     try:
-        token = token_path.read_text(encoding="utf-8").strip()
+        metadata = path.lstat()
     except OSError as exc:
         raise CliError(
-            f"Unable to read token file: {exc}",
+            f"Unable to inspect {purpose}: {exc}",
+            _private_file_exit_code(purpose),
+            error_code="config.file_unavailable",
+        ) from exc
+    _validate_regular_private_file(path, purpose, metadata)
+
+
+def _read_bounded_private_file(
+    path: Path,
+    purpose: str,
+    *,
+    max_bytes: int,
+    missing_ok: bool = False,
+) -> bytes | None:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    descriptor = -1
+    expected_metadata = None
+    try:
+        # Platforms without O_NOFOLLOW compare pre-open and opened metadata;
+        # POSIX rejects a final-component symlink atomically at open time.
+        if not getattr(os, "O_NOFOLLOW", 0):  # pragma: no cover - Windows
+            try:
+                expected_metadata = path.lstat()
+            except FileNotFoundError:
+                if missing_ok:
+                    return None
+                raise
+            _validate_regular_private_file(
+                path,
+                purpose,
+                expected_metadata,
+            )
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise CliError(
+                    f"{purpose.capitalize()} must not be a symbolic link.",
+                    _private_file_exit_code(purpose),
+                    error_code="config.symlink_rejected",
+                ) from exc
+            raise
+        metadata = os.fstat(descriptor)
+        _validate_regular_private_file(path, purpose, metadata)
+        if (
+            expected_metadata is not None
+            and not os.path.samestat(expected_metadata, metadata)
+        ):
+            raise CliError(
+                f"{purpose.capitalize()} changed while it was being opened.",
+                _private_file_exit_code(purpose),
+                details={"path": str(path)},
+                error_code="config.file_unavailable",
+            )
+        if metadata.st_size > max_bytes:
+            raise CliError(
+                f"{purpose.capitalize()} exceeds the local size limit.",
+                _private_file_exit_code(purpose),
+                details={
+                    "path": str(path),
+                    "maxBytes": max_bytes,
+                    "actualBytes": metadata.st_size,
+                },
+                error_code=(
+                    "auth.token_file_too_large"
+                    if purpose == "token file"
+                    else "config.file_too_large"
+                ),
+            )
+        chunks: list[bytes] = []
+        total = 0
+        while total <= max_bytes:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, max_bytes + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > max_bytes:
+            raise CliError(
+                f"{purpose.capitalize()} exceeds the local size limit.",
+                _private_file_exit_code(purpose),
+                details={
+                    "path": str(path),
+                    "maxBytes": max_bytes,
+                    "actualBytes": total,
+                },
+                error_code=(
+                    "auth.token_file_too_large"
+                    if purpose == "token file"
+                    else "config.file_too_large"
+                ),
+            )
+        return b"".join(chunks)
+    except CliError:
+        raise
+    except OSError as exc:
+        raise CliError(
+            f"Unable to read {purpose}: {exc}",
+            _private_file_exit_code(purpose),
+            error_code=(
+                "auth.token_file_unreadable"
+                if purpose == "token file" and descriptor >= 0
+                else "config.file_unavailable"
+            ),
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def read_token_file(path: str | Path) -> str:
+    token_path = Path(path).expanduser()
+    try:
+        raw = _read_bounded_private_file(
+            token_path,
+            "token file",
+            max_bytes=MAX_TOKEN_FILE_BYTES,
+        )
+        assert raw is not None
+        token = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise CliError(
+            "Token file is not valid UTF-8 text.",
             EXIT_AUTHENTICATION,
             error_code="auth.token_file_unreadable",
         ) from exc
@@ -156,7 +298,7 @@ class Profile:
                 EXIT_CONNECTIVITY,
                 error_code="profile.malformed",
             )
-        allow_http = value.get("allowHttp", value.get("insecure", False))
+        allow_http = value.get("allowHttp", False)
         if not isinstance(allow_http, bool):
             raise CliError(
                 f"Profile {name} contains an invalid allowHttp value.",
@@ -357,23 +499,25 @@ class ConfigStore:
 
     def _read_json(self, path: Path, default: Any) -> Any:
         self.ensure_home()
-        if not path.exists() and not path.is_symlink():
+        raw = _read_bounded_private_file(
+            path,
+            "configuration file",
+            max_bytes=MAX_CONFIG_FILE_BYTES,
+            missing_ok=True,
+        )
+        if raw is None:
             return default
-        _require_regular_private_file(path, "configuration file")
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            details: dict[str, Any] = {"path": str(path)}
+            if isinstance(exc, json.JSONDecodeError):
+                details.update({"line": exc.lineno, "column": exc.colno})
             raise CliError(
                 f"Configuration file contains invalid JSON: {path.name}.",
                 EXIT_CONNECTIVITY,
-                details={"path": str(path), "line": exc.lineno, "column": exc.colno},
+                details=details,
                 error_code="config.invalid_json",
-            ) from exc
-        except OSError as exc:
-            raise CliError(
-                f"Unable to read configuration file: {exc}",
-                EXIT_CONNECTIVITY,
-                error_code="config.file_unavailable",
             ) from exc
 
     def _write_json(self, path: Path, data: Any) -> None:
@@ -393,7 +537,7 @@ class ConfigStore:
                 suffix=".tmp",
                 dir=self.root,
             )
-            os.fchmod(descriptor, 0o600)
+            _posix_fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 descriptor = -1
                 json.dump(data, stream, indent=2, ensure_ascii=False)
@@ -455,22 +599,50 @@ class ConfigStore:
         with self._locked():
             return self._credentials_document()
 
-    def save_check(self, profile: Profile, check: dict[str, Any]) -> None:
+    def save_check(
+        self,
+        profile: Profile,
+        check: dict[str, Any],
+        *,
+        domain: str = "workspace",
+    ) -> None:
         """Cache authoritative preflight inputs for exact checked handoff."""
-        fingerprint = check.get("checkFingerprint")
-        revision = check.get("originalRevision")
+        if domain not in CHECK_DOMAINS:
+            raise ValueError(f"unsupported check domain: {domain}")
+        fingerprint = check.get(
+            "checkFingerprint" if domain == "workspace" else "fingerprint"
+        )
+        revision = check.get(
+            "originalRevision" if domain == "workspace" else "baseVersion"
+        )
         operations = check.get("operations")
         if (
             not isinstance(fingerprint, str)
             or CHECK_FINGERPRINT.fullmatch(fingerprint) is None
-            or not isinstance(revision, str)
-            or not revision
+            or (
+                domain == "workspace"
+                and (not isinstance(revision, str) or not revision)
+            )
+            or (
+                domain == "semantic"
+                and (
+                    not isinstance(revision, int)
+                    or isinstance(revision, bool)
+                    or revision < 0
+                    or not isinstance(check.get("assetId"), str)
+                    or not check["assetId"]
+                )
+            )
             or not isinstance(operations, list)
         ):
             raise CliError(
                 "Proposal check response cannot be cached safely.",
                 EXIT_CONNECTIVITY,
-                error_code="proposal.check_invalid",
+                error_code=(
+                    "proposal.check_invalid"
+                    if domain == "workspace"
+                    else "semantic.proposal.check_invalid"
+                ),
             )
         with self._locked():
             document = self._read_json(self.checks_path, {"checks": {}})
@@ -480,44 +652,102 @@ class ConfigStore:
                     EXIT_CONNECTIVITY,
                     error_code="proposal.check_cache_malformed",
                 )
-            cache_key = f"{profile.name}:{fingerprint}"
-            document["checks"][cache_key] = {
+            cache_key = f"{profile.name}:{domain}:{fingerprint}"
+            record = {
                 "profile": profile.name,
                 "endpoint": profile.endpoint,
                 "instanceId": profile.instance_id,
+                "domain": domain,
                 "revision": revision,
                 "operations": operations,
                 "explanation": check.get("explanation"),
             }
+            if domain == "semantic":
+                record["assetId"] = check["assetId"]
+            document["checks"][cache_key] = record
             # Keep the private cache bounded. Dict order reflects insertion
             # order for documents written by this client.
             while len(document["checks"]) > 20:
                 del document["checks"][next(iter(document["checks"]))]
             self._write_json(self.checks_path, document)
 
-    def load_check(self, profile: Profile, fingerprint: str) -> dict[str, Any]:
+    def load_check(
+        self,
+        profile: Profile,
+        fingerprint: str,
+        *,
+        domain: str = "workspace",
+    ) -> dict[str, Any]:
+        if domain not in CHECK_DOMAINS:
+            raise ValueError(f"unsupported check domain: {domain}")
         if CHECK_FINGERPRINT.fullmatch(fingerprint) is None:
             raise CliError(
                 "Check fingerprint must contain 64 lowercase hexadecimal characters.",
                 EXIT_USAGE,
-                error_code="proposal.check_fingerprint_invalid",
+                error_code=(
+                    "proposal.check_fingerprint_invalid"
+                    if domain == "workspace"
+                    else "semantic.proposal.check_fingerprint_invalid"
+                ),
             )
         with self._locked():
             document = self._read_json(self.checks_path, {"checks": {}})
             checks = document.get("checks") if isinstance(document, dict) else None
             record = (
-                checks.get(f"{profile.name}:{fingerprint}")
+                checks.get(f"{profile.name}:{domain}:{fingerprint}")
                 if isinstance(checks, dict)
                 else None
             )
-            # Read the original fingerprint-only format for existing clients.
-            if not isinstance(record, dict) and isinstance(checks, dict):
-                record = checks.get(fingerprint)
+            if (
+                not isinstance(record, dict)
+                and domain == "workspace"
+                and isinstance(checks, dict)
+            ):
+                # Read both pre-domain cache formats for existing clients.
+                record = checks.get(f"{profile.name}:{fingerprint}")
+                if not isinstance(record, dict):
+                    record = checks.get(fingerprint)
             if not isinstance(record, dict):
+                other_domain = (
+                    "semantic" if domain == "workspace" else "workspace"
+                )
+                if (
+                    isinstance(checks, dict)
+                    and isinstance(
+                        checks.get(
+                            f"{profile.name}:{other_domain}:{fingerprint}"
+                        ),
+                        dict,
+                    )
+                ):
+                    raise CliError(
+                        "Checked operations belong to a different proposal domain.",
+                        EXIT_CONFLICT,
+                        error_code=(
+                            "proposal.check_domain_mismatch"
+                            if domain == "workspace"
+                            else "semantic.proposal.check_domain_mismatch"
+                        ),
+                    )
                 raise CliError(
                     "Checked operations are not available in this local profile store.",
                     EXIT_USAGE,
-                    error_code="proposal.check_not_found",
+                    error_code=(
+                        "proposal.check_not_found"
+                        if domain == "workspace"
+                        else "semantic.proposal.check_not_found"
+                    ),
+                )
+            record_domain = record.get("domain", "workspace")
+            if record_domain != domain:
+                raise CliError(
+                    "Checked operations belong to a different proposal domain.",
+                    EXIT_CONFLICT,
+                    error_code=(
+                        "proposal.check_domain_mismatch"
+                        if domain == "workspace"
+                        else "semantic.proposal.check_domain_mismatch"
+                    ),
                 )
             if (
                 record.get("profile") != profile.name
@@ -529,7 +759,27 @@ class ConfigStore:
                     EXIT_CONFLICT,
                     error_code="proposal.check_target_mismatch",
                 )
-            if not isinstance(record.get("revision"), str) or not isinstance(record.get("operations"), list):
+            revision = record.get("revision")
+            valid_revision = (
+                isinstance(revision, str) and bool(revision)
+                if domain == "workspace"
+                else (
+                    isinstance(revision, int)
+                    and not isinstance(revision, bool)
+                    and revision >= 0
+                )
+            )
+            if (
+                not valid_revision
+                or not isinstance(record.get("operations"), list)
+                or (
+                    domain == "semantic"
+                    and (
+                        not isinstance(record.get("assetId"), str)
+                        or not record["assetId"]
+                    )
+                )
+            ):
                 raise CliError(
                     "Cached checked operations are malformed.",
                     EXIT_CONNECTIVITY,

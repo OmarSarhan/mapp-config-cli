@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from mapp_config_cli.client import (
     ApiClient,
+    MAX_REQUEST_BYTES,
     contract_major,
     normalize_endpoint,
     verify_target,
@@ -15,8 +16,10 @@ from mapp_config_cli.client import (
 from mapp_config_cli.config import Profile
 from mapp_config_cli.errors import (
     CliError,
+    EXIT_AUTHENTICATION,
     EXIT_CONFLICT,
     EXIT_CONNECTIVITY,
+    EXIT_VALIDATION,
     EXIT_VISUAL,
 )
 
@@ -59,6 +62,59 @@ class EndpointTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_request_serializes_non_ascii_json_as_compact_utf8(self):
+        client = ApiClient("http://localhost", "token")
+        with patch.object(
+            client.opener,
+            "open",
+            side_effect=urllib.error.URLError("synthetic stop"),
+        ) as mocked_open:
+            with self.assertRaises(CliError):
+                client.request(
+                    "/api/test",
+                    method="POST",
+                    payload={"label": "café"},
+                )
+
+        request = mocked_open.call_args.args[0]
+        self.assertEqual(request.data, b'{"label":"caf\xc3\xa9"}')
+
+    def test_request_allows_exactly_five_mib_serialized_body(self):
+        empty_payload = b'{"value":""}'
+        payload = {"value": "x" * (MAX_REQUEST_BYTES - len(empty_payload))}
+        client = ApiClient("http://localhost", "token")
+        with patch.object(
+            client.opener,
+            "open",
+            side_effect=urllib.error.URLError("synthetic stop"),
+        ) as mocked_open:
+            with self.assertRaises(CliError):
+                client.request("/api/test", method="POST", payload=payload)
+
+        request = mocked_open.call_args.args[0]
+        self.assertEqual(len(request.data), MAX_REQUEST_BYTES)
+
+    def test_request_rejects_serialized_body_over_five_mib_without_network(self):
+        empty_payload = b'{"value":""}'
+        payload = {
+            "value": "x" * (MAX_REQUEST_BYTES - len(empty_payload) + 1),
+        }
+        client = ApiClient("http://localhost", "token")
+        with patch.object(client.opener, "open") as mocked_open:
+            with self.assertRaises(CliError) as raised:
+                client.request("/api/test", method="POST", payload=payload)
+
+        self.assertEqual(raised.exception.exit_code, EXIT_VALIDATION)
+        self.assertEqual(raised.exception.error_code, "client.payload_too_large")
+        self.assertEqual(
+            raised.exception.safe_details,
+            {
+                "requestBytes": MAX_REQUEST_BYTES + 1,
+                "maxRequestBytes": MAX_REQUEST_BYTES,
+            },
+        )
+        mocked_open.assert_not_called()
+
     def test_localhost_subdomain_uses_configured_transport_hostname(self):
         client = ApiClient("http://config.localhost:3000")
         with patch.object(
@@ -160,6 +216,141 @@ class TransportTests(unittest.TestCase):
         payload = raised.exception.payload()
         self.assertEqual(payload["details"]["errors"][0]["ruleId"], "workspace.structure")
 
+    def test_preserves_semantic_server_error_code(self):
+        routes = {
+            ("GET", "/api/semantic/catalog/objects/missing"): (
+                404,
+                {
+                    "error": "Semantic asset does not exist.",
+                    "code": "semantic.asset_missing",
+                },
+            )
+        }
+        with JsonServer(routes) as server:
+            client = ApiClient(server.endpoint, "token")
+            with self.assertRaises(CliError) as raised:
+                client.request("/api/semantic/catalog/objects/missing")
+        self.assertEqual(
+            raised.exception.error_code,
+            "semantic.asset_missing",
+        )
+
+    def test_preserves_valid_namespaced_server_error_codes(self):
+        codes = (
+            "operation.not_found",
+            "workspace.fingerprint_conflict",
+            "proposal.approval_required",
+            "xyz.confirmation_required",
+            "locale.not_found",
+        )
+        routes = {
+            ("GET", f"/api/errors/{index}"): (
+                404,
+                {"error": "Expected failure.", "code": code},
+            )
+            for index, code in enumerate(codes)
+        }
+        with JsonServer(routes) as server:
+            client = ApiClient(server.endpoint, "token")
+            for index, code in enumerate(codes):
+                with self.subTest(code=code), self.assertRaises(CliError) as raised:
+                    client.request(f"/api/errors/{index}")
+                self.assertEqual(raised.exception.error_code, code)
+
+    def test_rejects_malformed_server_error_codes(self):
+        codes = (
+            "operation",
+            ".operation.not_found",
+            "operation.",
+            "operation..not_found",
+            "Operation.not_found",
+            "operation.not-found",
+            "operation.not_found\nspoofed.code",
+            42,
+        )
+        routes = {
+            ("GET", f"/api/errors/{index}"): (
+                404,
+                {"error": "Expected failure.", "code": code},
+            )
+            for index, code in enumerate(codes)
+        }
+        with JsonServer(routes) as server:
+            client = ApiClient(server.endpoint, "token")
+            for index, code in enumerate(codes):
+                with self.subTest(code=code), self.assertRaises(CliError) as raised:
+                    client.request(f"/api/errors/{index}")
+                self.assertEqual(raised.exception.error_code, "api.http_error")
+
+    def test_download_preserves_valid_namespaced_server_error_code(self):
+        with JsonServer(
+            {
+                ("GET", "/api/evidence/missing"): (
+                    404,
+                    {
+                        "error": "Operation does not exist.",
+                        "code": "operation.not_found",
+                    },
+                )
+            }
+        ) as server:
+            client = ApiClient(server.endpoint, "token")
+            with self.assertRaises(CliError) as raised:
+                client.request_bytes("/api/evidence/missing")
+
+        self.assertEqual(raised.exception.error_code, "operation.not_found")
+
+    def test_download_rejects_malformed_server_error_code(self):
+        with JsonServer(
+            {
+                ("GET", "/api/evidence/missing"): (
+                    404,
+                    {
+                        "error": "Operation does not exist.",
+                        "code": "operation.not_found\nspoofed.code",
+                    },
+                )
+            }
+        ) as server:
+            client = ApiClient(server.endpoint, "token")
+            with self.assertRaises(CliError) as raised:
+                client.request_bytes("/api/evidence/missing")
+
+        self.assertEqual(raised.exception.error_code, "api.http_error")
+
+    def test_preserves_authorization_scope_error_code(self):
+        routes = {
+            ("POST", "/api/semantic/generate"): (
+                403,
+                {
+                    "error": "The credential does not grant the required scope.",
+                    "code": "auth.scope_required",
+                    "requiredScope": "semantic:generate",
+                    "grantedScopes": ["semantic:inspect"],
+                },
+            )
+        }
+        with JsonServer(routes) as server:
+            client = ApiClient(server.endpoint, "token")
+            with self.assertRaises(CliError) as raised:
+                client.request(
+                    "/api/semantic/generate",
+                    method="POST",
+                    payload={
+                        "assetId": "asset:roads",
+                        "target": {"kind": "table"},
+                    },
+                )
+        self.assertEqual(raised.exception.exit_code, EXIT_AUTHENTICATION)
+        self.assertEqual(
+            raised.exception.error_code,
+            "auth.scope_required",
+        )
+        self.assertEqual(
+            raised.exception.safe_details["requiredScope"],
+            "semantic:generate",
+        )
+
     def test_visual_gateway_timeout_uses_visual_exit_code(self):
         with JsonServer(
             {
@@ -185,6 +376,40 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(
             raised.exception.payload()["details"]["run"]["status"],
             "timed-out",
+        )
+
+    def test_visual_planning_code_and_safe_stage_are_preserved(self):
+        response = {
+            "error": "Visual planning timed out before browser validation began.",
+            "code": "visual.planning_timeout",
+            "planningStage": "layer-summary",
+            "queryPurpose": "feature-count-and-extent",
+            "timeoutMilliseconds": 5000,
+        }
+        with JsonServer(
+            {
+                ("POST", "/api/visual-test"): (
+                    422,
+                    response,
+                )
+            }
+        ) as server:
+            client = ApiClient(server.endpoint, "token")
+            with self.assertRaises(CliError) as raised:
+                client.request(
+                    "/api/visual-test",
+                    method="POST",
+                    payload={"layer": "Bus Stops"},
+                    failure_code=EXIT_VISUAL,
+                )
+
+        error = raised.exception
+        self.assertEqual(EXIT_VISUAL, error.exit_code)
+        self.assertEqual("visual.planning_timeout", error.error_code)
+        self.assertEqual("layer-summary", error.safe_details["planningStage"])
+        self.assertEqual(
+            "feature-count-and-extent",
+            error.safe_details["queryPurpose"],
         )
 
     def test_non_json_response_is_structured(self):
@@ -239,7 +464,10 @@ class StubClient:
 
     def request(self, path, **kwargs):
         self.requests.append((path, kwargs))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, CliError):
+            raise response
+        return response
 
 
 class VerifyTargetTests(unittest.TestCase):
@@ -269,6 +497,12 @@ class VerifyTargetTests(unittest.TestCase):
             [
                 {"instanceId": "instance-1", "contractVersion": "1.0"},
                 self.contract(),
+                {
+                    "authenticated": True,
+                    "actor": "token:test",
+                    "scopes": ["inspect"],
+                    "expires": None,
+                },
             ]
         )
         target = verify_target(client, self.profile())
@@ -278,6 +512,7 @@ class VerifyTargetTests(unittest.TestCase):
             [
                 ("/api/public/identity", {"authenticated": False}),
                 ("/api/contract", {}),
+                ("/api/connect", {}),
             ],
         )
 
@@ -286,12 +521,190 @@ class VerifyTargetTests(unittest.TestCase):
             [
                 {"instanceId": "instance-1"},
                 self.contract(),
+                {
+                    "authenticated": True,
+                    "actor": "token:test",
+                    "scopes": ["inspect"],
+                    "expires": None,
+                },
             ]
         )
         self.assertEqual(
             verify_target(client, self.profile()).contract_version,
             "1.0",
         )
+
+    def test_contract_1_through_1_2_falls_back_to_auth_me_on_connect_404(self):
+        for version in ("1", "1.0", "1.1", "1.2"):
+            with self.subTest(version=version):
+                client = StubClient(
+                    [
+                        {
+                            "instanceId": "instance-1",
+                            "contractVersion": version,
+                        },
+                        self.contract(version=version),
+                        CliError(
+                            "No route for GET /api/connect.",
+                            EXIT_VALIDATION,
+                            http_status=404,
+                            error_code="api.http_error",
+                        ),
+                        {
+                            "actor": "token:legacy",
+                            "scopes": ["inspect", "propose"],
+                            "expires": "2030-01-01T00:00:00Z",
+                        },
+                    ]
+                )
+
+                target = verify_target(
+                    client,
+                    self.profile(contract_version=version),
+                )
+
+                self.assertEqual(
+                    target.connection,
+                    {
+                        "authenticated": True,
+                        "actor": "token:legacy",
+                        "scopes": ["inspect", "propose"],
+                        "expires": "2030-01-01T00:00:00Z",
+                    },
+                )
+                self.assertEqual(
+                    client.requests,
+                    [
+                        ("/api/public/identity", {"authenticated": False}),
+                        ("/api/contract", {}),
+                        ("/api/connect", {}),
+                        ("/api/auth/me", {}),
+                    ],
+                )
+
+    def test_connect_auth_failure_does_not_fall_back(self):
+        failure = CliError(
+            "Authentication failed.",
+            EXIT_AUTHENTICATION,
+            http_status=401,
+            error_code="auth.invalid_credential",
+        )
+        client = StubClient(
+            [
+                {"instanceId": "instance-1", "contractVersion": "1.2"},
+                self.contract(version="1.2"),
+                failure,
+            ]
+        )
+
+        with self.assertRaises(CliError) as raised:
+            verify_target(client, self.profile(contract_version="1.2"))
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(len(client.requests), 3)
+
+    def test_non_404_connect_failure_does_not_fall_back(self):
+        failure = CliError(
+            "Configuration service is unavailable.",
+            EXIT_CONNECTIVITY,
+            http_status=503,
+            error_code="api.http_error",
+        )
+        client = StubClient(
+            [
+                {"instanceId": "instance-1", "contractVersion": "1.2"},
+                self.contract(version="1.2"),
+                failure,
+            ]
+        )
+
+        with self.assertRaises(CliError) as raised:
+            verify_target(client, self.profile(contract_version="1.2"))
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(len(client.requests), 3)
+
+    def test_contract_1_3_connect_404_does_not_fall_back(self):
+        failure = CliError(
+            "No route for GET /api/connect.",
+            EXIT_VALIDATION,
+            http_status=404,
+            error_code="api.http_error",
+        )
+        client = StubClient(
+            [
+                {"instanceId": "instance-1", "contractVersion": "1.3"},
+                self.contract(version="1.3"),
+                failure,
+            ]
+        )
+
+        with self.assertRaises(CliError) as raised:
+            verify_target(client, self.profile(contract_version="1.3"))
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(len(client.requests), 3)
+
+    def test_malformed_contract_version_stops_before_connection_endpoints(self):
+        client = StubClient(
+            [
+                {"instanceId": "instance-1", "contractVersion": "1.0"},
+                self.contract(version="1.bad"),
+            ]
+        )
+
+        with self.assertRaises(CliError) as raised:
+            verify_target(client, self.profile())
+
+        self.assertEqual(raised.exception.error_code, "contract.invalid_version")
+        self.assertEqual(
+            client.requests,
+            [
+                ("/api/public/identity", {"authenticated": False}),
+                ("/api/contract", {}),
+            ],
+        )
+
+    def test_malformed_connect_response_does_not_fall_back(self):
+        client = StubClient(
+            [
+                {"instanceId": "instance-1", "contractVersion": "1.2"},
+                self.contract(version="1.2"),
+                {"actor": "token:test", "scopes": ["inspect"]},
+                {
+                    "actor": "token:legacy",
+                    "scopes": ["inspect"],
+                    "expires": None,
+                },
+            ]
+        )
+
+        with self.assertRaises(CliError) as raised:
+            verify_target(client, self.profile(contract_version="1.2"))
+
+        self.assertEqual(raised.exception.error_code, "auth.invalid_response")
+        self.assertEqual(len(client.requests), 3)
+
+    def test_malformed_auth_me_fallback_response_is_rejected(self):
+        client = StubClient(
+            [
+                {"instanceId": "instance-1", "contractVersion": "1.2"},
+                self.contract(version="1.2"),
+                CliError(
+                    "No route for GET /api/connect.",
+                    EXIT_VALIDATION,
+                    http_status=404,
+                    error_code="api.http_error",
+                ),
+                {"actor": "token:legacy", "scopes": "inspect"},
+            ]
+        )
+
+        with self.assertRaises(CliError) as raised:
+            verify_target(client, self.profile(contract_version="1.2"))
+
+        self.assertEqual(raised.exception.error_code, "auth.invalid_response")
+        self.assertEqual(len(client.requests), 4)
 
     def test_rejects_stored_contract_before_network(self):
         client = StubClient([])

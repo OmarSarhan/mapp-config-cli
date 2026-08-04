@@ -8,11 +8,39 @@ repository commits.
 
 | CLI release | Python | API version | Contract version | Status |
 | --- | --- | --- | --- | --- |
-| `0.1.x` | `3.11+` | `1.0` | `1.x` | Initial supported extraction |
+| `0.1.x` | `3.11+` | `1.x` | `1.x` | Initial supported extraction |
 
 The server reports its XYZ version, rules version, capabilities, instance ID,
 workspace key, and current revision. The client does not import XYZ source or
 encode a particular XYZ checkout.
+
+MAPP Platform API/contract `1.3` adds the hardened derived-layer error taxonomy,
+reason-specific actions, operation-specific unchanged-state evidence, and
+synchronous/background error parity. The CLI still verifies the connected
+server at runtime; against an earlier compatible `1.x` server it preserves the
+older response but cannot invent fields or distinctions that server did not
+return.
+
+MAPP Platform API/contract `1.4` advertises bounded pagination contract `1`.
+For workspace proposals and growing semantic collections, this CLI sends a
+page limit (100 by default, 1–100 accepted), retains only that response page,
+and exposes the server's opaque `pagination.nextCursor`. Pass that value back
+unchanged with `--cursor` to request the next page. A null cursor means the end
+of the collection. `--limit` or `--cursor` fails closed when the server does
+not advertise pagination; the one exception is semantic search's legacy
+`--limit`, which remains compatible with earlier API-1.x servers.
+
+The derived-profile list may also return a bounded `deliveryBlockers` repair
+batch. A literal boolean `deliveryBlockersMore` means additional unmatched
+archive repairs remain server-side; repair the displayed batch and refresh the
+list. The CLI rejects malformed or unaccompanied backlog flags instead of
+mistaking an incomplete administrative work queue for a complete result.
+
+Release this contract-1.4-aware CLI before activating the platform's 1.1.0
+legacy collection threshold. Then deploy the semantic service and matching
+`config-ui` image together; that image owns both the gateway and its bundled
+paginating dashboard and is not split into separate dashboard and API release
+steps.
 
 Until the first stable CLI release, minor `0.x` releases may contain breaking
 client-side changes. Review the changelog before upgrading.
@@ -70,15 +98,31 @@ The connected server is authoritative for:
 - workspace schema and JSON Pointer locations;
 - validation rules and remediation text;
 - layer/database catalog metadata;
+- semantic catalog definitions, revisions, derived-profile readiness,
+  configured source exclusions and archive visibility, authorized
+  source-relation discovery/synchronization, generation-context availability
+  and caps, and curated proposal behavior;
 - safe SVG assets;
 - SQL-expression capabilities;
+- managed derived-layer definition rules, ready source-profile requirements,
+  durable execution, query-error classification/remediation, materialization
+  estimate/actual-stage evidence, and server-resolved fixed map extents;
+- plugin manifests, hashes, workspace usage, preview assertions, and catalogue
+  fingerprint binding;
 - XYZ-version-specific styles and rendering behavior;
 - default/named/composite locale selection and XYZ-specific merge behavior;
-- proposal validation, revision checks, application, reload, and visual tests.
+- proposal validation, revision checks, application, reload, visual planning,
+  interaction evidence, and artifact requirements.
 
 Use `schema`, `rules`, `examples`, and capability endpoints at runtime. Do not
 copy those rules into client code or assume every server exposes the same
 optional capabilities.
+
+`GET /api/contract` owns the exact CLI command set, while
+`GET /api/capabilities` owns action IDs, risks, routes, input schemas,
+conditional scopes, presentation hints, and operation kinds. These are
+complementary checks: neither a familiar route nor a related action substitutes
+for the exact command required by the installed CLI.
 
 Use `plugins list`, `show`, `validate`, and `usage` for plugin behavior. The
 server-owned response includes pinned built-ins and source-controlled external
@@ -107,6 +151,25 @@ not sufficient if the selected client requires the explicit
 `proposals preview-test` contract command. Treat `capability.missing` as an
 unsupported operation and do not bypass the named client command.
 
+Semantic command matching includes all three levels. Advertising `semantic
+catalog export` does not authorize `semantic catalog search`, and advertising
+`semantic catalog show` does not authorize `semantic catalog history`.
+Advertising `semantic generate table` does not authorize `semantic generate field`;
+advertising workspace `proposals check` does not satisfy `semantic proposals check`.
+Advertising `semantic source relations` does not authorize the catalog-changing
+`semantic source sync` command. Likewise, `semantic catalog show` is not
+authority for `semantic catalog archive`, and `semantic source sync` is not
+authority for the separate confirmed `semantic source archive-excluded`
+lifecycle action.
+Semantic reads and proposal responses are rejected when their required catalog
+revision, object identity, asset version, or lifecycle state is malformed.
+Generation responses are also rejected unless the exact target is preserved,
+the reported metadata-only state and context options match the request,
+proposal creation is false, and every operation is a valid curated annotation
+for that target. A metadata-only request omits `contextOptions` for
+compatibility with older servers; the CLI accepts both the legacy
+metadata-only response and the newer explicit false/false context report.
+
 Layer inspection requires the server's `layers effective` capability. A CLI
 must fail closed when that capability is absent rather than reimplementing XYZ
 locale composition or assuming `/api/layers` exists on an older `1.x` server.
@@ -128,11 +191,15 @@ still lists that contract as supported.
 
 ## Cross-repository contract testing
 
-The platform repository should publish or export a versioned OpenAPI contract.
-This repository should pin a reviewed copy for automated contract tests. CI
-should verify request methods, paths, bodies, response schemas, error details,
-capabilities, exit-code mapping, revision conflicts, and instance mismatch
-handling.
+The platform repository publishes
+`contracts/api-compatibility-v1.4.json` as the machine-readable version and
+pagination matrix. The separate private `mapp-explore` integration repository
+checks out explicitly selected platform and CLI refs (their remote default
+branches when omitted), verifies the artifact against the CLI's supported
+majors, and runs the real CLI against the real configuration HTTP handler.
+Repository-local tests continue to verify request methods, paths, bodies,
+response schemas, error details, capabilities, exit-code mapping, revision
+conflicts, and instance mismatch handling.
 
 Compatibility is not established solely because authentication or one read
 command succeeds.

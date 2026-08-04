@@ -40,12 +40,22 @@ HTTPS certificate verification. Never use it for a remote production system.
 
 ## Token handling
 
-Prefer `config-cli auth device` for agent access. It requests an expiring token
-with `inspect`, `propose`, and `visual` scopes by default; `apply` and `reload`
-are separate explicit grants. Existing dashboard-created `full` tokens remain
-compatible for human operators and migration, but carry more authority than a
-proposal-generating agent needs. Prefer separate tokens for separate hosts and
-environments.
+Prefer `config-cli auth device` for agent access. It accepts only recognized,
+supported, non-elevated defaults from the verified server contract; the
+current platform advertises `inspect`, `propose`, `visual`, and
+`semantic:inspect`, while a legacy 1.0 server without semantic support falls
+back to the first three. Workspace apply/reload, derived-layer lifecycle
+authority, and elevated semantic source/generate/data/propose/apply/admin
+scopes are separate explicit grants. Source synchronization can register or
+refresh generated schema metadata. Generation also requires semantic inspection
+authority and is deliberately absent from safe defaults because authorized
+schema metadata leaves the MAPP control plane for Gemini. The CLI refuses to
+save a newly issued credential unless the
+device start, credential record, and authenticated identity all report
+exactly the requested scope set. Existing dashboard-created `full` tokens
+remain compatible for human operators and migration, but carry more authority
+than a proposal-generating agent needs. Prefer separate tokens for separate
+hosts and environments.
 
 For a human-operated terminal, prefer `config-cli setup`: it reads the token
 with hidden input, verifies the target, and never includes the token in its
@@ -59,6 +69,9 @@ an atomic credential switch, so failure preserves the old credential.
 - Understand that `init --token-file` copies the token into the CLI's private
   mode-`0600` `credentials.json`; later command-level overrides do not replace
   that stored credential.
+- Token files are limited to 64 KiB, and the private profile configuration is
+  limited to 128 MiB; both are validated as regular non-symlink files before
+  bounded reads.
 - Never pass a token as a command-line argument.
 - Never commit credentials, `.env` files, profiles, captured HTTP traffic, or
   test fixtures containing real secrets.
@@ -71,12 +84,58 @@ an atomic credential switch, so failure preserves the old credential.
 Profile removal deletes local material but does not revoke the server-side
 token.
 
-Successful proposal checks cache their exact operations, which may contain
-sensitive SQL, in private mode-`0600` `checks.json`. The cache is bounded and
-target-bound; protect it like other CLI credential/configuration state.
+Successful workspace and semantic proposal checks cache their exact
+operations, which may contain sensitive SQL or catalog meaning, in private
+mode-`0600` `checks.json`. The cache is bounded, target-bound, and namespaced
+by proposal domain so fingerprints cannot cross between workspace and
+semantic proposals. Protect it like other CLI credential/configuration state.
 Files supplied through `--input` may also contain workspace or SQL material;
 keep them private, reject symlinks, and remove temporary inputs according to
 the same retention policy.
+
+Source-relation discovery and synchronization require both `semantic:inspect`
+and the separate `semantic:source` scope. Discovery exposes configured
+database aliases and relation identities, while synchronization reads
+authorized schema metadata and can change the generated semantic catalog; an
+unchanged definition is a catalog no-op. Neither operation accepts SQL or
+returns rows. Keep source authority out of default agent credentials.
+`SEMANTIC_SOURCE_EXCLUSIONS` is operator configuration rather than a hard-coded
+client list and blocks future discovery/synchronization only. Archiving
+already-registered matches or one selected ready profile requires explicit
+confirmation plus `semantic:inspect + semantic:admin`; it leaves the database
+unchanged. Archived records are hidden from catalog/search/derived-profile
+collections for every caller. Exact show/history audit reads remain available
+only by a previously retained ID with both scopes, so record intended audit
+identities before archival. Removing an exclusion does not restore a
+tombstone.
+
+On-demand semantic generation sends only the schema and semantic metadata the
+server authorizes for the caller by default, never table rows or server
+credentials. `--sample-rows` is the explicit boundary at which raw row values
+from a server-bounded 5% sample leave MAPP for Gemini. `--statistics` sends
+relevant data-derived table or target-column aggregates, but no raw values
+unless the sample option is also selected. Both options require the additional
+`semantic:data` scope; keep that scope out of default agent credentials and
+inspect `semantic status` for the server-advertised row and payload caps before
+using it. Current platform ceilings are 100 rows, 96 KiB, 20 eligible table
+columns, and 512 characters per serialized value; field statistics aggregate
+at most 1,000 rows from a 5% sample. The Gemini API key remains server-side.
+Treat field names,
+descriptions, sampled values, statistics, generated drafts, and model/provider
+diagnostics as controlled data. Generation is read-only but can incur provider
+cost and disclosure, so grant `semantic:generate` separately, review its audit
+trail and reported `generation.contextOptions`, and do not add it to default
+agent credentials. Provider processing and retention follow the configured
+project's [Gemini API terms](https://ai.google.dev/gemini-api/terms); the
+server's `store: false` request does not replace that operator review. The CLI
+issues one request and does not retry provider errors.
+
+Generated bindings, relation fields, and types are lifecycle-owned. Curated
+table/field annotations are proposal-owned. Removing only an annotation uses a
+reviewed `/curated/...` `unset` proposal and does not remove generated metadata
+or database data; archiving the entire profile is a distinct administrative
+lifecycle action. Preserve that distinction in review packets and audit
+reports.
 
 Profile mutations are serialized with a private mode-`0600` state lock.
 Profiles publish immutable credential references only after target
@@ -114,6 +173,10 @@ and `xyz status`; reconcile proposal status/applied revision with the live
 revision before deciding what happened. If the proposal is already applied,
 never submit it again. Escalate any ambiguous state.
 
+Semantic proposal application has the same indeterminate-result rule. Inspect
+`semantic proposals show` and the affected `semantic catalog show` version
+before an operator decides whether any further action is safe.
+
 ## Output and artifacts
 
 Workspace documents, catalog metadata, SQL samples, and screenshots may reveal
@@ -125,6 +188,18 @@ Apply least-retention practices:
 - store visual artifacts in access-controlled locations;
 - do not paste full workspace output into public issues;
 - keep CI fixtures synthetic.
+
+Local JSON, SQL query, and validation inputs are descriptor-opened as regular,
+non-symlink files and limited to 5 MiB before UTF-8 decoding. Token files are
+limited to 64 KiB, while private configuration/cache JSON is limited to 128
+MiB to accommodate the bounded retained-check cache.
+
+These guarantees depend on POSIX descriptor-relative traversal. Native Windows
+operational execution is therefore unsupported and fails with
+`platform.unsupported` immediately after argument parsing, before configuration
+state is accessed or any remote request is made. Use WSL rather than a weaker
+path-based fallback that could follow a raced ancestor reparse point. The
+Windows CI lane verifies this fail-closed boundary.
 
 Structured errors should retain diagnostic fields such as rule IDs and JSON
 paths while redacting credentials and authorization data. A visual HTTP 422
@@ -140,6 +215,21 @@ bounded probes. The CLI is not an unrestricted SQL shell.
 SQL can still disclose data, consume resources, return unexpected nulls, or
 disable efficient index use. Inspect server capabilities, test the expression,
 and disclose its purpose and risk before requesting approval.
+
+Managed derived-layer SQL remains a separate `derive`-scoped administrative
+operation. Its mandatory map extent filters final output geometry; it is not
+row-level security and does not stop the declared query reading its sources.
+The advertised materialization guard uses a planner estimate rather than
+creating or sampling the result. A second actual-size check runs only after
+population and indexing inside the transaction, so rollback cannot prevent
+transient relation, index, TOAST, or WAL growth. Treat both as storage-safety
+checks, not query-cost guarantees or replacements for database quotas and
+monitoring. Policy failures are distinct from malformed or over-budget SQL and
+must keep their reason-specific remediation. The CLI surfaces safe background
+`userMessage` text while retaining diagnostic details; an indeterminate result
+must never be presented as known unchanged state. A database error's optional
+technical detail is restricted to bounded SQLSTATE and primary-message fields,
+never the SQL text, PostgreSQL context, detail, or hint.
 
 ## Workstation hardening
 

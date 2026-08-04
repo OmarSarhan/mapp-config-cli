@@ -99,8 +99,10 @@ config-cli auth status
 
 Initial interactive setup prompts for the profile, endpoint, and a hidden
 bootstrap token, then verifies the target before saving it. `auth device`
-defaults to inspect, propose, and visual scopes; never request apply or reload
-unless the user explicitly needs that authority. For automation, use
+uses the verified server contract's advertised defaults (inspect, propose,
+visual, and semantic-inspect on the current platform); never request apply,
+reload, derive, or elevated semantic scopes unless the user explicitly needs
+that authority. For automation, use
 `config-cli init ENDPOINT --profile PROFILE` and put the token in a mode-`0600`
 file via `--token-file` or
 `CONFIG_CLI_TOKEN_FILE`. During `init`, that token is copied into the private
@@ -109,6 +111,45 @@ Never pass tokens as command arguments or include them in logs, proposals,
 error reports, or screenshots. Use `--allow-http` only for an isolated,
 trusted development endpoint; never use it for production or an
 Internet-reachable remote host.
+
+On-demand semantic generation requires the separate `semantic:generate` scope
+as well as `semantic:inspect`. It sends only caller-authorized metadata to
+Gemini by default and returns a review-only draft. `--sample-rows` and
+`--statistics` explicitly opt in to server-bounded data context and
+additionally require `semantic:data`; raw row values leave MAPP only with
+`--sample-rows`. Inspect `semantic status` for the advertised sample caps.
+Never treat generated text as fact, retry a provider failure automatically, or
+pass the draft directly into create/apply. Review the exact asset version,
+target, context options, curated-only operations, descriptions, tags, and
+caveats, then use the normal semantic check/fingerprint/create workflow and
+wait for separate approval before apply.
+
+Ordinary source-relation discovery and synchronization require both
+`semantic:inspect` and the elevated `semantic:source` scope. Discover the
+allowlisted identities with `semantic source relations`, then synchronize only
+an explicitly selected identity with `semantic source sync --alias ALIAS
+--schema SCHEMA --relation RELATION --confirm`. The sync command accepts no SQL
+or row data. Record whether it returned `register`, `refresh`, or the
+catalog-preserving `unchanged` result before continuing with generation.
+
+`SEMANTIC_SOURCE_EXCLUSIONS` is server deployment configuration, not a table
+list maintained by this CLI. It prevents future discovery/sync but does not
+retroactively hide an existing profile. With explicit administrative approval
+and both `semantic:inspect` and `semantic:admin`, use `semantic source
+archive-excluded --confirm` for all registered matches or `semantic catalog
+archive ASSET_ID --confirm` for one ready profile. Record asset IDs first.
+Archival leaves PostgreSQL data untouched and removes the tombstone from
+catalog/search/derived-profile collections even for administrators; only an
+exact show/history lookup by retained ID remains available with both scopes.
+Removing an exclusion does not unarchive it.
+
+Treat generated relation and field facts as lifecycle-owned and curated
+annotations as proposal-owned. `semantic catalog show ASSET_ID` returns both,
+including stable field IDs, but no database rows. To remove only table or field
+meaning, check an `unset` below `/curated` and follow the ordinary
+fingerprint/create/review/approval/apply workflow. Never archive a profile merely
+to clear one annotation, and never claim a curated proposal removed a generated
+column or database data.
 
 ## Natural-language style mapping
 
@@ -277,10 +318,61 @@ database actions. Creating the relation does not add it to XYZ. Inspect the
 new catalog relation and use the normal revision-bound proposal and approval
 workflow for the workspace layer as a separate step.
 
-For H3-derived relations, treat cell generation as a candidate expansion step
-and apply an exact spatial predicate against the source geometry before
-publishing the relation. Use the containment mode names advertised by the
-server/database extension, not guessed aliases. On restricted server search
+Managed derived relation names must match
+`^[a-z][a-z0-9_]{0,62}$`: start with a lowercase ASCII letter, then use only
+lowercase letters, digits, and underscores, up to 63 characters. Use the same
+rule for ID and geometry column names. Do not propose spaces, hyphens, dots,
+uppercase, quoted mixed-case, or schema-qualified output names; the server
+uses the fixed `derived_layers` schema and safely quotes accepted identifiers.
+
+Every derived-layer create or replace is map-bounded. Preview
+`derived-layers map-extent` and pass the same optional `--locale` directly to
+`create` or `replace`. The retained `--map-extent` flag is accepted for older
+automation but does not change this mandatory scope. The server resolves it
+around the locale's configured centre, using a 1920x1080 viewport at one zoom
+level wider (`max(0, z-1)`, clamped at zoom 0). It keeps complete output
+features intersecting the envelope rather than clipping them, and it does not
+follow later pan, zoom, viewport, or workspace-view changes. Refresh retains
+the saved scope without recalculating it; replace resolves the current scope
+again, and omission of the compatibility flag cannot clear the scope.
+The outer guard filters output rows only: it is not an RLS/security boundary
+and does not map-scope upstream aggregates, windows, limits, or computation.
+Put the previewed envelope predicate in source-side SQL before aggregation
+when the requested metric must be map-scoped; this also avoids unnecessary
+upstream work. The semantic catalog remains authoritative for source and field
+meaning.
+Preserve the preview and returned `derivedLayer.spatialScope` in review
+evidence, including the final result of a background create or replace.
+
+Inspect `derived-layers capabilities` before all derived work. The universal
+`queryGuard` advertises ordered AST/catalog/EXPLAIN stages, shape limits, H3
+expansion, recursive PostgreSQL plan limits, and error categories for ordinary
+and materialized views; preserve the accepted
+`derivedLayer.queryPlanProbe`. `derived_layer.query_too_expensive` must not offer
+or recommend a view—rewrite the query or reduce H3/intermediate work. Keep it
+distinct from `derived_layer.query_invalid` (fix malformed/non-SELECT SQL) and
+`derived_layer.query_not_allowed` (remove or replace the prohibited SQL or
+catalog dependency). Present each reason's own `suggestedAction`, plus
+`safeState` when `stateUnchanged` is true; do not substitute a generic H3 hint.
+The separate materialized-size probe returns
+`derivedLayer.materializationProbe`. Only
+`derived_layer.materialization_too_large` may recommend `view`; preserve its
+`probeStage`. An estimate-stage failure starts no materialization, while an
+actual-stage failure populated and indexed inside a transaction before
+`rolledBack: true`; it may still have caused transient relation, index, TOAST,
+or WAL growth. Ask before changing kind because a view shifts cost to reads and
+is not an automatic substitute for the requested stored result.
+
+For H3-derived relations, generate polygon candidates directly from the
+server-supplied `_mapp_h3_scope.geom_4326` with a literal resolution. Bounded
+literal grid traversal, non-expanding index/parent/boundary functions, and
+provable one-level child expansion remain supported; dynamic or unbounded
+expansion and over-budget composed expansion are rejected. Treat cell generation as a candidate expansion step and
+apply an exact spatial predicate against the complete source geometry before
+publishing the relation. Do not subset a layer-wide aggregate that must use the
+complete declared input. For a “share of all points” field, the denominator is
+the complete declared point source unless the requested meaning explicitly
+limits it to the saved map area. On restricted server search
 paths, higher-level H3/PostGIS convenience wrappers may fail to resolve
 geometry or PostGIS helper types; prefer SQL that explicitly qualifies PostGIS
 functions or uses lower-level H3 boundary output converted with qualified
@@ -302,6 +394,11 @@ A durable background operation can report a terminal serialization or result-
 reporting failure after its database transaction committed. Audit
 `operations show`, `derived-layers list|show`, and `catalog list` before acting
 on any late background failure, even when its operation status says `failed`.
+Expected background guard failures preserve their synchronous derived-layer
+code and guidance under `operation.error`; the CLI surfaces that user message
+and code and retains actions/reasons in structured details. An unexpected
+`derived_layer.operation_failed` is `indeterminate` and deliberately makes no
+`stateUnchanged` claim.
 
 Inspect existing `infoj` entries and catalog columns before adding a calculated
 field. Ask whether the user wants an existing stored value, formatting, or a
@@ -342,9 +439,11 @@ XYZ hover configuration selects a feature field but does not itself provide
 numeric grouping or a suffix formatter. If hover needs a value such as
 `1,250 m`, expose a text column from an authorized managed view while retaining
 the original numeric column for graduated styling. Keep clicked-feature
-`infoj`, hover, and theme fields independent. A browser visual test does not
-exercise hover reliably, so disclose that evidence gap unless the tooltip was
-manually observed.
+`infoj`, hover, and theme fields independent. Candidate and live visual tests
+automatically exercise configured hover. Use `--hover` to require it and
+repeat `--expect-hover-text` for acceptance text. Claim hover evidence only
+when the report says it was requested, attempted, opened, and passed and
+provides the dedicated hover-tooltip artifact.
 
 ## Visual evidence and limitations
 
@@ -352,13 +451,23 @@ manually observed.
 view containing data. `visual-test` runs Chromium on the server and returns
 authenticated artifact paths for its report and screenshots.
 
-A passing visual test establishes that XYZ loaded, the named layer was present,
-and a map canvas rendered. It is evidence, not a guarantee of cartographic
-quality. Large/outlier-heavy datasets, external basemaps, theme-driven styles,
-custom SVGs, grouped layer folders, and layers with unusual zoom rules may
-require a user-specified view or manual screenshot review. It also does not
-prove exact colours, pointer interactions, information-panel values, or
-emoji/custom-font glyph fidelity. Grouped layers can render and interact while
+Providing `--lng`, `--lat`, and `--zoom` together bypasses the relation-wide
+feature-count, extent, and representative-feature planning queries. The runner
+uses the exact requested map centre and still exercises configured hover and
+clicked-feature evidence there. A pre-browser database failure has no visual
+artifacts; preserve its `visual.planning_timeout` or
+`visual.planning_database_error` code and the `planningStage` and
+`queryPurpose` fields.
+
+A passing visual test establishes only the checks explicitly reported as
+passed. XYZ loading, layer presence, and canvas rendering do not alone prove
+cartographic quality. Large/outlier-heavy datasets, external basemaps,
+theme-driven styles, custom SVGs, grouped layer folders, and layers with
+unusual zoom rules may require a user-specified view or manual screenshot
+review. Exact colours and emoji/custom-font glyph fidelity still require
+artifact inspection. Hover and clicked-feature content count as evidence only
+when their dedicated report fields and artifacts pass. Grouped layers can
+render and interact while
 a strict layer-name text assertion fails because XYZ exposes the folder label
 instead of the child layer name in the checked UI text. A failed HTTP 422 visual
 result can still contain its plan, report, and authenticated artifacts;
@@ -395,6 +504,12 @@ stored candidate without applying it:
 config-cli proposals preview-plan PROPOSAL_ID --layer "LAYER KEY"
 config-cli proposals preview-test PROPOSAL_ID --layer "LAYER KEY"
 config-cli proposals preview-screenshot PROPOSAL_ID --layer "LAYER KEY"
+config-cli proposals preview-test PROPOSAL_ID --layer "LAYER KEY" \
+  --hover --expect-hover-text "EXPECTED TOOLTIP TEXT"
+config-cli proposals preview-screenshot PROPOSAL_ID --layer "LAYER KEY" \
+  --expect-info-text "EXPECTED SOURCE NOTE"
+config-cli proposals preview-screenshot PROPOSAL_ID --layer "LAYER KEY" \
+  --panel filtering --expect-panel-text "EXPECTED FILTER LABEL"
 ```
 
 For initial visibility or default-view changes, add `--view-mode default`.
@@ -432,6 +547,12 @@ similar action ID or route is not sufficient. If the contract gate rejects the
 preview, report candidate evidence as unavailable rather than bypassing it.
 Do not describe the proposal's visual evidence as complete until every
 applicable checklist item is covered or every gap is explicitly disclosed.
+For requested Filtering evidence, require both sides' `panels.filtering.passed`
+records and dedicated before/after Filtering artifacts. For hover, require
+`requested`, `attempted`, `opened`, and `passed` plus its tooltip artifact;
+`passed: true` on a deliberately skipped hover is not hover evidence. For
+clicked-feature text, require captured per-side feature-info evidence, every
+expected-text result, and the corresponding information-panel artifact.
 
 ## Safety rules
 

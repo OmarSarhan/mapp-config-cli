@@ -283,6 +283,12 @@ the exact retained candidate without changing the live workspace:
 config-cli proposals preview-plan PROPOSAL_ID --layer "LAYER KEY"
 config-cli proposals preview-test PROPOSAL_ID --layer "LAYER KEY"
 config-cli proposals preview-screenshot PROPOSAL_ID --layer "LAYER KEY"
+config-cli proposals preview-test PROPOSAL_ID --layer "LAYER KEY" \
+  --hover --expect-hover-text "EXPECTED TOOLTIP TEXT"
+config-cli proposals preview-screenshot PROPOSAL_ID --layer "LAYER KEY" \
+  --expect-info-text "EXPECTED FEATURE INFORMATION"
+config-cli proposals preview-screenshot PROPOSAL_ID --layer "LAYER KEY" \
+  --panel filtering --expect-panel-text "EXPECTED FILTER LABEL"
 ```
 
 One invocation represents one requested layer in one selected map view; it is
@@ -321,7 +327,9 @@ retained visible layer renders at a useful data-derived location.
 Use explicit `--lng`, `--lat`, and `--zoom` when automatic framing is too
 broad, outlier-driven, or unrepresentative. Prefer separate readable views to
 one proposal-wide image zoomed too far out to verify. If the proposal affects
-several distant areas, add a checklist case for each area.
+several distant areas, add a checklist case for each area. Supplying all three
+values bypasses relation-wide database auto-framing and makes the browser
+exercise the exact map centre.
 
 Group membership comparisons deliberately isolate the affected layer: an
 added layer is off before and shown alone after; a removed layer is shown alone
@@ -353,14 +361,22 @@ artifacts; preserve that evidence rather than reducing it to a generic error.
 An HTTP 429 means the bounded visual runner is busy; report the contention and
 retry the read-only check only after it clears.
 
-A passing visual test establishes that XYZ loaded, the named layer was
-present, and a map canvas rendered. It is evidence, not a guarantee of
-cartographic quality. Large or outlier-heavy datasets, external basemaps,
-theme-driven styles, custom SVGs, and unusual zoom rules may require a
-user-specified view or manual screenshot review. A pass also does not prove
-exact colours, pointer interactions, information-panel values, or
-emoji/custom-font glyph fidelity; download and inspect screenshots when those
-details matter.
+If the request fails before Chromium starts, preserve the returned
+`visual.planning_timeout` or `visual.planning_database_error` code together
+with `planningStage` and `queryPurpose`. There will be no browser artifacts.
+For a `feature-count-and-extent` timeout at a known useful location, rerun with
+all of `--lng`, `--lat`, and `--zoom`; do not describe that retry as weakening
+the hover or clicked-feature assertion, because those are still exercised at
+the browser's map centre.
+
+A passing visual test establishes only the checks explicitly reported as
+passed. XYZ loading, layer presence, and canvas rendering do not alone
+guarantee cartographic quality. Large or outlier-heavy datasets, external
+basemaps, theme-driven styles, custom SVGs, and unusual zoom rules may require
+a user-specified view or manual screenshot review. Exact colours and
+emoji/custom-font glyph fidelity still require artifact inspection. Hover,
+Filtering-panel, and clicked-feature content count only when their dedicated
+checks and artifacts pass.
 
 When the automatic extent is misleading, provide a bounded explicit view:
 
@@ -484,6 +500,41 @@ The server fixes the output schema to `derived_layers`, validates declared
 PostgreSQL dependencies and output geometry/ID properties, and remains
 authoritative for SQL safety.
 
+Before presenting a definition, normalize the managed relation name to
+`^[a-z][a-z0-9_]{0,62}$`: it must start with a lowercase ASCII letter and use
+only lowercase letters, digits, and underscores, up to PostgreSQL's 63-byte
+identifier limit (63 characters under this ASCII-only rule). Apply the same
+rule to the selected ID and geometry column names. Do not invent spaces,
+hyphens, dots, uppercase, or quoted mixed-case output identifiers; the server
+safely quotes accepted identifiers and fixes the output schema to
+`derived_layers`.
+
+Every derived-layer create or replace uses a fixed spatial scope. First run
+`derived-layers map-extent [--locale LOCALE]`, then pass the same optional
+`--locale` directly to `create` or `replace`. `--map-extent` remains accepted
+for compatibility with older automation but does not change this mandatory
+behavior. The scope is centred on the selected locale's configured view,
+planned for a 1920x1080 viewport at one zoom level wider (`max(0, z-1)`,
+clamped at zoom 0). It selects whole output features that intersect the saved
+envelope; it does not clip geometry or follow later pan, zoom, viewport, or
+workspace-view changes. Ordinary views continue to track source-row changes
+within that scope; materialized views update on refresh, which does not resolve
+the extent again. Replace resolves and saves the current scope again; omitting
+the compatibility flag cannot clear it.
+
+The server's outer intersection guard filters final output rows only. It is
+not an RLS/security boundary and does not automatically map-scope upstream
+aggregates, windows, limits, or computation. When the requested metric must be
+map-scoped, put the previewed envelope predicate in the source-side SQL before
+aggregation. This early predicate also avoids an unbounded upstream
+calculation.
+
+Keep global and local aggregate meanings separate. For example, a cell's point
+count may use points intersecting that cell, while a “share of all points”
+field must divide by a count over the complete declared point relation. Use a
+map-filtered denominator only when the user explicitly means “all points in
+this saved map area.”
+
 Creating or refreshing a derived relation is not a workspace proposal and
 requires the separate `derive` scope. Do not infer approval for it from a
 request to change the map. Present the definition, sources, mode, expected
@@ -492,13 +543,69 @@ database action. Adding the result to XYZ is a second operation: inspect it in
 the catalog, create a revision-bound workspace proposal, present that diff,
 and wait for its own approval before applying.
 
-For H3-derived layers, keep candidate generation and final acceptance
-separate. H3 polygon-to-cells functions can deliberately over-select when the
-goal is "cells that touch" a source feature; follow that with an exact
-`ST_Intersects` or other reviewed predicate against the original source
-geometry so the derived table semantics are clear. Use the containment mode
-names exposed by the installed H3 extension, such as `overlapping` when that
-is the advertised value, rather than inferred aliases.
+The mandatory extent guard changes spatial scope only. Continue to use
+semantic catalog profiles as the authority for source and field meaning, and
+fall back to authorized source discovery only when the needed semantics do not
+exist.
+Retain the preview and returned `derivedLayer.spatialScope` in the evidence
+packet; a background create or replace must return the same server-resolved
+scope in its completed operation result.
+
+Inspect the server's `derived-layers capabilities` response before any derived
+mutation. The advertised `queryGuard` uses a non-writing, recursively inspected
+PostgreSQL plan plus SQL-shape and H3-expansion bounds for both ordinary and
+materialized views. It exposes ordered AST/catalog/EXPLAIN `stages`,
+`shapeLimits`, plan `limits`, H3 bounds, and `errorCategories`; the CLI validates
+the complete hardened shape. Preserve the successful
+`derivedLayer.queryPlanProbe` in the review packet. Treat the server's failure
+taxonomy literally:
+
+- `derived_layer.query_invalid` (HTTP 400, `category: "invalid"`) means the
+  input is not exactly one parseable `SELECT` statement; correct its syntax or
+  statement form.
+- `derived_layer.query_not_allowed` (HTTP 422, `category: "policy"`) means an
+  SQL or resolved catalog dependency violates policy; follow each reason's
+  `suggestedAction` and replace or schema-qualify the prohibited object.
+- `derived_layer.query_too_expensive` (HTTP 409,
+  `category: "compute"`) means shape, H3/generated rows, join fan-out,
+  recursion, or the plan exceeds a resource limit; reduce intermediate work or
+  bounded expansion without silently changing the requested metric.
+
+All three block both layer kinds and have no view fallback. Present
+`userMessage`, then `suggestedAction`, then the reason-specific actions. When
+`stateUnchanged` is true, include `safeState` so the user knows whether nothing
+was created, the original definition remains active, or stored data remains
+unchanged. Keep `technicalDetail` out of the primary notification.
+For `derived_layer.source_mismatch`, show `missingSources` and `extraSources`
+and correct the declaration to match `resolvedSources`; reducing H3 work cannot
+repair a dependency declaration.
+
+Before asking to materialize, also inspect `materializationGuard`. It blocks
+materialized create, conversion, and refresh when estimated stored bytes exceed
+`maxEstimatedBytes`; a successful mutation returns
+`derivedLayer.materializationProbe`. If the server returns
+`derived_layer.materialization_too_large` and `recommendedKind: "view"`, do not
+silently change kind: explain that this compute-safe view stores no result rows
+but shifts work to reads, then obtain authorization for that alternative or
+reduce the query/result. Preserve `probeStage`: `estimate` means no
+materialized DDL or refresh started, while `actual` means population and
+indexing occurred inside a transaction before the server measured the result
+and returned `rolledBack: true`. The rollback preserves the reported
+`safeState`, but it cannot prevent transient relation, index, TOAST, or WAL
+growth. On refresh, offer conversion of the existing layer or output reduction,
+not creation of a duplicate layer.
+
+For H3-derived layers, generate polygon candidates directly from the supplied
+`_mapp_h3_scope.geom_4326` with a literal resolution. Literal bounded grid
+disk/ring traversal, non-expanding index/parent/boundary operations, and
+provable one-level child expansion remain supported; dynamic or unbounded cell
+expansion is rejected, and the composed operations must stay within the
+advertised combined-cell bound before the general plan budget runs. Keep candidate
+generation and final acceptance separate. H3 polygon-to-cells functions can
+deliberately over-select when the goal is "cells that touch" a source feature;
+follow that with an exact `ST_Intersects` or other reviewed predicate against
+the complete original source geometry so the derived table semantics are clear.
+Do not substitute a subset when a layer-wide aggregate must use complete input.
 
 Restricted server search paths can expose extension-wrapper assumptions. If a
 higher-level H3/PostGIS wrapper fails with missing `geometry`, `st_dump`, or
@@ -512,6 +619,13 @@ work was not cancelled. If a synchronous request times out or returns HTTP
 `5xx`, inspect `derived-layers list`, `derived-layers show`, and `catalog list`
 before retrying because the database action may have committed. Never
 automatically resubmit an ambiguous mutation.
+
+Expected background guard failures retain the same derived-layer code and
+guidance under `operation.error`. The CLI promotes the nested `userMessage` and
+stable code to its top-level structured error and retains `suggestedAction`,
+`reasons`, probe, and safe-state evidence under `details`. An unexpected
+`derived_layer.operation_failed` ends as `indeterminate`; because commit state
+may be uncertain, it deliberately has no `stateUnchanged` or `safeState`.
 
 When using lower-level H3 functions, PostgreSQL points are ordered
 `(longitude, latitude)`. For lines, grid traversal between segment endpoint
@@ -533,14 +647,91 @@ grouping or suffix formatter. For formatted hover text, create an authorized
 managed view that keeps the numeric source column for themes and adds a text
 column such as `to_char(round(length_metres)::bigint,
 'FM999,999,999,990') || ' m'`. State rounding and null behavior, keep clicked
-`infoj` independent, and disclose that standard visual tests do not trigger
-hover. Empty `infoj` prevents feature fields from rendering but may still allow
-an empty information-panel shell to open on click.
+`infoj` independent, and verify the tooltip with `--hover` plus repeated
+`--expect-hover-text` assertions. Count it as evidence only when the hover
+report says it was attempted, opened, and passed and includes the dedicated
+tooltip artifact. Empty `infoj` prevents feature fields from rendering but may
+still allow an empty information-panel shell to open on click.
 
 For MVT layers on pinned XYZ v4.23.4, prefer `srid: "3857"`. Although the schema
 also accepts numeric `3857`, the browser runtime can reject that representation
 with an SRID warning; candidate screenshots are the authoritative compatibility
 check.
+
+Every managed derived-layer response includes `semanticProfile`. Treat the
+relation as unavailable for a new workspace proposal until that profile is
+`ready`. Inspect `semantic derived-profiles show NAME`; an administrator may
+run `semantic derived-profiles repair NAME --confirm` for a persistent
+`repair_required` state only after investigating and correcting its delivery
+failure. Repair requeues the unchanged retained event; it does not rebuild or
+edit the payload, so a deterministic failure will recur until its cause is
+corrected. An administrator's `derived-profiles list` can also contain
+`deliveryBlockers` for already-dropped relations; repair that retained archive
+event by its blocker name, after which it reports `pending_archive`. The
+`derive` scope authorizes automatic generated profile
+registration but not curated semantic edits.
+
+For an ordinary configured database relation, first use `semantic source
+relations` with a token granted both `semantic:inspect` and
+`semantic:source`. Synchronize only the reviewed alias/schema/relation identity
+with `semantic source sync
+--alias ALIAS --schema SCHEMA --relation RELATION --confirm`. This changes
+generated semantic catalog facts but does not authorize SQL, expose table rows,
+or edit curated meaning. Record the returned canonical asset ID, asset version,
+and catalog revision before requesting generation or proposing annotations.
+Server-configured `SEMANTIC_SOURCE_EXCLUSIONS` are subtracted from discovery and
+sync; agents must not maintain or guess a hard-coded internal-table list.
+Exclusions do not retroactively hide existing profiles. An explicit
+administrator may record the affected IDs and run `semantic source
+archive-excluded --confirm`, or archive one ready profile with `semantic
+catalog archive ASSET_ID --confirm`; both require `semantic:inspect +
+semantic:admin` and leave PostgreSQL untouched. Archived assets disappear from
+catalog/search collections even for administrators. Only exact show/history
+reads by retained ID remain available with both scopes.
+
+If the user explicitly authorizes external semantic generation and the token
+has both `semantic:inspect` and `semantic:generate`, use `semantic generate
+table ASSET_ID` or `semantic generate field ASSET_ID FIELD_ID`. Treat the
+returned Gemini text as an untrusted draft. Generation is metadata-only by
+default. Use `--sample-rows` and/or `--statistics` only when the user has
+explicitly authorized that extra context and the token also has
+`semantic:data`; raw row values leave MAPP only for `--sample-rows`. First
+inspect `semantic status` for the server-advertised caps. Verify the response's
+exact asset version, target, `generation.metadataOnly`,
+`generation.contextOptions`, paths, descriptions, tags, and caveats against
+the catalog. Generation creates no check or proposal and must not be retried
+automatically after a provider error. Only after review may its exact
+curated-only operations enter the normal check/fingerprint/create workflow.
+On the current platform, the 5% sample is capped at 100 rows, 96 KiB, 20
+eligible table columns, and 512 characters per serialized value; field
+statistics aggregate at most 1,000 rows from a 5% sample. These are ceilings,
+not evidence that a sample is representative. The dashboard may concurrently
+request up to ten independently selected stable field IDs and reports
+completed/total progress; it preserves selection order and exposes no partial
+combined draft on failure. One CLI invocation still targets exactly one table
+or field, so an agent must not imply the CLI performed an atomic batch.
+
+When semantic meaning must change, inspect `semantic catalog show ASSET_ID`
+and use `semantic catalog history ASSET_ID` when prior source or curated
+decisions affect the interpretation. Check the smallest `/curated/...`
+operation set against its exact asset version, and create with
+`semantic proposals create --from-check
+FINGERPRINT`. Present the canonical asset ID, catalog revision, asset version,
+focused diff, and explanation. Wait for separate approval before
+`semantic proposals apply ID --confirm`. Never use a workspace check
+fingerprint for a semantic proposal or treat either proposal as approval for
+the other domain. Treat a timeout, HTTP `5xx`, or malformed/inconsistent
+successful semantic apply response as indeterminate: do not retry, and
+reconcile with `semantic proposals show ID` and `semantic catalog show
+ASSET_ID`.
+
+When the request is to remove only a semantic annotation, check the smallest
+`unset` below `/curated`: for example `/curated/description`, one field
+property, or `/curated/fields/FIELD_ID` for the complete field annotation.
+This retains generated source facts and database data. Do not archive the
+whole profile or claim a generated column was removed. Conversely, profile
+archival is an administrator lifecycle action, not a shortcut around the
+semantic proposal approval boundary.
 
 ## Non-negotiable safeguards
 

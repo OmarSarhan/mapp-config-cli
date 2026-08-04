@@ -2,8 +2,9 @@
 
 `config-cli` is the standalone, JSON-first command-line client for a remote
 MAPP configuration service. It lets a human or an automation agent inspect an
-XYZ workspace, create revision-bound configuration proposals, and apply an
-approved proposal without needing shell or filesystem access to the server.
+XYZ workspace and its semantic catalog, create revision-bound configuration
+proposals, and apply an approved proposal without needing shell or filesystem
+access to the server.
 
 This repository contains only the client. The XYZ application, PostgreSQL
 database, configuration dashboard, validation rules, browser runner, and
@@ -88,13 +89,20 @@ check fails. It writes the token only to the CLI's private mode-`0600`
 credential store and never echoes it. For automation, use `config-cli
 init` with a private token file instead; see [Installation](docs/installation.md).
 `auth device` replaces that bootstrap credential with a browser-approved,
-thirty-day agent token scoped to inspect, propose, and visual work by default;
-apply and reload remain separate grants. After `auth status` confirms the
-replacement, revoke the bootstrap token in the remote dashboard.
+thirty-day agent token using the verified server contract's safe advertised
+defaults. The current platform defaults to inspect, propose, visual, and
+semantic-inspect work; workspace apply, reload, derived-layer lifecycle
+authority, and elevated semantic changes remain separate grants. After `auth
+status` confirms the replacement, revoke the bootstrap token in the remote
+dashboard.
 
 Agents can inspect deployed action schemas with `config-cli capabilities
 list`, correlate responses through `meta.requestId`, and inspect durable
-visual, reload, and apply outcomes with `config-cli operations show|wait`.
+visual, reload, apply, and background derived-layer outcomes with `config-cli
+operations show|wait`. The server contract's exact command list and
+`/api/capabilities` action schemas are complementary runtime authorities; the
+CLI fails closed when either required declaration is absent instead of calling
+a familiar route directly.
 Global `--input`, `--extract`, and `--out` options support JSON file/stdin
 workflows without fragile shell quoting.
 
@@ -104,6 +112,15 @@ Inspect the bound instance:
 config-cli --profile production describe
 config-cli --profile production workspace get
 config-cli --profile production layers get "Bus Stops"
+config-cli --profile production semantic catalog search "bus stops"
+config-cli --profile production semantic catalog show ASSET_ID
+config-cli --profile production semantic catalog history ASSET_ID
+config-cli --profile production semantic source relations
+config-cli --profile production semantic source sync \
+  --alias DATABASE_ALIAS --schema SCHEMA --relation RELATION --confirm
+config-cli --profile production semantic generate field ASSET_ID FIELD_ID
+config-cli --profile production semantic generate table ASSET_ID \
+  --sample-rows --statistics
 ```
 
 Use the revision returned by `describe` or `workspace get` to check the exact
@@ -128,6 +145,42 @@ config-cli --profile production visual-test --layer "Bus Stops"
 ```
 
 The original request to make a change is not approval to apply its proposal.
+Semantic metadata uses the same separation: check curated-only operations,
+create from the returned fingerprint, review the focused diff, and run
+`semantic proposals apply ... --confirm` only after explicit approval.
+Gemini generation is metadata-only by default and never performs any of those
+proposal steps. `--sample-rows` and `--statistics` are separate explicit
+opt-ins for server-bounded data context; both additionally require the
+`semantic:data` scope. On the current platform, sampling selects from 5% of the
+relation and is capped at 100 rows, 96 KiB, 20 eligible table columns, and 512
+characters per value; field statistics aggregate at most 1,000 sampled rows.
+Always inspect `semantic status` because the connected server advertises the
+authoritative availability and caps.
+
+`semantic catalog show` returns generated relation/field facts and their stable
+IDs together with separately curated table and field meaning; it never returns
+database rows. Start derived-layer planning from that semantic profile and let
+it overrule agent guesses. If the needed relation profile is absent, use the
+separately scoped `semantic source relations` and confirmed `semantic source
+sync` fallback; PostgreSQL/PostGIS/H3 functions are not relations and need no
+profile of their own.
+
+Administrators can archive a single semantic profile without changing its
+database relation:
+
+```sh
+config-cli --profile production semantic catalog archive ASSET_ID --confirm
+config-cli --profile production semantic source archive-excluded --confirm
+```
+
+Source exclusions are deployment configuration, not a hard-coded CLI list,
+and affect future discovery/sync; the bundled platform currently excludes
+`MAPP:leeds.census_datasets`. The second command explicitly archives
+already-registered matches. Archived assets are omitted from catalog/search
+collections even for administrators, while exact show/history remains
+available by a retained ID with `semantic:inspect + semantic:admin`. To remove
+only curated wording, use a checked `/curated/...` `unset` proposal instead;
+generated metadata and database data remain untouched.
 For an explicitly approved standalone XYZ reload, use
 `config-cli --profile production reload-xyz --confirm`; the existing
 `xyz reload --confirm` spelling remains available. This is an
@@ -138,6 +191,7 @@ which already requests and waits for the associated reload.
 
 - [Installation](docs/installation.md)
 - [Command reference](docs/commands.md)
+- [Advanced workspace setup](docs/commands.md#advanced-workspace-setup)
 - [Agent workflow](docs/agent-workflow.md)
 - [Security](docs/security.md)
 - [Compatibility](docs/compatibility.md)

@@ -6,14 +6,36 @@ import json
 from typing import Any
 
 
+def sanitize_terminal_text(value: Any, *, preserve_newlines: bool = False) -> str:
+    """Render untrusted text without emitting terminal control characters."""
+    text = str(value)
+    return "".join(
+        character
+        if (
+            ord(character) > 0x1F
+            and ord(character) != 0x7F
+            and not 0x80 <= ord(character) <= 0x9F
+        )
+        or (preserve_newlines and character == "\n")
+        else f"\\u{ord(character):04x}"
+        for character in text
+    )
+
+
 def _value(value: Any) -> str:
     if isinstance(value, bool):
         return "yes" if value else "no"
     if value is None:
         return "-"
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return str(value)
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return sanitize_terminal_text(serialized)
+    return sanitize_terminal_text(value)
 
 
 def _doctor(data: dict[str, Any]) -> str:
@@ -23,6 +45,16 @@ def _doctor(data: dict[str, Any]) -> str:
         ("target", ("liveInstanceId", "identityMatches", "compatible", "apiVersion", "contractVersion")),
         ("authentication", ("authenticated", "actor", "scopes")),
         ("workspace", ("accessible", "key", "revision")),
+        (
+            "semantic",
+            (
+                "advertised",
+                "authorized",
+                "available",
+                "schemaVersion",
+                "catalogRevision",
+            ),
+        ),
     ):
         value = data.get(section)
         if isinstance(value, dict):
@@ -40,7 +72,7 @@ def _doctor(data: dict[str, Any]) -> str:
 def _proposal(data: dict[str, Any], action: str) -> str:
     container = data.get("proposal" if action == "create" else "check")
     if not isinstance(container, dict):
-        return _json(data)
+        return _human_json(data)
     title = "Proposal" if action == "create" else "Proposal check"
     lines = [title]
     for field in ("id", "status", "originalRevision", "explanation"):
@@ -68,8 +100,49 @@ def _proposal(data: dict[str, Any], action: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _semantic_generation(data: dict[str, Any]) -> str:
+    draft = data.get("draft")
+    generation = data.get("generation")
+    if not isinstance(draft, dict) or not isinstance(generation, dict):
+        return _human_json(data)
+    lines = ["Semantic draft"]
+    for field in ("assetId", "baseVersion", "target", "explanation"):
+        if field in draft:
+            lines.append(f"{field}: {_value(draft[field])}")
+    lines.extend([
+        f"provider: {_value(generation.get('provider'))}",
+        f"model: {_value(generation.get('model'))}",
+        f"metadataOnly: {_value(generation.get('metadataOnly'))}",
+    ])
+    if "contextOptions" in generation:
+        lines.append(
+            f"contextOptions: {_value(generation['contextOptions'])}"
+        )
+    lines.append(
+        f"proposalCreated: {_value(generation.get('proposalCreated'))}"
+    )
+    operations = draft.get("operations")
+    if isinstance(operations, list):
+        lines.append(f"operations: {len(operations)}")
+        lines.extend(
+            "  " + _value(operation)
+            for operation in operations
+        )
+    actions = data.get("nextActions")
+    if isinstance(actions, list) and actions:
+        lines.append("Next actions:")
+        lines.extend(f"  - {_value(item)}" for item in actions)
+    return "\n".join(lines) + "\n"
+
+
 def _json(data: Any) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+
+
+def _human_json(data: Any) -> str:
+    # JSON already escapes control characters inside strings. Preserve only
+    # the serializer's structural newlines while escaping raw C1 controls.
+    return sanitize_terminal_text(_json(data), preserve_newlines=True)
 
 
 def render(data: Any, *, command: str, output: str = "json") -> str:
@@ -79,9 +152,11 @@ def render(data: Any, *, command: str, output: str = "json") -> str:
     if output != "human":
         raise ValueError(f"unsupported output format: {output}")
     if not isinstance(data, dict):
-        return _json(data)
+        return _human_json(data)
     if command == "doctor":
         return _doctor(data)
     if command in {"proposals check", "proposals create"}:
         return _proposal(data, command.split()[1])
-    return _json(data)
+    if command.startswith("semantic generate "):
+        return _semantic_generation(data)
+    return _human_json(data)
