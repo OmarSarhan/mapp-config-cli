@@ -314,9 +314,11 @@ Managed derived layers are a separate privileged workflow. They create only a
 server-validated view or materialized view in `derived_layers` and require the
 `derive` scope. Present and obtain explicit authorization for creation,
 materialized refresh, or drop; a map-change request is not approval for these
-database actions. Creating the relation does not add it to XYZ. Inspect the
-new catalog relation and use the normal revision-bound proposal and approval
-workflow for the workspace layer as a separate step.
+database actions. After that authorization, invoke creation with `--confirm`;
+the flag is a local command guard, not evidence of user approval. Creating the
+relation does not add it to XYZ. Inspect the new catalog relation and use the
+normal revision-bound proposal and approval workflow for the workspace layer
+as a separate step.
 
 Managed derived relation names must match
 `^[a-z][a-z0-9_]{0,62}$`: start with a lowercase ASCII letter, then use only

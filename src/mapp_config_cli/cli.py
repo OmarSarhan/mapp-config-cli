@@ -374,6 +374,7 @@ def parser() -> JsonArgumentParser:
         ),
     )
     derived_create.add_argument("--locale", type=nonempty)
+    derived_create.add_argument("--confirm", action="store_true", required=True)
     derived_replace = derived_actions.add_parser("replace")
     derived_replace.add_argument("name")
     derived_replace.add_argument("--kind", choices=("view", "materialized"))
@@ -6158,8 +6159,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     details={"missing": missing},
                     error_code="derived_layer.missing_input",
                 )
-            if args.action == "replace":
-                payload["confirmed"] = True
+            payload["confirmed"] = True
             if args.background:
                 payload["background"] = True
             result = _request_derived_mutation(

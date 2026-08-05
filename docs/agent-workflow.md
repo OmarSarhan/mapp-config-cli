@@ -539,9 +539,11 @@ Creating or refreshing a derived relation is not a workspace proposal and
 requires the separate `derive` scope. Do not infer approval for it from a
 request to change the map. Present the definition, sources, mode, expected
 cost, and refresh behavior, then obtain explicit authorization for the
-database action. Adding the result to XYZ is a second operation: inspect it in
-the catalog, create a revision-bound workspace proposal, present that diff,
-and wait for its own approval before applying.
+database action. After that authorization, invoke creation with `--confirm`;
+the flag is a local command guard, not evidence of user approval. Adding the
+result to XYZ is a second operation: inspect it in the catalog, create a
+revision-bound workspace proposal, present that diff, and wait for its own
+approval before applying.
 
 The mandatory extent guard changes spatial scope only. Continue to use
 semantic catalog profiles as the authority for source and field meaning, and

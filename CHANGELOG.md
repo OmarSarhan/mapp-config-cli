@@ -89,6 +89,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Required `--confirm` for `derived-layers create` and forwarded the confirmed
+  mutation guard. Existing create automation must add the flag; it does not
+  replace separate user authorization for the database action.
 - Validated the bounded semantic delivery-blocker batch and its explicit
   `deliveryBlockersMore` continuation signal so an incomplete repair queue
   cannot be mistaken for a complete result.

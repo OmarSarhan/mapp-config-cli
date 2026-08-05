@@ -85,6 +85,15 @@ class CompletionTests(unittest.TestCase):
             ),
         )
 
+    def test_bash_completes_derived_create_confirmation(self):
+        self.assertIn(
+            "--confirm",
+            self.bash_completions(
+                ["config-cli", "derived-layers", "create", "--c"],
+                3,
+            ),
+        )
+
     def test_fish_nested_conditions_and_required_values_are_explicit(self):
         script = generate_completion(parser(), "fish")
         self.assertIn(

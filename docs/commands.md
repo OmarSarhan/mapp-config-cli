@@ -697,8 +697,13 @@ config-cli derived-layers create paths_h3_r9 \
   --query-file paths-h3-r9.sql \
   --source leeds.definitive_paths \
   --id-column h3_id \
-  --geometry-column geom_3857
+  --geometry-column geom_3857 \
+  --confirm
 ```
+
+Create, replace, refresh, and drop all require `--confirm`. This is a local
+command guard that records deliberate invocation; it is not evidence of the
+separate user authorization required for the database action.
 
 Every create or replace uses a fixed, bounded spatial scope around the selected
 locale's configured map centre. The server uses a 1920x1080 planning viewport
@@ -715,7 +720,8 @@ config-cli derived-layers create paths_h3_r9 \
   --source leeds.definitive_paths \
   --id-column h3_id \
   --geometry-column geom_3857 \
-  --locale Leeds
+  --locale Leeds \
+  --confirm
 ```
 
 Preview the resolved envelope before the mutation. The filter selects complete

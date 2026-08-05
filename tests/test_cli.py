@@ -428,6 +428,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["code"], "auth.credential_missing")
         self.assertNotIn("stored-token", stderr)
 
+    def test_derived_layer_create_requires_confirmation_before_input_or_request(self):
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "places",
+                "--query-file", str(Path(directory) / "missing.sql"),
+                "--source", "leeds.places",
+                "--id-column", "id",
+                "--geometry-column", "geom",
+            ], store)
+
+        self.assertEqual(EXIT_USAGE, code)
+        self.assertEqual("", stdout)
+        failure = json.loads(stderr)
+        self.assertEqual("usage.invalid_arguments", failure["code"])
+        self.assertIn("--confirm", failure["error"])
+        self.assertEqual([], server.requests)
+
     def test_derived_layer_create_forwards_definition(self):
         captured = {}
         resolved_scope = map_extent_scope()
@@ -460,8 +479,10 @@ class CliTests(unittest.TestCase):
                 "--source", "leeds.definitive_paths",
                 "--id-column", "h3_id",
                 "--geometry-column", "geom_3857",
+                "--confirm",
             ], store)
         self.assertEqual(code, 0, stderr)
+        self.assertIs(captured["confirmed"], True)
         self.assertEqual(captured["query"], query)
         self.assertEqual(captured["kind"], "materialized")
         self.assertNotIn("background", captured)
@@ -505,6 +526,7 @@ class CliTests(unittest.TestCase):
                         "--source", "source",
                         "--id-column", "id",
                         "--geometry-column", "geom",
+                        "--confirm",
                     ],
                     store,
                 ))
@@ -829,6 +851,7 @@ class CliTests(unittest.TestCase):
                 "--geometry-column", "geom",
                 "--map-extent",
                 "--locale", "Leeds",
+                "--confirm",
             ], store)
 
         self.assertEqual(code, 0, stderr)
@@ -1020,6 +1043,7 @@ class CliTests(unittest.TestCase):
                 "--id-column", "id",
                 "--geometry-column", "geom",
                 "--locale", "Leeds",
+                "--confirm",
             ], store)
 
         self.assertEqual(code, 0, stderr)
@@ -1054,6 +1078,7 @@ class CliTests(unittest.TestCase):
                 "--source", "leeds.places",
                 "--id-column", "id",
                 "--geometry-column", "geom",
+                "--confirm",
             ], store)
 
         self.assertEqual(code, EXIT_CONNECTIVITY)
@@ -1208,6 +1233,7 @@ class CliTests(unittest.TestCase):
                 "--geometry-column", "geom",
                 "--background",
                 "--interval", "0.001",
+                "--confirm",
             ], store)
 
         self.assertEqual(0, code, stderr)
@@ -1320,6 +1346,7 @@ class CliTests(unittest.TestCase):
                 "--id-column", "id",
                 "--geometry-column", "geom",
                 "--background",
+                "--confirm",
             ], store)
 
         self.assertEqual(EXIT_VALIDATION, code)
