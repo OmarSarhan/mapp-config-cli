@@ -89,6 +89,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Preserved authoritative derived-mutation commit-state fields, distinguished
+  request/response ambiguity from lost operation polling, and kept every
+  indeterminate path non-retryable until its retained identity is reconciled.
 - Required `--confirm` for `derived-layers create` and forwarded the confirmed
   mutation guard. Existing create automation must add the flag; it does not
   replace separate user authorization for the database action.

@@ -1425,6 +1425,23 @@ def _validate_background_wait(wait_timeout: float, interval: float) -> None:
         )
 
 
+def _operation_reconciliation(operation_id: str) -> dict[str, Any]:
+    return {
+        "required": True,
+        "automaticRetry": False,
+        "commands": [
+            {
+                "command": "config-cli operations show",
+                "arguments": [operation_id],
+            },
+            {
+                "command": "config-cli operations wait",
+                "arguments": [operation_id],
+            },
+        ],
+    }
+
+
 def _background_poll_error(
     operation_id: str,
     status: Any,
@@ -1435,20 +1452,9 @@ def _background_poll_error(
     details: dict[str, Any] = {
         "operationId": operation_id,
         "status": status,
-        "reconciliation": {
-            "required": True,
-            "automaticRetry": False,
-            "commands": [
-                {
-                    "command": "config-cli operations show",
-                    "arguments": [operation_id],
-                },
-                {
-                    "command": "config-cli operations wait",
-                    "arguments": [operation_id],
-                },
-            ],
-        },
+        "indeterminate": True,
+        "failurePhase": "operation-polling",
+        "reconciliation": _operation_reconciliation(operation_id),
     }
     if cause is not None:
         details["cause"] = {
@@ -1485,6 +1491,8 @@ def _derived_mutation_indeterminate(
     details: dict[str, Any] = {
         "derivedLayer": name,
         "action": action,
+        "indeterminate": True,
+        "failurePhase": "request-response",
         "reconciliation": {
             "required": True,
             "automaticRetry": False,
@@ -1521,6 +1529,57 @@ def _derived_mutation_indeterminate(
     )
 
 
+_DERIVED_SERVER_FAILURE_PHASES = frozenset({
+    "preflight",
+    "database-transaction",
+    "transaction-rollback",
+    "transaction-commit",
+    "result-reporting",
+    "request-response",
+    "service-recovery",
+})
+
+
+def _has_authoritative_derived_failure(error: CliError) -> bool:
+    details = error.safe_details
+    if (
+        not isinstance(error.error_code, str)
+        or not error.error_code.startswith("derived_layer.")
+        or not isinstance(details, dict)
+        or details.get("failurePhase") not in _DERIVED_SERVER_FAILURE_PHASES
+    ):
+        return False
+    if details.get("indeterminate") is True:
+        return (
+            details["failurePhase"] in {
+                "transaction-rollback",
+                "transaction-commit",
+                "result-reporting",
+                "request-response",
+                "service-recovery",
+            }
+            and all(
+                key not in details
+                for key in ("stateUnchanged", "safeState", "rolledBack")
+            )
+        )
+    phase = details["failurePhase"]
+    return (
+        phase in {"preflight", "database-transaction"}
+        and details.get("stateUnchanged") is True
+        and isinstance(details.get("safeState"), str)
+        and bool(details["safeState"].strip())
+        and "indeterminate" not in details
+        and (
+            (
+                phase == "database-transaction"
+                and details.get("rolledBack") is True
+            )
+            or (phase == "preflight" and "rolledBack" not in details)
+        )
+    )
+
+
 def _request_derived_mutation(
     client: ApiClient,
     path: str,
@@ -1548,6 +1607,16 @@ def _request_derived_mutation(
             and 400 <= exc.http_status < 500
             and exc.http_status != 408
         ):
+            raise
+        if _has_authoritative_derived_failure(exc):
+            if exc.safe_details.get("indeterminate") is True:
+                raise CliError(
+                    exc.message,
+                    EXIT_CONNECTIVITY,
+                    details=exc.safe_details,
+                    http_status=exc.http_status,
+                    error_code=exc.error_code,
+                ) from exc
             raise
         if (
             exc.error_code in {
@@ -4905,10 +4974,20 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     error_code="operation.invalid_wait",
                 )
             deadline = time.monotonic() + args.wait_timeout
+        last_status: Any = "unknown"
         while True:
-            result = client.request(
-                f"/api/operations/{quote_segment(args.id)}"
-            )
+            try:
+                result = client.request(
+                    f"/api/operations/{quote_segment(args.id)}"
+                )
+            except CliError as exc:
+                if args.action == "wait":
+                    raise _background_poll_error(
+                        args.id,
+                        last_status,
+                        cause=exc,
+                    ) from exc
+                raise
             operation = result.get("operation")
             if not isinstance(operation, dict) or not isinstance(operation.get("status"), str):
                 raise _invalid_response(
@@ -4916,6 +4995,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     result,
                     error_code="operation.invalid_response",
                 )
+            last_status = operation["status"]
             if args.action == "show" or operation["status"] in {
                 "succeeded", "failed", "indeterminate",
             }:
@@ -4944,6 +5024,9 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     details={
                         "operationId": args.id,
                         "status": operation["status"],
+                        "indeterminate": True,
+                        "failurePhase": "operation-polling",
+                        "reconciliation": _operation_reconciliation(args.id),
                     },
                     error_code="operation.wait_timeout",
                 )

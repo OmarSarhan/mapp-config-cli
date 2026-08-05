@@ -1423,12 +1423,54 @@ class CliTests(unittest.TestCase):
         payload = json.loads(stderr)
         self.assertEqual(payload["code"], "operation.poll_failed")
         self.assertEqual(payload["details"]["operationId"], "derived-op-poll")
+        self.assertTrue(payload["details"]["indeterminate"])
+        self.assertEqual(
+            payload["details"]["failurePhase"],
+            "operation-polling",
+        )
         reconciliation = payload["details"]["reconciliation"]
         self.assertTrue(reconciliation["required"])
         self.assertFalse(reconciliation["automaticRetry"])
         self.assertEqual(
             reconciliation["commands"][0]["arguments"],
             ["derived-op-poll"],
+        )
+
+    def test_background_wait_timeout_is_operation_polling_ambiguity(self):
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
+            202,
+            {"operation": {
+                "id": "derived-op-timeout",
+                "kind": "derived-layer.refresh",
+                "status": "running",
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch(
+                "mapp_config_cli.cli.time.monotonic",
+                side_effect=[0.0, 2.0],
+            ):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "derived-layers", "refresh", "slow_places",
+                        "--confirm", "--background", "--wait-timeout", "1",
+                    ],
+                    store,
+                )
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("operation.wait_timeout", payload["code"])
+        self.assertTrue(payload["details"]["indeterminate"])
+        self.assertEqual(
+            "operation-polling",
+            payload["details"]["failurePhase"],
+        )
+        self.assertFalse(
+            payload["details"]["reconciliation"]["automaticRetry"],
         )
 
     def test_background_poll_interruption_retains_reconciliation_identity(self):
@@ -1580,6 +1622,11 @@ class CliTests(unittest.TestCase):
                     failure["code"],
                     "derived_layer.mutation_indeterminate",
                 )
+                self.assertTrue(failure["details"]["indeterminate"])
+                self.assertEqual(
+                    "request-response",
+                    failure["details"]["failurePhase"],
+                )
                 self.assertEqual(
                     failure["details"]["cause"]["code"],
                     "operation.invalid_response",
@@ -1603,6 +1650,22 @@ class CliTests(unittest.TestCase):
                 307,
                 {"error": "Refresh endpoint moved."},
                 {"Location": "/moved"},
+            ),
+            (
+                500,
+                {
+                    "error": "Refresh failed without outcome metadata.",
+                    "code": "derived_layer.operation_failed",
+                },
+            ),
+            (
+                500,
+                {
+                    "error": "Refresh returned contradictory outcome metadata.",
+                    "code": "derived_layer.operation_failed",
+                    "failurePhase": "preflight",
+                    "indeterminate": True,
+                },
             ),
         )
         for response in responses:
@@ -1638,10 +1701,80 @@ class CliTests(unittest.TestCase):
                     failure["details"]["cause"]["httpStatus"],
                     response[0],
                 )
+                self.assertTrue(failure["details"]["indeterminate"])
+                self.assertEqual(
+                    "request-response",
+                    failure["details"]["failurePhase"],
+                )
                 self.assertFalse(
                     failure["details"]["reconciliation"]["automaticRetry"]
                 )
                 self.assertEqual(len(attempts), 1)
+
+    def test_derived_mutation_preserves_safe_server_500(self):
+        route = ("POST", "/api/derived-layers/slow_places/refresh")
+        server_error = {
+            "error": "The database rejected the refresh before it began.",
+            "code": "derived_layer.operation_failed",
+            "stateUnchanged": True,
+            "safeState": "The existing materialized data remains unchanged.",
+            "failurePhase": "preflight",
+        }
+        routes = standard_routes()
+        routes[route] = (500, server_error)
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers", "refresh", "slow_places",
+                    "--confirm",
+                ],
+                store,
+            )
+
+        self.assertEqual(EXIT_VALIDATION, code)
+        self.assertEqual("", stdout)
+        failure = json.loads(stderr)
+        self.assertEqual(server_error["code"], failure["code"])
+        self.assertEqual(500, failure["httpStatus"])
+        self.assertEqual("preflight", failure["details"]["failurePhase"])
+        self.assertTrue(failure["details"]["stateUnchanged"])
+        self.assertEqual(
+            server_error["safeState"],
+            failure["details"]["safeState"],
+        )
+
+    def test_derived_mutation_preserves_indeterminate_server_500(self):
+        route = ("POST", "/api/derived-layers/slow_places/refresh")
+        server_error = {
+            "error": "The server could not report the committed result.",
+            "code": "derived_layer.operation_failed",
+            "indeterminate": True,
+            "failurePhase": "result-reporting",
+        }
+        routes = standard_routes()
+        routes[route] = (500, server_error)
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers", "refresh", "slow_places",
+                    "--confirm",
+                ],
+                store,
+            )
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        failure = json.loads(stderr)
+        self.assertEqual(server_error["code"], failure["code"])
+        self.assertEqual(500, failure["httpStatus"])
+        self.assertTrue(failure["details"]["indeterminate"])
+        self.assertEqual(
+            "result-reporting",
+            failure["details"]["failurePhase"],
+        )
+        self.assertNotIn("stateUnchanged", failure["details"])
 
     def test_derived_mutation_interruption_is_indeterminate(self):
         routes = standard_routes()
@@ -4906,6 +5039,104 @@ class CliTests(unittest.TestCase):
             json.loads(stderr)["code"],
         )
 
+    def test_operation_wait_poll_failure_retains_operation_identity(self):
+        routes = standard_routes()
+        routes[("GET", "/api/operations/op-lost")] = (
+            503,
+            {"error": "Operation status is temporarily unavailable."},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["operations", "wait", "op-lost"],
+                store,
+            )
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("operation.poll_failed", payload["code"])
+        self.assertEqual("op-lost", payload["details"]["operationId"])
+        self.assertTrue(payload["details"]["indeterminate"])
+        self.assertEqual(
+            "operation-polling",
+            payload["details"]["failurePhase"],
+        )
+        self.assertFalse(
+            payload["details"]["reconciliation"]["automaticRetry"],
+        )
+
+    def test_operation_wait_timeout_is_operation_polling_ambiguity(self):
+        routes = standard_routes()
+        routes[("GET", "/api/operations/op-running")] = (
+            200,
+            {"operation": {
+                "id": "op-running",
+                "kind": "derived-layer.refresh",
+                "status": "running",
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch(
+                "mapp_config_cli.cli.time.monotonic",
+                side_effect=[0.0, 2.0],
+            ):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "operations", "wait", "op-running",
+                        "--wait-timeout", "1",
+                    ],
+                    store,
+                )
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("operation.wait_timeout", payload["code"])
+        self.assertTrue(payload["details"]["indeterminate"])
+        self.assertEqual(
+            "operation-polling",
+            payload["details"]["failurePhase"],
+        )
+        self.assertFalse(
+            payload["details"]["reconciliation"]["automaticRetry"],
+        )
+
+    def test_operation_show_preserves_derived_failure_state(self):
+        operation_error = {
+            "error": "The refresh failed and was rolled back.",
+            "code": "derived_layer.database_error",
+            "stateUnchanged": True,
+            "safeState": "The existing materialized data remains unchanged.",
+            "rolledBack": True,
+            "failurePhase": "database-transaction",
+        }
+        routes = standard_routes()
+        routes[("GET", "/api/operations/op-derived-show")] = (
+            200,
+            {"operation": {
+                "id": "op-derived-show",
+                "kind": "derived-layer.refresh",
+                "status": "failed",
+                "error": operation_error,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["operations", "show", "op-derived-show"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("", stderr)
+        preserved = json.loads(stdout)["operation"]["error"]
+        self.assertEqual(operation_error, preserved)
+        self.assertTrue(preserved["stateUnchanged"])
+        self.assertTrue(preserved["rolledBack"])
+        self.assertEqual("database-transaction", preserved["failurePhase"])
+
     def test_operation_wait_preserves_derived_failure_code_and_guidance(self):
         operation_error = {
             "error": "Derived query exceeds the compute budget.",
@@ -4917,6 +5148,8 @@ class CliTests(unittest.TestCase):
             "blocked": True,
             "stateUnchanged": True,
             "safeState": "The existing materialized data is unchanged.",
+            "rolledBack": True,
+            "failurePhase": "database-transaction",
             "reasons": [{
                 "code": "intermediate_rows",
                 "message": "An intermediate plan node exceeds the row limit.",
@@ -4949,6 +5182,10 @@ class CliTests(unittest.TestCase):
             operation_error["suggestedAction"],
             payload["details"]["operation"]["error"]["suggestedAction"],
         )
+        preserved = payload["details"]["operation"]["error"]
+        self.assertTrue(preserved["stateUnchanged"])
+        self.assertTrue(preserved["rolledBack"])
+        self.assertEqual("database-transaction", preserved["failurePhase"])
 
     def test_operation_wait_preserves_indeterminate_derived_guidance(self):
         operation_error = {
@@ -4964,6 +5201,8 @@ class CliTests(unittest.TestCase):
             "category": "operation",
             "status": 500,
             "blocked": True,
+            "indeterminate": True,
+            "failurePhase": "result-reporting",
         }
         routes = standard_routes()
         routes[("GET", "/api/operations/op-derived-uncertain")] = (
@@ -4987,7 +5226,10 @@ class CliTests(unittest.TestCase):
         payload = json.loads(stderr)
         self.assertEqual("derived_layer.operation_failed", payload["code"])
         self.assertEqual(operation_error["userMessage"], payload["error"])
-        self.assertNotIn("stateUnchanged", operation_error)
+        preserved = payload["details"]["operation"]["error"]
+        self.assertTrue(preserved["indeterminate"])
+        self.assertEqual("result-reporting", preserved["failurePhase"])
+        self.assertNotIn("stateUnchanged", preserved)
 
     def test_operation_wait_keeps_database_detail_diagnostic(self):
         operation_error = {
@@ -4999,6 +5241,10 @@ class CliTests(unittest.TestCase):
             "code": "derived_layer.database_error",
             "status": 422,
             "blocked": True,
+            "stateUnchanged": True,
+            "safeState": "No derived layer was created.",
+            "rolledBack": True,
+            "failurePhase": "database-transaction",
             "technicalDetail": {
                 "sqlstate": "42703",
                 "message": "column missing_field does not exist",
@@ -5030,6 +5276,10 @@ class CliTests(unittest.TestCase):
             operation_error["technicalDetail"],
             payload["details"]["operation"]["error"]["technicalDetail"],
         )
+        preserved = payload["details"]["operation"]["error"]
+        self.assertTrue(preserved["stateUnchanged"])
+        self.assertTrue(preserved["rolledBack"])
+        self.assertEqual("database-transaction", preserved["failurePhase"])
 
     def test_input_extract_and_private_output_file_are_composable(self):
         routes = standard_routes()

@@ -577,7 +577,11 @@ All three block both layer kinds and have no view fallback. Present
 `userMessage`, then `suggestedAction`, then the reason-specific actions. When
 `stateUnchanged` is true, include `safeState` so the user knows whether nothing
 was created, the original definition remains active, or stored data remains
-unchanged. Keep `technicalDetail` out of the primary notification.
+unchanged. `failurePhase: "preflight"` proves no mutation transaction began;
+`failurePhase: "database-transaction"` includes `rolledBack: true` only after
+the server explicitly completed rollback. Commit, rollback-finalization, and
+result-reporting phases are indeterminate and omit all unchanged-state fields.
+Keep `technicalDetail` out of the primary notification.
 For `derived_layer.source_mismatch`, show `missingSources` and `extraSources`
 and correct the declaration to match `resolvedSources`; reducing H3 work cannot
 repair a dependency declaration.
@@ -617,17 +621,24 @@ PostGIS constructors. Use synchronous derived-layer commands first for normal
 jobs. For a known slow materialized create, replace, or refresh, add
 `--background`; the CLI polls the durable operation automatically. If its
 local wait expires, continue with `operations wait OPERATION_ID`; the server
-work was not cancelled. If a synchronous request times out or returns HTTP
-`5xx`, inspect `derived-layers list`, `derived-layers show`, and `catalog list`
-before retrying because the database action may have committed. Never
-automatically resubmit an ambiguous mutation.
+work was not cancelled. The CLI labels this observation
+`failurePhase: "operation-polling"`. If a synchronous request times out or
+returns an unclassified or malformed HTTP `5xx`, the CLI uses
+`failurePhase: "request-response"`: it cannot infer whether the server reached
+commit. A coherent server error containing `failurePhase` and either proven
+unchanged-state fields or `indeterminate: true` retains that server
+classification. Inspect `derived-layers list`, `derived-layers show`, and
+`catalog list` before retrying an ambiguous mutation; never resubmit it
+automatically.
 
 Expected background guard failures retain the same derived-layer code and
 guidance under `operation.error`. The CLI promotes the nested `userMessage` and
 stable code to its top-level structured error and retains `suggestedAction`,
 `reasons`, probe, and safe-state evidence under `details`. An unexpected
-`derived_layer.operation_failed` ends as `indeterminate`; because commit state
-may be uncertain, it deliberately has no `stateUnchanged` or `safeState`.
+`derived_layer.operation_failed` can be safely unchanged at `preflight` or
+after proven rollback. Commit, rollback-finalization, and result-reporting
+failures are `indeterminate` and omit `stateUnchanged` and `safeState`. Preserve
+the server phase under `operation.error`.
 
 When using lower-level H3 functions, PostgreSQL points are ordered
 `(longitude, latitude)`. For lines, grid traversal between segment endpoint

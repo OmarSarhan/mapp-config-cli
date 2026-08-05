@@ -300,7 +300,9 @@ replace, and refresh jobs are also durable operations and require `derive` to
 inspect. A late derived-layer reporting failure may follow a committed database
 transaction, so reconcile the operation, managed-layer registry, and catalog
 before retrying. `operations wait` defaults to a 120-second wait timeout and a
-one-second polling interval.
+one-second polling interval. A lost poll or local wait timeout returns
+`indeterminate: true`, `failurePhase: "operation-polling"`, the operation ID,
+and reconciliation commands with automatic retry disabled.
 
 ### `completion`
 
@@ -775,7 +777,12 @@ All three block both kinds and have no `recommendedKind`; never offer a view as
 an escape. The structured response includes `operation`, reason-specific
 actions, and, when known, `stateUnchanged: true` plus an operation-specific
 `safeState`. Present those fields instead of a generic cost or H3 message, and
-keep `technicalDetail` in optional diagnostics only.
+keep `technicalDetail` in optional diagnostics only. The closed
+`failurePhase` vocabulary distinguishes `preflight`, proven
+`database-transaction` rollback, uncertain `transaction-rollback` or
+`transaction-commit`, post-commit `result-reporting`, client-side
+`request-response` and `operation-polling`, and startup `service-recovery`.
+Only preflight and proven rollback may include unchanged-state fields.
 For `derived_layer.database_error`, that optional object is limited to bounded
 `sqlstate` and primary `message` fields; it never contains the SQL, PostgreSQL
 context, detail, or hint.
@@ -870,10 +877,12 @@ Some H3/PostGIS convenience wrappers assume a broader PostgreSQL search path
 than the derived-layer runner provides. Errors such as unresolved `geometry`
 types or `st_dump` functions can indicate wrapper resolution rather than a bad
 spatial idea. Prefer explicitly qualified PostGIS calls or lower-level H3 WKB
-boundary functions when that happens. A derived-layer mutation that returns a
-timeout or HTTP `5xx` is indeterminate: inspect `derived-layers list`,
+boundary functions when that happens. A derived-layer mutation that times out
+or returns an unclassified or malformed HTTP `5xx` is indeterminate with
+`failurePhase: "request-response"`: inspect `derived-layers list`,
 `derived-layers show NAME`, and `catalog list` before recreating, replacing,
-or dropping anything.
+or dropping anything. A coherent structured server failure retains its
+server-provided phase and unchanged or indeterminate state.
 
 Create, replace, and refresh are synchronous by default; use that path first
 for ordinary views and jobs expected to finish promptly. For a known slow
@@ -882,18 +891,21 @@ operation and polls it automatically. Background mode accepts
 `--wait-timeout` (default 1860 seconds) and `--interval` (default one second).
 Reaching the local wait timeout does not cancel database work; continue with
 the operation ID from the structured error using
-`config-cli operations wait OPERATION_ID`.
+`config-cli operations wait OPERATION_ID`. This error uses
+`failurePhase: "operation-polling"` and disables automatic retry.
 
 When a durable query or size guard rejects the work, the server stores the same
 structured envelope under `operation.error`. The CLI uses its safe
 `userMessage` and `derived_layer.*` code as the primary error and preserves its
 `suggestedAction`, reasons, probe, and state fields under `details`. An
-unexpected `derived_layer.operation_failed` is reported as `indeterminate` and
-has no unchanged-state claim; inspect the operation, managed layer, and catalog
-before retrying.
+unexpected `derived_layer.operation_failed` at preflight or after proven
+rollback can retain an unchanged-state claim. Commit, rollback-finalization,
+and reporting failures are `indeterminate`; inspect the operation, managed
+layer, and catalog before retrying.
 
-Do not blindly resend a synchronous request after a client timeout or HTTP
-`5xx`: it may have committed. Inspect `derived-layers list`,
+Do not blindly resend a synchronous request after a client timeout or an
+unclassified/malformed HTTP `5xx`: it may have committed. Inspect
+`derived-layers list`,
 `derived-layers show NAME`, and `catalog list` first. Use `--background` for a
 subsequent deliberate attempt only after confirming the original did not
 commit.
