@@ -6242,7 +6242,8 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     details={"missing": missing},
                     error_code="derived_layer.missing_input",
                 )
-            payload["confirmed"] = True
+            if args.action == "replace":
+                payload["confirmed"] = True
             if args.background:
                 payload["background"] = True
             result = _request_derived_mutation(

@@ -92,9 +92,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 - Preserved authoritative derived-mutation commit-state fields, distinguished
   request/response ambiguity from lost operation polling, and kept every
   indeterminate path non-retryable until its retained identity is reconciled.
-- Required `--confirm` for `derived-layers create` and forwarded the confirmed
-  mutation guard. Existing create automation must add the flag; it does not
-  replace separate user authorization for the database action.
+- Required `--confirm` for `derived-layers create` as a local command guard
+  without adding it to the server request. Existing create automation must add
+  the flag; it does not replace separate user authorization for the database
+  action.
 - Validated the bounded semantic delivery-blocker batch and its explicit
   `deliveryBlockersMore` continuation signal so an incomplete repair queue
   cannot be mistaken for a complete result.

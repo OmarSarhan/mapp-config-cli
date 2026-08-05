@@ -447,12 +447,25 @@ class CliTests(unittest.TestCase):
         self.assertIn("--confirm", failure["error"])
         self.assertEqual([], server.requests)
 
-    def test_derived_layer_create_forwards_definition(self):
+    def test_derived_layer_create_keeps_confirmation_local_for_closed_contract(self):
         captured = {}
         resolved_scope = map_extent_scope()
 
         def create(request):
             captured.update(request["body"])
+            allowed = {
+                "name", "kind", "query", "sources", "idColumn",
+                "geometryColumn", "description", "background", "spatialScope",
+            }
+            unknown = sorted(set(request["body"]) - allowed)
+            if unknown:
+                return 400, {
+                    "code": "derived_layer.invalid_request",
+                    "error": (
+                        "Unknown derived-layer properties: "
+                        + ", ".join(unknown)
+                    ),
+                }
             return 201, {"derivedLayer": {
                 "name": request["body"]["name"],
                 "kind": request["body"]["kind"],
@@ -482,7 +495,7 @@ class CliTests(unittest.TestCase):
                 "--confirm",
             ], store)
         self.assertEqual(code, 0, stderr)
-        self.assertIs(captured["confirmed"], True)
+        self.assertNotIn("confirmed", captured)
         self.assertEqual(captured["query"], query)
         self.assertEqual(captured["kind"], "materialized")
         self.assertNotIn("background", captured)
