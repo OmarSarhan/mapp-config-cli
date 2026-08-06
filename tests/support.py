@@ -153,6 +153,7 @@ def standard_routes(
                     "auth device",
                     "operations show",
                     "operations wait",
+                    "operations cancel",
                 ],
             },
         ),

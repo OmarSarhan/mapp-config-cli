@@ -99,7 +99,7 @@ dashboard.
 Agents can inspect deployed action schemas with `config-cli capabilities
 list`, correlate responses through `meta.requestId`, and inspect durable
 visual, reload, apply, and background derived-layer outcomes with `config-cli
-operations show|wait`. The server contract's exact command list and
+operations show|wait|cancel`. The server contract's exact command list and
 `/api/capabilities` action schemas are complementary runtime authorities; the
 CLI fails closed when either required declaration is absent instead of calling
 a familiar route directly.

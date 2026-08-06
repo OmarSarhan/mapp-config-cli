@@ -95,6 +95,7 @@ is not permission to bypass that gate.
 | `proposals preview-plan\|preview-test\|preview-screenshot` | Proposal-bound visual routes | `proposals.preview-plan`, `proposals.preview-test`, `proposals.preview-screenshot` | `visual` |
 | `xyz status\|reload` (`reload-xyz` alias) | `/api/xyz/status`, `/api/xyz/reload` | `xyz.reload` for reload | `inspect` or `reload` |
 | `operations show\|wait` | `/api/operations/{operationId}` | Originating operation kind | Same `visual`, `apply`, `reload`, or `derive` scope |
+| `operations cancel` | `/api/operations/{operationId}/cancel` | Background derived-layer create, replace, or refresh | `derive`; `--confirm` required |
 | `auth status\|device` | Auth identity and device start/poll routes | Command-advertised auth flow | Any authenticated credential for status; device verifies the current target before unauthenticated start/poll |
 | `semantic *` | `/api/semantic/*` | Matching `semantic.*` action | See [Semantic metadata](#semantic-metadata) |
 
@@ -285,22 +286,27 @@ config-cli capabilities show proposals.check
 Actions include stable IDs, risk classes, routes, input schemas, and operation
 kinds. Named CLI commands remain the only write interface.
 
-### `operations show|wait`
+### `operations show|wait|cancel`
 
 Inspect or wait for a durable operation:
 
 ```sh
 config-cli operations show OPERATION_ID
 config-cli operations wait OPERATION_ID --wait-timeout 120 --interval 1
+config-cli operations cancel OPERATION_ID --confirm --wait-timeout 120 --interval 1
 ```
 
-Terminal states are `succeeded`, `failed`, and `indeterminate`. Never blindly
-retry an indeterminate apply or reload. Background derived-layer create,
-replace, and refresh jobs are also durable operations and require `derive` to
-inspect. A late derived-layer reporting failure may follow a committed database
-transaction, so reconcile the operation, managed-layer registry, and catalog
-before retrying. `operations wait` defaults to a 120-second wait timeout and a
-one-second polling interval. A lost poll or local wait timeout returns
+Terminal states are `succeeded`, `failed`, `cancelled`, and `indeterminate`.
+Never blindly retry an indeterminate apply or reload. Background derived-layer
+create, replace, and refresh jobs are durable operations and require `derive`
+to inspect or cancel. Cancellation first reports nonterminal `cancelling`; the
+CLI returns success only after the server reports `cancelled`, proving the
+database transaction rolled back. If commit already won the race, cancellation
+fails and the original terminal result remains authoritative. A late
+derived-layer reporting failure may follow a committed database transaction,
+so reconcile the operation, managed-layer registry, and catalog before
+retrying. Wait and cancel default to a 120-second wait timeout and a one-second
+polling interval. A lost poll or local wait timeout returns
 `indeterminate: true`, `failurePhase: "operation-polling"`, the operation ID,
 and reconciliation commands with automatic retry disabled.
 

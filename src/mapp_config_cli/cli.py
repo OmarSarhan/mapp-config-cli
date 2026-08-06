@@ -827,6 +827,11 @@ def parser() -> JsonArgumentParser:
     operation_wait.add_argument("id")
     operation_wait.add_argument("--wait-timeout", type=float, default=120)
     operation_wait.add_argument("--interval", type=float, default=1)
+    operation_cancel = operation_actions.add_parser("cancel")
+    operation_cancel.add_argument("id")
+    operation_cancel.add_argument("--confirm", action="store_true", required=True)
+    operation_cancel.add_argument("--wait-timeout", type=float, default=120)
+    operation_cancel.add_argument("--interval", type=float, default=1)
 
     completion = commands.add_parser("completion", help="Generate shell completion.")
     completion.add_argument("shell", choices=("bash", "zsh", "fish"))
@@ -1809,7 +1814,7 @@ def _complete_background_operation(
         while True:
             status = operation.get("status")
             last_status = status
-            if status in {"succeeded", "failed", "indeterminate"}:
+            if status in {"succeeded", "failed", "cancelled", "indeterminate"}:
                 if status == "succeeded":
                     result = operation.get("result")
                     if not isinstance(result, dict):
@@ -1834,7 +1839,7 @@ def _complete_background_operation(
                         "operation and authoritative database state before retrying."
                     ),
                 )
-            if status != "running":
+            if status not in {"running", "cancelling"}:
                 invalid = _invalid_response(
                     "Background operation",
                     {"operationId": operation_id, "operation": operation},
@@ -5211,33 +5216,31 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
         return _with_context(result, context)
 
     if args.command == "operations":
-        if args.action == "wait":
-            if (
-                not math.isfinite(args.wait_timeout)
-                or args.wait_timeout <= 0
-                or not math.isfinite(args.interval)
-                or args.interval <= 0
-            ):
-                raise CliError(
-                    "Operation wait timeout and interval must be positive.",
-                    EXIT_USAGE,
-                    error_code="operation.invalid_wait",
-                )
+        if args.action in {"wait", "cancel"}:
+            _validate_background_wait(args.wait_timeout, args.interval)
             deadline = time.monotonic() + args.wait_timeout
+        result = None
+        if args.action == "cancel":
+            result = client.request(
+                f"/api/operations/{quote_segment(args.id)}/cancel",
+                method="POST",
+                payload={"confirmed": True},
+            )
         last_status: Any = "unknown"
         while True:
-            try:
-                result = client.request(
-                    f"/api/operations/{quote_segment(args.id)}"
-                )
-            except CliError as exc:
-                if args.action == "wait":
-                    raise _background_poll_error(
-                        args.id,
-                        last_status,
-                        cause=exc,
-                    ) from exc
-                raise
+            if result is None:
+                try:
+                    result = client.request(
+                        f"/api/operations/{quote_segment(args.id)}"
+                    )
+                except CliError as exc:
+                    if args.action in {"wait", "cancel"}:
+                        raise _background_poll_error(
+                            args.id,
+                            last_status,
+                            cause=exc,
+                        ) from exc
+                    raise
             operation = result.get("operation")
             if not isinstance(operation, dict) or not isinstance(operation.get("status"), str):
                 raise _invalid_response(
@@ -5247,7 +5250,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 )
             last_status = operation["status"]
             if args.action == "show" or operation["status"] in {
-                "succeeded", "failed", "indeterminate",
+                "succeeded", "failed", "cancelled", "indeterminate",
             }:
                 if args.action == "wait" and operation["status"] != "succeeded":
                     status = operation["status"]
@@ -5258,6 +5261,8 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                             EXIT_VISUAL
                             if status == "failed"
                             and "visual" in str(operation.get("kind", ""))
+                            else EXIT_CONFLICT
+                            if status == "cancelled"
                             else EXIT_CONNECTIVITY
                         ),
                         failed_message="Operation failed.",
@@ -5266,10 +5271,40 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                             "authoritative server state before recovery."
                         ),
                     )
+                if args.action == "cancel" and operation["status"] != "cancelled":
+                    if operation["status"] == "indeterminate":
+                        raise _terminal_operation_error(
+                            operation,
+                            details=result,
+                            failed_exit_code=EXIT_CONFLICT,
+                            failed_message="Operation could not be cancelled.",
+                            indeterminate_message=(
+                                "Cancellation is indeterminate; inspect authoritative "
+                                "server state before recovery."
+                            ),
+                        )
+                    raise CliError(
+                        "The operation reached a terminal state before cancellation was confirmed.",
+                        EXIT_CONFLICT,
+                        details=result,
+                        error_code="operation.cancel_not_applied",
+                    )
                 return _with_context(result, context)
+            if operation["status"] not in {"running", "cancelling"}:
+                raise _invalid_response(
+                    "Operation",
+                    result,
+                    error_code="operation.invalid_response",
+                )
             if time.monotonic() >= deadline:
+                message = (
+                    "Cancellation was requested, but the operation did not reach "
+                    "a terminal state before the local wait timeout."
+                    if args.action == "cancel"
+                    else "Operation did not reach a terminal state before the local wait timeout."
+                )
                 raise CliError(
-                    "Operation did not reach a terminal state before the local wait timeout.",
+                    message,
                     EXIT_CONNECTIVITY,
                     details={
                         "operationId": args.id,
@@ -5281,6 +5316,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     error_code="operation.wait_timeout",
                 )
             time.sleep(args.interval)
+            result = None
 
     if args.command == "doctor":
         actor, scopes = _auth_from_response(target.connection)

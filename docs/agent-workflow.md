@@ -622,7 +622,12 @@ jobs. For a known slow materialized create, replace, or refresh, add
 `--background`; the CLI polls the durable operation automatically. If its
 local wait expires, continue with `operations wait OPERATION_ID`; the server
 work was not cancelled. The CLI labels this observation
-`failurePhase: "operation-polling"`. If a synchronous request times out or
+`failurePhase: "operation-polling"`. To stop a background derived create,
+replace, or refresh, run
+`operations cancel OPERATION_ID --confirm`. The command waits for server status
+`cancelled`, which is recorded only after PostgreSQL rolls back; `cancelling`
+alone is not proof that the database work stopped. If a synchronous request
+times out or
 returns an unclassified or malformed HTTP `5xx`, the CLI uses
 `failurePhase: "request-response"`: it cannot infer whether the server reached
 commit. A coherent server error containing `failurePhase` and either proven

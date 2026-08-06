@@ -5318,6 +5318,71 @@ class CliTests(unittest.TestCase):
             json.loads(stderr)["code"],
         )
 
+    def test_operation_cancel_waits_for_confirmed_database_rollback(self):
+        routes = standard_routes()
+        routes[("POST", "/api/operations/op-cancel/cancel")] = (
+            202,
+            {"operation": {
+                "id": "op-cancel",
+                "kind": "derived-layer.create",
+                "status": "cancelling",
+            }},
+        )
+        routes[("GET", "/api/operations/op-cancel")] = (
+            200,
+            {"operation": {
+                "id": "op-cancel",
+                "kind": "derived-layer.create",
+                "status": "cancelled",
+                "error": {
+                    "code": "derived_layer.cancelled",
+                    "stateUnchanged": True,
+                    "rolledBack": True,
+                },
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch("mapp_config_cli.cli.time.sleep"):
+                code, stdout, stderr = self.invoke(
+                    ["operations", "cancel", "op-cancel", "--confirm"],
+                    store,
+                )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("", stderr)
+        self.assertEqual("cancelled", json.loads(stdout)["operation"]["status"])
+        cancel_request = next(
+            request for request in server.requests
+            if request["method"] == "POST"
+        )
+        self.assertEqual({"confirmed": True}, cancel_request["body"])
+
+    def test_operation_wait_reports_cancelled_as_conflict(self):
+        routes = standard_routes()
+        routes[("GET", "/api/operations/op-cancelled")] = (
+            200,
+            {"operation": {
+                "id": "op-cancelled",
+                "kind": "derived-layer.refresh",
+                "status": "cancelled",
+                "error": {
+                    "code": "derived_layer.cancelled",
+                    "userMessage": "Derived-layer refresh was cancelled and rolled back.",
+                },
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["operations", "wait", "op-cancelled"],
+                store,
+            )
+
+        self.assertEqual(EXIT_CONFLICT, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("derived_layer.cancelled", json.loads(stderr)["code"])
+
     def test_operation_wait_poll_failure_retains_operation_identity(self):
         routes = standard_routes()
         routes[("GET", "/api/operations/op-lost")] = (
