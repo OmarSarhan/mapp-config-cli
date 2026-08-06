@@ -758,6 +758,15 @@ On API/contract 1.3 it includes ordered AST/catalog/EXPLAIN `stages`,
 `shapeLimits`, plan `limits`, H3 bounds, and the stable `errorCategories`
 mapping; the CLI validates that closed shape while still accepting the earlier
 compatible 1.x guard shape.
+When the server advertises `h3Readiness`, the CLI also validates its closed
+catalog-and-execution result and its consistency with `h3Available`. A failed
+result includes one bounded stage-specific reason and `suggestedAction`.
+Create and replace inspect this fresh readiness immediately before submitting a
+query that invokes an H3 function; an unavailable result stops locally and no
+mutation request is sent. Queries that merely read an `h3_id` column or an
+existing H3-derived relation do not require H3 function readiness. Earlier
+servers without `h3Readiness` remain compatible; their boolean `h3Available`,
+when present, is still authoritative.
 Before any create or replacement, and before a materialized refresh, the server
 runs non-writing PostgreSQL `EXPLAIN` over the exact scoped query and recursively
 checks total cost, final and intermediate rows, intermediate bytes, join

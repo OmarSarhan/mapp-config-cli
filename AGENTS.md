@@ -365,6 +365,14 @@ actual-stage failure populated and indexed inside a transaction before
 or WAL growth. Ask before changing kind because a view shifts cost to reads and
 is not an automatic substitute for the requested stored result.
 
+For a create or replace query that invokes an H3 function, preserve the fresh
+`h3Readiness` result checked by the CLI. If it reports
+`derived_layer.h3_not_ready`, no mutation was submitted; present its `stage`,
+reason `message`, and `suggestedAction`, repair the reported deployment issue,
+then retry so readiness is checked again. Do not treat an `h3_id` column name or
+an existing H3-derived source as an H3 function invocation, and do not block
+non-H3 derived work solely because H3 is unavailable.
+
 For H3-derived relations, generate polygon candidates directly from the
 server-supplied `_mapp_h3_scope.geom_4326` with a literal resolution. Bounded
 literal grid traversal, non-expanding index/parent/boundary functions, and

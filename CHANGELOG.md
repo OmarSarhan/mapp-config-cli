@@ -8,6 +8,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- H3 derived-layer create and replace now validate fresh server readiness before
+  mutation, preserve bounded stage-specific remediation when unavailable, and
+  avoid blocking queries that do not invoke H3 functions.
+
 ### Added
 
 - Live and proposal evidence controls for required hover-tooltip and

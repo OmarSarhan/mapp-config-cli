@@ -1580,6 +1580,154 @@ def _has_authoritative_derived_failure(error: CliError) -> bool:
     )
 
 
+def _skip_sql_comment(query: str, index: int) -> int:
+    if query.startswith("--", index):
+        newline = query.find("\n", index + 2)
+        return len(query) if newline == -1 else newline + 1
+    if not query.startswith("/*", index):
+        return index
+    depth = 1
+    index += 2
+    while index < len(query) and depth:
+        if query.startswith("/*", index):
+            depth += 1
+            index += 2
+        elif query.startswith("*/", index):
+            depth -= 1
+            index += 2
+        else:
+            index += 1
+    return index
+
+
+def _next_sql_token_is_call(query: str, index: int) -> bool:
+    while index < len(query):
+        if query[index].isspace():
+            index += 1
+        elif query.startswith("--", index) or query.startswith("/*", index):
+            index = _skip_sql_comment(query, index)
+        else:
+            return query[index] == "("
+    return False
+
+
+def _sql_string_uses_backslash_escapes(query: str, quote_index: int) -> bool:
+    prefix_index = quote_index - 1
+    return (
+        prefix_index >= 0
+        and query[prefix_index] in {"e", "E"}
+        and (
+            prefix_index == 0
+            or not (
+                query[prefix_index - 1].isalnum()
+                or query[prefix_index - 1] in {"_", "$"}
+            )
+        )
+    )
+
+
+def _query_invokes_h3(query: str) -> bool:
+    """Recognize H3 function calls without interpreting general SQL."""
+    index = 0
+    while index < len(query):
+        if query.startswith("--", index) or query.startswith("/*", index):
+            index = _skip_sql_comment(query, index)
+            continue
+        character = query[index]
+        if character == "'":
+            backslash_escapes = _sql_string_uses_backslash_escapes(
+                query,
+                index,
+            )
+            index += 1
+            while index < len(query):
+                if backslash_escapes and query[index] == "\\":
+                    index = min(len(query), index + 2)
+                elif query[index] != "'":
+                    index += 1
+                elif index + 1 < len(query) and query[index + 1] == "'":
+                    index += 2
+                else:
+                    index += 1
+                    break
+            continue
+        if character == "$":
+            delimiter_end = index + 1
+            while (
+                delimiter_end < len(query)
+                and (
+                    query[delimiter_end].isalnum()
+                    or query[delimiter_end] == "_"
+                )
+            ):
+                delimiter_end += 1
+            if delimiter_end < len(query) and query[delimiter_end] == "$":
+                delimiter = query[index:delimiter_end + 1]
+                closing = query.find(delimiter, delimiter_end + 1)
+                index = len(query) if closing == -1 else closing + len(delimiter)
+                continue
+        if character == '"':
+            identifier = []
+            index += 1
+            while index < len(query):
+                if query[index] != '"':
+                    identifier.append(query[index])
+                    index += 1
+                elif index + 1 < len(query) and query[index + 1] == '"':
+                    identifier.append('"')
+                    index += 2
+                else:
+                    index += 1
+                    break
+            if (
+                "".join(identifier).casefold().startswith("h3_")
+                and _next_sql_token_is_call(query, index)
+            ):
+                return True
+            continue
+        if character.isalpha() or character == "_":
+            start = index
+            index += 1
+            while index < len(query) and (
+                query[index].isalnum()
+                or query[index] in {"_", "$"}
+            ):
+                index += 1
+            if (
+                query[start:index].casefold().startswith("h3_")
+                and _next_sql_token_is_call(query, index)
+            ):
+                return True
+            continue
+        index += 1
+    return False
+
+
+def _require_h3_ready(client: ApiClient) -> None:
+    capabilities = _derived_capabilities(
+        client.request("/api/derived-layers/capabilities")
+    )
+    readiness = capabilities.get("h3Readiness")
+    if isinstance(readiness, dict) and readiness["ready"] is False:
+        reason = readiness["reasons"][0]
+        raise CliError(
+            reason["message"],
+            EXIT_VALIDATION,
+            details={
+                "stage": readiness["stage"],
+                "reasons": readiness["reasons"],
+            },
+            error_code=readiness["code"],
+        )
+    if readiness is None and capabilities.get("h3Available") is False:
+        raise CliError(
+            "The server reports that H3 derived-layer support is unavailable.",
+            EXIT_VALIDATION,
+            details={"h3Available": False},
+            error_code="derived_layer.h3_not_ready",
+        )
+
+
 def _request_derived_mutation(
     client: ApiClient,
     path: str,
@@ -2944,6 +3092,16 @@ _QUERY_GUARD_ERROR_CATEGORIES = {
         "httpStatus": 409,
     },
 }
+_H3_READINESS_METHOD = "postgresql-catalog-and-execution"
+_H3_READINESS_FAILURES = {
+    "extension-discovery": {"derived_layers_unconfigured", "missing_extensions"},
+    "version-validation": {"unsupported_extension_versions"},
+    "catalog-resolution": {"wrapper_not_found"},
+    "routine-policy": {"wrapper_not_approved"},
+    "nested-dependency-resolution": {"wrapper_dependencies_unresolved"},
+    "execution-probe": {"execution_probe_failed"},
+    "result-validation": {"invalid_probe_result"},
+}
 _QUERY_PLAN_H3_EXPANSION_KEYS = {
     "polygonToCellsCalls",
     "resolutions",
@@ -2958,6 +3116,98 @@ _QUERY_PLAN_H3_EXPANSION_KEYS = {
     "estimatedExpandedCells",
     "maxEstimatedExpandedCells",
 }
+
+
+def _h3_readiness(
+    value: Any,
+    *,
+    available: Any,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or not isinstance(available, bool):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    if value.get("ready") is True:
+        valid = (
+            set(value) == {"method", "ready"}
+            and value.get("method") == _H3_READINESS_METHOD
+            and available is True
+        )
+    else:
+        stage = value.get("stage")
+        reasons = value.get("reasons")
+        reason = reasons[0] if isinstance(reasons, list) and len(reasons) == 1 else None
+        valid = (
+            set(value) == {"method", "ready", "code", "stage", "reasons"}
+            and value.get("method") == _H3_READINESS_METHOD
+            and value.get("ready") is False
+            and available is False
+            and value.get("code") == "derived_layer.h3_not_ready"
+            and stage in _H3_READINESS_FAILURES
+            and isinstance(reason, dict)
+            and set(reason) == {"code", "message", "suggestedAction"}
+            and reason.get("code") in _H3_READINESS_FAILURES.get(stage, set())
+            and all(
+                isinstance(reason.get(key), str)
+                and reason[key] == reason[key].strip()
+                and 1 <= len(reason[key]) <= 1000
+                for key in ("message", "suggestedAction")
+            )
+        )
+    if not valid:
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
+def _derived_capabilities(
+    data: dict[str, Any],
+    *,
+    label: str = "Derived-layer capabilities",
+) -> dict[str, Any]:
+    if (
+        not isinstance(data.get("configured"), bool)
+        or not isinstance(data.get("schema"), str)
+        or not isinstance(data.get("kinds"), list)
+        or (
+            "h3Available" in data
+            and not isinstance(data["h3Available"], bool)
+        )
+        or (
+            "h3Readiness" in data
+            and "h3Available" not in data
+        )
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    if "h3Readiness" in data:
+        _h3_readiness(
+            data["h3Readiness"],
+            available=data["h3Available"],
+            data=data,
+            label=label,
+        )
+    if "materializationGuard" in data:
+        _materialization_guard(
+            data["materializationGuard"],
+            data=data,
+            label=label,
+        )
+    if "queryGuard" in data:
+        _query_guard(data["queryGuard"], data=data, label=label)
+    return data
+
+
 _QUERY_PLAN_PROBE_KEYS = {
     "method",
     "estimatedTotalCost",
@@ -6127,29 +6377,9 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
     if args.command == "derived-layers":
         base = "/api/derived-layers"
         if args.action == "capabilities":
-            result = client.request(f"{base}/capabilities")
-            if (
-                not isinstance(result.get("configured"), bool)
-                or not isinstance(result.get("schema"), str)
-                or not isinstance(result.get("kinds"), list)
-            ):
-                raise _invalid_response(
-                    "Derived-layer capabilities",
-                    result,
-                    error_code="derived_layer.invalid_response",
-                )
-            if "materializationGuard" in result:
-                _materialization_guard(
-                    result["materializationGuard"],
-                    data=result,
-                    label="Derived-layer capabilities",
-                )
-            if "queryGuard" in result:
-                _query_guard(
-                    result["queryGuard"],
-                    data=result,
-                    label="Derived-layer capabilities",
-                )
+            result = _derived_capabilities(
+                client.request(f"{base}/capabilities")
+            )
         elif args.action == "list":
             result = client.request(base)
             if not isinstance(result.get("derivedLayers"), list):
@@ -6242,6 +6472,11 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     details={"missing": missing},
                     error_code="derived_layer.missing_input",
                 )
+            if (
+                isinstance(payload.get("query"), str)
+                and _query_invokes_h3(payload["query"])
+            ):
+                _require_h3_ready(client)
             if args.action == "replace":
                 payload["confirmed"] = True
             if args.background:

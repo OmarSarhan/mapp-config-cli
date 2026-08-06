@@ -14,6 +14,7 @@ from mapp_config_cli.cli import (
     MAX_LOCAL_FILE_BYTES,
     MAX_VISUAL_ARTIFACTS,
     _canonical_json_equal,
+    _query_invokes_h3,
     _strict_json_file,
     _validate_requested_visual_evidence,
     input_object,
@@ -179,6 +180,20 @@ def query_plan_probe() -> dict:
             "maxEstimatedExpandedCells": 10_000_000,
         },
         "limits": query_plan_limits(),
+    }
+
+
+def h3_readiness_failure() -> dict:
+    return {
+        "method": "postgresql-catalog-and-execution",
+        "ready": False,
+        "code": "derived_layer.h3_not_ready",
+        "stage": "routine-policy",
+        "reasons": [{
+            "code": "wrapper_not_approved",
+            "message": "The approved H3 wrapper is not safely configured.",
+            "suggestedAction": "Run the derived-layer database upgrade.",
+        }],
     }
 
 
@@ -518,6 +533,175 @@ class CliTests(unittest.TestCase):
             query_plan_probe(),
         )
 
+    def test_h3_query_detector_ignores_literals_comments_and_column_names(self):
+        for query in (
+            "SELECT h3_id FROM cells",
+            "SELECT 'h3_polygon_to_cells(geom, 9)'",
+            'SELECT "h3_polygon_to_cells" FROM metadata',
+            "SELECT 1 -- h3_polygon_to_cells(geom, 9)\n",
+            "SELECT 1 /* h3_polygon_to_cells(geom, 9) */",
+            "SELECT $$h3_polygon_to_cells(geom, 9)$$",
+            "SELECT E'ignored\\' h3_polygon_to_cells(geom, 9)'",
+        ):
+            with self.subTest(query=query):
+                self.assertFalse(_query_invokes_h3(query))
+        for query in (
+            "SELECT h3_polygon_to_cells(geom, 9)",
+            "SELECT public.h3_cell_to_boundary_wkb(cell)",
+            'SELECT "public"."h3_polygon_to_cells"(geom, 9)',
+            "SELECT h3_grid_disk /* bounded */ (cell, 1)",
+        ):
+            with self.subTest(query=query):
+                self.assertTrue(_query_invokes_h3(query))
+
+    def test_derived_h3_create_refuses_not_ready_before_mutation(self):
+        readiness = h3_readiness_failure()
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (200, {
+            "configured": True,
+            "schema": "derived_layers",
+            "kinds": ["view", "materialized"],
+            "h3Available": False,
+            "h3Readiness": readiness,
+        })
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT h3_polygon_to_cells(geom, 9) AS h3_id, geom FROM source",
+                encoding="utf-8",
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "h3_cells",
+                "--query-file", str(query_file),
+                "--source", "source",
+                "--id-column", "h3_id",
+                "--geometry-column", "geom",
+                "--confirm",
+            ], store)
+            mutation_requests = [
+                request for request in server.requests
+                if request["method"] == "POST"
+            ]
+
+        self.assertEqual(EXIT_VALIDATION, code)
+        self.assertEqual("", stdout)
+        failure = json.loads(stderr)
+        self.assertEqual("derived_layer.h3_not_ready", failure["code"])
+        self.assertEqual("routine-policy", failure["details"]["stage"])
+        self.assertEqual(readiness["reasons"], failure["details"]["reasons"])
+        self.assertEqual([], mutation_requests)
+
+    def test_derived_non_h3_create_does_not_require_h3_readiness(self):
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (200, {
+            "configured": True,
+            "schema": "derived_layers",
+            "kinds": ["view", "materialized"],
+            "h3Available": False,
+            "h3Readiness": h3_readiness_failure(),
+        })
+        routes[("POST", "/api/derived-layers")] = (201, {
+            "derivedLayer": {
+                "name": "plain_cells",
+                "kind": "view",
+                "spatialScope": map_extent_scope(),
+                "queryPlanProbe": query_plan_probe(),
+            },
+        })
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT h3_id, geom FROM existing_cells",
+                encoding="utf-8",
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "plain_cells",
+                "--kind", "view",
+                "--query-file", str(query_file),
+                "--source", "existing_cells",
+                "--id-column", "h3_id",
+                "--geometry-column", "geom",
+                "--confirm",
+            ], store)
+            capability_requests = [
+                request for request in server.requests
+                if request["path"] == "/api/derived-layers/capabilities"
+            ]
+            mutation_requests = [
+                request for request in server.requests
+                if request["method"] == "POST"
+            ]
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("plain_cells", json.loads(stdout)["derivedLayer"]["name"])
+        self.assertEqual([], capability_requests)
+        self.assertEqual(1, len(mutation_requests))
+
+    def test_derived_h3_create_rechecks_readiness_after_repair(self):
+        checks = 0
+
+        def capabilities(_request):
+            nonlocal checks
+            checks += 1
+            if checks == 1:
+                return 200, {
+                    "configured": True,
+                    "schema": "derived_layers",
+                    "kinds": ["view", "materialized"],
+                    "h3Available": False,
+                    "h3Readiness": h3_readiness_failure(),
+                }
+            return 200, {
+                "configured": True,
+                "schema": "derived_layers",
+                "kinds": ["view", "materialized"],
+                "h3Available": True,
+                "h3Readiness": {
+                    "method": "postgresql-catalog-and-execution",
+                    "ready": True,
+                },
+            }
+
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = capabilities
+        routes[("POST", "/api/derived-layers")] = (201, {
+            "derivedLayer": {
+                "name": "h3_cells",
+                "kind": "view",
+                "spatialScope": map_extent_scope(),
+                "queryPlanProbe": query_plan_probe(),
+            },
+        })
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT h3_polygon_to_cells(geom, 9) AS h3_id, geom FROM source",
+                encoding="utf-8",
+            )
+            store = self.configured_store(directory, server.endpoint)
+            command = [
+                "derived-layers", "create", "h3_cells",
+                "--kind", "view",
+                "--query-file", str(query_file),
+                "--source", "source",
+                "--id-column", "h3_id",
+                "--geometry-column", "geom",
+                "--confirm",
+            ]
+            first = self.invoke(command, store)
+            second = self.invoke(command, store)
+            mutation_requests = [
+                request for request in server.requests
+                if request["method"] == "POST"
+            ]
+
+        self.assertEqual(EXIT_VALIDATION, first[0])
+        self.assertEqual(0, second[0], second[2])
+        self.assertEqual(2, checks)
+        self.assertEqual(1, len(mutation_requests))
+
     def test_derived_query_file_rejects_oversize_and_symlink_inputs(self):
         routes = standard_routes()
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
@@ -595,6 +779,88 @@ class CliTests(unittest.TestCase):
             query_guard(),
             json.loads(stdout)["queryGuard"],
         )
+
+    def test_derived_layer_capabilities_surface_h3_readiness_diagnostics(self):
+        readiness = h3_readiness_failure()
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (200, {
+            "configured": True,
+            "schema": "derived_layers",
+            "kinds": ["view", "materialized"],
+            "h3Available": False,
+            "h3Readiness": readiness,
+        })
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "capabilities"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        payload = json.loads(stdout)
+        self.assertFalse(payload["h3Available"])
+        self.assertEqual(readiness, payload["h3Readiness"])
+
+    def test_derived_layer_capabilities_reject_malformed_h3_readiness(self):
+        mismatched = h3_readiness_failure()
+        wrong_reason = h3_readiness_failure()
+        wrong_reason["reasons"][0]["code"] = "execution_probe_failed"
+        unknown_field = h3_readiness_failure()
+        unknown_field["future"] = True
+        success_with_failure_fields = {
+            "method": "postgresql-catalog-and-execution",
+            "ready": True,
+            "code": "derived_layer.h3_not_ready",
+        }
+
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            results = []
+            for available, readiness in (
+                (True, mismatched),
+                (False, wrong_reason),
+                (False, unknown_field),
+                (True, success_with_failure_fields),
+            ):
+                routes[("GET", "/api/derived-layers/capabilities")] = (200, {
+                    "configured": True,
+                    "schema": "derived_layers",
+                    "kinds": ["view", "materialized"],
+                    "h3Available": available,
+                    "h3Readiness": readiness,
+                })
+                results.append(self.invoke(
+                    ["derived-layers", "capabilities"],
+                    store,
+                ))
+
+        for code, stdout, stderr in results:
+            self.assertEqual(EXIT_CONNECTIVITY, code)
+            self.assertEqual("", stdout)
+            self.assertEqual(
+                "derived_layer.invalid_response",
+                json.loads(stderr)["code"],
+            )
+
+    def test_derived_layer_capabilities_accept_legacy_h3_available(self):
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (200, {
+            "configured": True,
+            "schema": "derived_layers",
+            "kinds": ["view", "materialized"],
+            "h3Available": False,
+        })
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "capabilities"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertFalse(json.loads(stdout)["h3Available"])
 
     def test_derived_layer_capabilities_validate_hardened_query_guard(self):
         invalid_stages = query_guard()
