@@ -1,4 +1,10 @@
-WITH source_areas AS (
+WITH national_totals AS MATERIALIZED (
+  SELECT
+    SUM(COALESCE(ts018_0004, 0.0))::double precision AS national_arrived_age_0_4,
+    SUM(COALESCE(ts018_0001, 0.0))::double precision AS national_total_population
+  FROM leeds.census_2021_england_oa
+),
+source_areas AS NOT MATERIALIZED (
   SELECT
     oa.ts018_0004,
     oa.ts018_0001,
@@ -23,19 +29,19 @@ scope_cells AS (
 cells AS (
   SELECT
     scope_cells.h3_id,
-    public.ST_GeomFromWKB(
-      h3_cell_to_boundary_wkb(scope_cells.h3_id), 4326
+    h3_cell_to_boundary_geometry(
+      scope_cells.h3_id
     )::public.geometry(Polygon, 4326) AS geom_4326
   FROM scope_cells
 ),
-projected_cells AS (
+projected_cells AS MATERIALIZED (
   SELECT
     h3_id,
     geom_4326,
     public.ST_Transform(geom_4326, 27700) AS geom_27700
   FROM cells
 ),
-cell_overlaps AS (
+cell_overlaps AS MATERIALIZED (
   SELECT
     cell.h3_id,
     cell.geom_4326,
@@ -47,7 +53,8 @@ cell_overlaps AS (
     source.area_m2
   FROM projected_cells AS cell
   JOIN source_areas AS source
-    ON public.ST_Intersects(source.geom_27700, cell.geom_27700)
+    ON source.geom_27700 && cell.geom_27700
+   AND public.ST_Intersects(source.geom_27700, cell.geom_27700)
 ),
 weighted AS (
   SELECT
@@ -69,15 +76,10 @@ metrics AS (
     weighted.*,
     100.0 * weighted.arrived_age_0_4 /
       NULLIF(weighted.total_population, 0.0) AS local_percent,
-    100.0 *
-      (SELECT SUM(COALESCE(ts018_0004, 0.0))
-       FROM leeds.census_2021_england_oa) /
-      NULLIF(
-        (SELECT SUM(COALESCE(ts018_0001, 0.0))
-         FROM leeds.census_2021_england_oa),
-        0.0
-      ) AS national_average_percent
+    100.0 * national.national_arrived_age_0_4 /
+      NULLIF(national.national_total_population, 0.0) AS national_average_percent
   FROM weighted
+  CROSS JOIN national_totals AS national
 )
 SELECT
   h3_id::text AS h3_id,
