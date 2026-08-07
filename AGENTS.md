@@ -350,7 +350,23 @@ Inspect `derived-layers capabilities` before all derived work. The universal
 `queryGuard` advertises ordered AST/catalog/EXPLAIN stages, shape limits, H3
 expansion, recursive PostgreSQL plan limits, and error categories for ordinary
 and materialized views; preserve the accepted
-`derivedLayer.queryPlanProbe`. `derived_layer.query_too_expensive` must not offer
+`derivedLayer.queryPlanProbe`. When capabilities also advertise
+`queryPlanning` version `1`, preserve the successful
+`derivedLayer.queryPlanningProbe`. A compute rejection with reason
+`nested_loop_pair_work` and valid over-limit planning evidence receives
+additive `details.clientGuidance` from the CLI. Present the server's unchanged
+message, action, reasons, and probe first, then use that client guidance to
+rewrite the query: perform the selective candidate match on a native geometry
+or the exact prepared transform expression before materializing joined rows;
+aggregate pair-local metrics only after that match; compute compatible
+complete-input totals together in a single one-row aggregate referenced after the
+selective aggregation; preserve row-dependent window semantics; compute
+transformations, intersections, and areas once at that narrowed stage; and resubmit the revised definition so
+server preflight runs again. Do not
+automatically rewrite SQL. Preserve complete-input totals and the exact spatial
+acceptance predicate while reducing work.
+
+`derived_layer.query_too_expensive` must not offer
 or recommend a view—rewrite the query or reduce H3/intermediate work. Keep it
 distinct from `derived_layer.query_invalid` (fix malformed/non-SELECT SQL) and
 `derived_layer.query_not_allowed` (remove or replace the prohibited SQL or
@@ -385,10 +401,23 @@ the complete declared point source unless the requested meaning explicitly
 limits it to the saved map area. On restricted server search
 paths, higher-level H3/PostGIS convenience wrappers may fail to resolve
 geometry or PostGIS helper types; prefer SQL that explicitly qualifies PostGIS
-functions or uses lower-level H3 boundary output converted with qualified
-PostGIS constructors. If a derived-layer create or refresh reports HTTP `5xx`,
+functions and uses the extension's geometry-native boundary function, such as
+`h3_cell_to_boundary_geometry(cell)`. If
+`h3_cell_to_boundary_wkb(cell)` is unavoidable on the pinned extension, use
+`ST_GeomFromEWKB(...)`, not `ST_GeomFromWKB(..., 4326)`. The latter expects OGC
+WKB but receives EWKB, emitting one warning per evaluated/generated cell and
+potentially flooding PostgreSQL logs. If a derived-layer create or refresh
+reports HTTP `5xx`,
 inspect `derived-layers list|show` and the catalog before retrying because the
 database relation may already have committed.
+
+For UK metric area weighting, the bundled platform prepares the exact
+`ST_Transform(source.geom, 27700)` GiST expression. Put that expression in the
+selective `&&`/`ST_Intersects` candidate predicate before materializing matched
+pairs; a materialized CTE containing all transformed source rows hides the
+expression index. Transform each generated cell once, compute intersection and
+source areas once for accepted pairs, then aggregate pair-local metrics. Keep
+complete-input benchmarks in a separate one-row aggregate attached afterward.
 
 Lower-level H3 point input uses PostgreSQL point order `(longitude, latitude)`.
 When line-to-cell generation is required, segment endpoint traversal plus a

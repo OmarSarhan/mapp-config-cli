@@ -559,7 +559,9 @@ PostgreSQL plan plus SQL-shape and H3-expansion bounds for both ordinary and
 materialized views. It exposes ordered AST/catalog/EXPLAIN `stages`,
 `shapeLimits`, plan `limits`, H3 bounds, and `errorCategories`; the CLI validates
 the complete hardened shape. Preserve the successful
-`derivedLayer.queryPlanProbe` in the review packet. Treat the server's failure
+`derivedLayer.queryPlanProbe` in the review packet. If capabilities include the
+optional `queryPlanning` version `1` contract, also preserve the successful
+`derivedLayer.queryPlanningProbe`. Treat the server's failure
 taxonomy literally:
 
 - `derived_layer.query_invalid` (HTTP 400, `category: "invalid"`) means the
@@ -585,6 +587,21 @@ Keep `technicalDetail` out of the primary notification.
 For `derived_layer.source_mismatch`, show `missingSources` and `extraSources`
 and correct the declaration to match `resolvedSources`; reducing H3 work cannot
 repair a dependency declaration.
+
+For `derived_layer.query_too_expensive` reason `nested_loop_pair_work`, a valid
+over-limit `queryPlanningProbe` lets the CLI add
+`details.clientGuidance` without changing the server error. Use its generic
+authoring steps: perform the selective candidate match on a native geometry or
+the exact prepared transform expression before materializing joined rows;
+aggregate pair-local metrics after that match; compute compatible complete-input
+global totals together in a single one-row aggregate referenced after the selective
+aggregation while preserving row-dependent window semantics; compute
+transformations, intersections, and areas once at that narrowed stage rather
+than relying on an inline CTE alias; and resubmit the revised
+definition so preflight runs again. Never auto-rewrite the SQL or change its
+meaning merely to pass admission. Preserve totals intended for the complete
+declared input and retain the exact spatial predicate that turns generated
+candidates into accepted results.
 
 Before asking to materialize, also inspect `materializationGuard`. It blocks
 materialized create, conversion, and refresh when estimated stored bytes exceed
@@ -613,12 +630,25 @@ follow that with an exact `ST_Intersects` or other reviewed predicate against
 the complete original source geometry so the derived table semantics are clear.
 Do not substitute a subset when a layer-wide aggregate must use complete input.
 
+For UK metric area weighting, the bundled platform prepares the exact
+`ST_Transform(source.geom, 27700)` GiST expression. Put that expression in the
+selective `&&`/`ST_Intersects` candidate predicate before materializing matched
+pairs; a materialized CTE containing all transformed source rows hides the
+expression index. Transform each generated cell once, compute intersection and
+source areas once for accepted pairs, then aggregate pair-local metrics. Keep
+complete-input benchmarks in a separate one-row aggregate attached afterward.
+
 Restricted server search paths can expose extension-wrapper assumptions. If a
 higher-level H3/PostGIS wrapper fails with missing `geometry`, `st_dump`, or
 similar function/type resolution errors, rewrite the query to explicitly
-qualify PostGIS functions or use lower-level H3 boundary output plus qualified
-PostGIS constructors. Use synchronous derived-layer commands first for normal
-jobs. For a known slow materialized create, replace, or refresh, add
+qualify PostGIS functions and use the extension's geometry-native boundary
+function, `h3_cell_to_boundary_geometry(cell)`. If
+`h3_cell_to_boundary_wkb(cell)` is unavoidable on the pinned extension, pass
+its EWKB result to `ST_GeomFromEWKB(...)`, not
+`ST_GeomFromWKB(..., 4326)`. The mismatch emits one warning per
+evaluated/generated cell and can flood PostgreSQL logs. Use synchronous
+derived-layer commands first for normal jobs. For a known slow materialized
+create, replace, or refresh, add
 `--background`; the CLI polls the durable operation automatically. If its
 local wait expires, continue with `operations wait OPERATION_ID`; the server
 work was not cancelled. The CLI labels this observation

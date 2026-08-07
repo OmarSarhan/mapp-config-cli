@@ -42,6 +42,15 @@ legacy collection threshold. Then deploy the semantic service and matching
 paginating dashboard and is not split into separate dashboard and API release
 steps.
 
+Derived-layer capabilities may include an additive top-level `queryPlanning`
+version `1` object, and successful mutations may include the sibling
+`derivedLayer.queryPlanningProbe`. These do not extend the closed legacy
+`queryGuard` or `queryPlanProbe` objects, so older API-1.x clients can continue
+to consume those existing shapes. This CLI validates the optional siblings
+when present and adds its own bounded authoring guidance only for a recognized
+over-limit `nested_loop_pair_work` failure. Server messages, actions, reasons,
+and probes remain unchanged and authoritative.
+
 Until the first stable CLI release, minor `0.x` releases may contain breaking
 client-side changes. Review the changelog before upgrading.
 
