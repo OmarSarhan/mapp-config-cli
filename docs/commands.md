@@ -801,6 +801,11 @@ Only preflight and proven rollback may include unchanged-state fields.
 For `derived_layer.database_error`, that optional object is limited to bounded
 `sqlstate` and primary `message` fields; it never contains the SQL, PostgreSQL
 context, detail, or hint.
+`derived_layer.database_contention` instead reports a proven-safe HTTP `409`
+conflict. Its `contentionScope` distinguishes the global `derived-mutation`
+admission lock from a `postgresql-lock` outside that admission boundary, and
+`retryable: true` means only that the same reviewed request may be retried
+manually after the blocker clears. It never authorizes an automatic retry.
 A `derived_layer.source_mismatch` response separately exposes
 `declaredSources`, `resolvedSources`, `missingSources`, and `extraSources`; make
 those two lists match instead of treating the failure as query cost.

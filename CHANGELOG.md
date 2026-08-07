@@ -10,6 +10,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Documented and regression-tested preservation of server-classified
+  derived-database contention as a conflict, including its retryable flag,
+  closed contention scope, corrective guidance, and authoritative rollback
+  state.
 - H3 derived-layer create and replace now validate fresh server readiness before
   mutation, preserve bounded stage-specific remediation when unavailable, and
   avoid blocking queries that do not invoke H3 functions.
