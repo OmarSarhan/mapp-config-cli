@@ -344,12 +344,15 @@ Every derived-layer create or replace is map-bounded. Preview
 `derived-layers map-extent` and pass the same optional `--locale` directly to
 `create` or `replace`. The retained `--map-extent` flag is accepted for older
 automation but does not change this mandatory scope. The server resolves it
-around the locale's configured centre, using a 1920x1080 viewport at one zoom
-level wider (`max(0, z-1)`, clamped at zoom 0). It keeps complete output
-features intersecting the envelope rather than clipping them, and it does not
-follow later pan, zoom, viewport, or workspace-view changes. Refresh retains
-the saved scope without recalculating it; replace resolves the current scope
-again, and omission of the compatibility flag cannot clear the scope.
+from the selected effective locale's configured `extent.north`,
+`extent.east`, `extent.south`, and `extent.west` bounds. For older workspaces
+without all four bounds, it falls back to a 1920x1080 viewport at one zoom
+level wider than the configured view (`max(0, z-1)`, clamped at zoom 0). It
+keeps complete output features intersecting the envelope rather than clipping
+them, and it does not follow later pan, zoom, viewport, or workspace-view
+changes. Refresh retains the saved scope without recalculating it; replace
+resolves the current scope again, and omission of the compatibility flag
+cannot clear the scope.
 The outer guard filters output rows only: it is not an RLS/security boundary
 and does not map-scope upstream aggregates, windows, limits, or computation.
 Put the previewed envelope predicate in source-side SQL before aggregation

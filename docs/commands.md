@@ -719,10 +719,12 @@ Create, replace, refresh, and drop all require `--confirm`. This is a local
 command guard that records deliberate invocation; it is not evidence of the
 separate user authorization required for the database action.
 
-Every create or replace uses a fixed, bounded spatial scope around the selected
-locale's configured map centre. The server uses a 1920x1080 planning viewport
-at one zoom level wider than the configured view (`max(0, z-1)`, clamped at
-zoom 0) and wraps the submitted query with an exact intersection filter.
+Every create or replace uses a fixed, bounded spatial scope from the selected
+effective locale's configured `extent.north`, `extent.east`, `extent.south`,
+and `extent.west` bounds. For older workspaces without all four bounds, the
+server falls back to a 1920x1080 planning viewport at one zoom level wider than
+the configured view (`max(0, z-1)`, clamped at zoom 0). It wraps the submitted
+query with an exact intersection filter.
 `--map-extent` remains accepted for compatibility with older automation but
 does not change this mandatory behavior:
 

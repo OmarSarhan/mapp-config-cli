@@ -10,6 +10,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Updated derived-layer scope guidance to treat the selected effective
+  locale's configured north/east/south/west extent as authoritative, while
+  documenting the server's legacy view-derived fallback for incomplete bounds.
 - Visual tests and candidate screenshots now use durable server operations,
   poll them to completion, preserve failed report artifacts, and return the
   operation ID when the local wait expires.

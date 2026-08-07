@@ -519,14 +519,16 @@ Every derived-layer create or replace uses a fixed spatial scope. First run
 `derived-layers map-extent [--locale LOCALE]`, then pass the same optional
 `--locale` directly to `create` or `replace`. `--map-extent` remains accepted
 for compatibility with older automation but does not change this mandatory
-behavior. The scope is centred on the selected locale's configured view,
-planned for a 1920x1080 viewport at one zoom level wider (`max(0, z-1)`,
-clamped at zoom 0). It selects whole output features that intersect the saved
-envelope; it does not clip geometry or follow later pan, zoom, viewport, or
+behavior. The scope uses the selected locale's configured `extent.north`,
+`extent.east`, `extent.south`, and `extent.west` bounds. If an older workspace
+lacks any of those four bounds, the server falls back to a 1920x1080 viewport
+at one zoom level wider than the configured view (`max(0, z-1)`, clamped at
+zoom 0). It selects whole output features that intersect the saved envelope;
+it does not clip geometry or follow later pan, zoom, viewport, or
 workspace-view changes. Ordinary views continue to track source-row changes
-within that scope; materialized views update on refresh, which does not resolve
-the extent again. Replace resolves and saves the current scope again; omitting
-the compatibility flag cannot clear it.
+within that scope; materialized views update on refresh, which does not
+resolve the extent again. Replace resolves and saves the current scope again;
+omitting the compatibility flag cannot clear it.
 
 The server's outer intersection guard filters final output rows only. It is
 not an RLS/security boundary and does not automatically map-scope upstream
