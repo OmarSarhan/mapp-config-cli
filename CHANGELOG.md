@@ -16,6 +16,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Closed validation for the optional versioned derived query-planning
+  capability and success probe, plus generic CLI-owned authoring guidance for
+  proven over-limit nested-loop pair work across synchronous and durable
+  failures without rewriting SQL or changing the server error envelope.
 - Live and proposal evidence controls for required hover-tooltip and
   clicked-feature text, with strict verification of dedicated hover,
   information, Filtering, and Styling artifacts before the CLI reports

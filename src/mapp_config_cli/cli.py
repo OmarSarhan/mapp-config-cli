@@ -1372,6 +1372,179 @@ def _validate_pagination_response(
     return pagination
 
 
+_QUERY_PLANNING_VERSION = "1"
+_QUERY_PLANNING_METHOD = "postgresql-explain-bounded-generator-pairs"
+_QUERY_PLANNING_REASON_CODE = "nested_loop_pair_work"
+_QUERY_PLANNING_KEYS = {
+    "version",
+    "method",
+    "maxNestedLoopPairRows",
+    "reasonCodes",
+}
+_QUERY_PLANNING_PROBE_KEYS = {
+    "version",
+    "method",
+    "maxProvenGeneratedRows",
+    "nestedLoopCount",
+    "maxEstimatedNestedLoopPairRows",
+    "maxAllowedNestedLoopPairRows",
+}
+
+
+def _valid_query_planning(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == _QUERY_PLANNING_KEYS
+        and value.get("version") == _QUERY_PLANNING_VERSION
+        and value.get("method") == _QUERY_PLANNING_METHOD
+        and _nonnegative_integer(value.get("maxNestedLoopPairRows"))
+        and value["maxNestedLoopPairRows"] > 0
+        and value.get("reasonCodes") == [_QUERY_PLANNING_REASON_CODE]
+    )
+
+
+def _valid_query_planning_probe(value: Any) -> bool:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _QUERY_PLANNING_PROBE_KEYS
+        or value.get("version") != _QUERY_PLANNING_VERSION
+        or value.get("method") != _QUERY_PLANNING_METHOD
+        or any(
+            not _nonnegative_integer(value.get(key))
+            for key in (
+                "maxProvenGeneratedRows",
+                "nestedLoopCount",
+                "maxEstimatedNestedLoopPairRows",
+                "maxAllowedNestedLoopPairRows",
+            )
+        )
+        or value["maxAllowedNestedLoopPairRows"] == 0
+    ):
+        return False
+    if value["nestedLoopCount"] == 0:
+        return value["maxEstimatedNestedLoopPairRows"] == 0
+    return True
+
+
+def _derived_client_guidance(
+    error: Any,
+    *,
+    query_planning: Any = None,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(error, dict)
+        or error.get("code") != "derived_layer.query_too_expensive"
+        or error.get("blocked") is not True
+        or error.get("failurePhase") != "preflight"
+        or error.get("stateUnchanged") is not True
+        or not isinstance(error.get("safeState"), str)
+        or not error["safeState"].strip()
+        or error.get("indeterminate") is True
+        or not isinstance(error.get("reasons"), list)
+        or not any(
+            isinstance(reason, dict)
+            and reason.get("code") == _QUERY_PLANNING_REASON_CODE
+            for reason in error["reasons"]
+        )
+    ):
+        return None
+    probe = error.get("queryPlanningProbe")
+    if (
+        not isinstance(probe, dict)
+        or not _valid_query_planning_probe(probe)
+        or probe["maxEstimatedNestedLoopPairRows"]
+        <= probe["maxAllowedNestedLoopPairRows"]
+    ):
+        return None
+    if query_planning is not None and (
+        not isinstance(query_planning, dict)
+        or not _valid_query_planning(query_planning)
+        or query_planning["maxNestedLoopPairRows"]
+        != probe["maxAllowedNestedLoopPairRows"]
+    ):
+        return None
+    return {
+        "version": "1",
+        "source": "mapp-config-cli",
+        "topic": "nested-loop-pair-work",
+        "triggerReasons": [_QUERY_PLANNING_REASON_CODE],
+        "summary": (
+            "Rewrite the query so high-cardinality inputs cannot drive "
+            "excessive nested-loop pair work."
+        ),
+        "evidence": dict(probe),
+        "steps": [
+            {
+                "id": "keep-high-cardinality-inputs-indexable",
+                "message": (
+                    "Keep high-cardinality join inputs directly visible to "
+                    "the planner and place selective predicates where an "
+                    "applicable index can be used."
+                ),
+            },
+            {
+                "id": "separate-complete-input-aggregate",
+                "message": (
+                    "Move complete-input totals out of the high-cardinality "
+                    "join path. Compute global totals as a one-row scalar "
+                    "result and reference them after selective aggregation; "
+                    "preserve row-dependent window semantics."
+                ),
+            },
+            {
+                "id": "compute-expensive-expression-once",
+                "message": (
+                    "Compute each repeated expensive expression once at the "
+                    "narrowest reusable stage."
+                ),
+            },
+            {
+                "id": "resubmit-for-preflight",
+                "message": (
+                    "Resubmit the revised definition; the server will rerun "
+                    "preflight and enforce the advertised pair-work limit "
+                    "before mutation."
+                ),
+            },
+        ],
+        "constraints": [
+            {
+                "id": "preserve-complete-input-totals",
+                "message": (
+                    "Preserve totals that intentionally cover the complete "
+                    "declared input; do not map-filter or sample them merely "
+                    "to reduce work."
+                ),
+            },
+            {
+                "id": "preserve-exact-spatial-predicate",
+                "message": (
+                    "Preserve the exact spatial predicate required by the "
+                    "requested result; candidate generation alone is not "
+                    "final acceptance."
+                ),
+            },
+        ],
+    }
+
+
+def _with_derived_client_guidance(error: CliError) -> CliError:
+    guidance = _derived_client_guidance(error.safe_details)
+    if (
+        guidance is None
+        or not isinstance(error.safe_details, dict)
+        or "clientGuidance" in error.safe_details
+    ):
+        return error
+    return CliError(
+        error.message,
+        error.exit_code,
+        details={**error.safe_details, "clientGuidance": guidance},
+        http_status=error.http_status,
+        error_code=error.error_code,
+    )
+
+
 def _terminal_operation_error(
     operation: dict[str, Any],
     *,
@@ -1407,6 +1580,14 @@ def _terminal_operation_error(
                     exit_code = EXIT_CONFLICT
                 elif server_status in {400, 404, 422}:
                     exit_code = EXIT_VALIDATION
+
+    client_guidance = (
+        _derived_client_guidance(operation_error)
+        if status == "failed"
+        else None
+    )
+    if client_guidance is not None and "clientGuidance" not in details:
+        details = {**details, "clientGuidance": client_guidance}
 
     return CliError(
         message,
@@ -1760,6 +1941,9 @@ def _request_derived_mutation(
             and 400 <= exc.http_status < 500
             and exc.http_status != 408
         ):
+            enriched = _with_derived_client_guidance(exc)
+            if enriched is not exc:
+                raise enriched from exc
             raise
         if _has_authoritative_derived_failure(exc):
             if exc.safe_details.get("indeterminate") is True:
@@ -1770,6 +1954,9 @@ def _request_derived_mutation(
                     http_status=exc.http_status,
                     error_code=exc.error_code,
                 ) from exc
+            enriched = _with_derived_client_guidance(exc)
+            if enriched is not exc:
+                raise enriched from exc
             raise
         if (
             exc.error_code in {
@@ -3172,6 +3359,44 @@ def _h3_readiness(
     return value
 
 
+def _query_planning(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    if not _valid_query_planning(value):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
+def _query_planning_probe(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+    require_within_limit: bool,
+) -> dict[str, Any]:
+    if (
+        not _valid_query_planning_probe(value)
+        or (
+            require_within_limit
+            and value["maxEstimatedNestedLoopPairRows"]
+            > value["maxAllowedNestedLoopPairRows"]
+        )
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
 def _derived_capabilities(
     data: dict[str, Any],
     *,
@@ -3210,6 +3435,8 @@ def _derived_capabilities(
         )
     if "queryGuard" in data:
         _query_guard(data["queryGuard"], data=data, label=label)
+    if "queryPlanning" in data:
+        _query_planning(data["queryPlanning"], data=data, label=label)
     return data
 
 
@@ -3484,6 +3711,22 @@ def _validate_derived_query_plan_probe(
     )
 
 
+def _validate_derived_query_planning_probe(
+    derived_layer: dict[str, Any],
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> None:
+    if "queryPlanningProbe" not in derived_layer:
+        return
+    _query_planning_probe(
+        derived_layer["queryPlanningProbe"],
+        data=data,
+        label=label,
+        require_within_limit=True,
+    )
+
+
 def _validate_derived_layer_response(
     data: dict[str, Any],
     *,
@@ -3526,6 +3769,11 @@ def _validate_derived_layer_response(
             label="Derived layer",
         )
         _validate_derived_query_plan_probe(
+            derived_layer,
+            data=data,
+            label="Derived layer",
+        )
+        _validate_derived_query_planning_probe(
             derived_layer,
             data=data,
             label="Derived layer",

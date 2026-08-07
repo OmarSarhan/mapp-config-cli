@@ -764,6 +764,13 @@ On API/contract 1.3 it includes ordered AST/catalog/EXPLAIN `stages`,
 `shapeLimits`, plan `limits`, H3 bounds, and the stable `errorCategories`
 mapping; the CLI validates that closed shape while still accepting the earlier
 compatible 1.x guard shape.
+Newer compatible servers can advertise the separate, optional
+`queryPlanning` version `1` contract. It bounds estimated nested-loop pair rows
+without changing the existing `queryGuard` or `queryPlanProbe` shapes. A
+successful mutation then preserves `derivedLayer.queryPlanningProbe` alongside
+`derivedLayer.queryPlanProbe`. Both optional objects use closed versioned
+schemas; earlier servers that omit them remain compatible.
+
 When the server advertises `h3Readiness`, the CLI also validates its closed
 catalog-and-execution result and its consistency with `h3Available`. A failed
 result includes one bounded stage-specific reason and `suggestedAction`.
@@ -804,6 +811,21 @@ context, detail, or hint.
 A `derived_layer.source_mismatch` response separately exposes
 `declaredSources`, `resolvedSources`, `missingSources`, and `extraSources`; make
 those two lists match instead of treating the failure as query cost.
+
+When a compute failure contains reason `nested_loop_pair_work` and a valid
+over-limit `queryPlanningProbe`, the CLI adds `details.clientGuidance` without
+altering any server field. The guidance is an authoring aid, not a SQL rewrite:
+keep high-cardinality join inputs directly visible to applicable indexes;
+calculate complete-input global totals as a one-row scalar result referenced
+after selective aggregation while preserving row-dependent window semantics;
+calculate repeated expensive expressions once; then resubmit the revised
+definition so the server reruns preflight before mutation. Do not reduce pair
+work by sampling or map-filtering totals whose intended meaning covers the
+complete declared input, and retain the reviewed exact spatial predicate after
+candidate generation. Unknown,
+malformed, or within-limit planning evidence is preserved as received but does
+not receive client guidance. The same behavior applies to synchronous errors
+and durable failures surfaced from `--background` or `operations wait`.
 
 Capabilities separately advertise `materializationGuard`. For a materialized
 create, view-to-materialized replacement, or refresh, the same plan estimates
@@ -891,9 +913,14 @@ other value must use the complete declared input.
 Some H3/PostGIS convenience wrappers assume a broader PostgreSQL search path
 than the derived-layer runner provides. Errors such as unresolved `geometry`
 types or `st_dump` functions can indicate wrapper resolution rather than a bad
-spatial idea. Prefer explicitly qualified PostGIS calls or lower-level H3 WKB
-boundary functions when that happens. A derived-layer mutation that times out
-or returns an unclassified or malformed HTTP `5xx` is indeterminate with
+spatial idea. Prefer explicitly qualified PostGIS calls and the extension's
+geometry-native `h3_cell_to_boundary_geometry(cell)` function. If
+`h3_cell_to_boundary_wkb(cell)` is unavoidable on the pinned extension, pass
+its EWKB result to `ST_GeomFromEWKB(...)`, not
+`ST_GeomFromWKB(..., 4326)`. That mismatch emits one warning per
+evaluated/generated cell and can flood PostgreSQL logs. A derived-layer
+mutation that times out or returns an unclassified or malformed HTTP `5xx` is
+indeterminate with
 `failurePhase: "request-response"`: inspect `derived-layers list`,
 `derived-layers show NAME`, and `catalog list` before recreating, replacing,
 or dropping anything. A coherent structured server failure retains its

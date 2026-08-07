@@ -14,6 +14,7 @@ from mapp_config_cli.cli import (
     MAX_LOCAL_FILE_BYTES,
     MAX_VISUAL_ARTIFACTS,
     _canonical_json_equal,
+    _derived_client_guidance,
     _query_invokes_h3,
     _strict_json_file,
     _validate_requested_visual_evidence,
@@ -180,6 +181,60 @@ def query_plan_probe() -> dict:
             "maxEstimatedExpandedCells": 10_000_000,
         },
         "limits": query_plan_limits(),
+    }
+
+
+def query_planning() -> dict:
+    return {
+        "version": "1",
+        "method": "postgresql-explain-bounded-generator-pairs",
+        "maxNestedLoopPairRows": 100_000_000,
+        "reasonCodes": ["nested_loop_pair_work"],
+    }
+
+
+def query_planning_probe(*, estimated_pair_rows: int = 2_000_000) -> dict:
+    return {
+        "version": "1",
+        "method": "postgresql-explain-bounded-generator-pairs",
+        "maxProvenGeneratedRows": 2_000,
+        "nestedLoopCount": 1,
+        "maxEstimatedNestedLoopPairRows": estimated_pair_rows,
+        "maxAllowedNestedLoopPairRows": 100_000_000,
+    }
+
+
+def nested_loop_pair_work_error(*, probe: object | None = None) -> dict:
+    reason = {
+        "code": "nested_loop_pair_work",
+        "message": (
+            "High-cardinality inputs would drive too many nested-loop row "
+            "pairs."
+        ),
+        "suggestedAction": (
+            "Rewrite the high-cardinality join so its selective predicate "
+            "can use an applicable index."
+        ),
+    }
+    default_probe = query_planning_probe(estimated_pair_rows=200_000_000)
+    default_probe["maxProvenGeneratedRows"] = 0
+    return {
+        "error": "Derived query exceeds the compute budget.",
+        "userMessage": reason["message"],
+        "suggestedAction": reason["suggestedAction"],
+        "code": "derived_layer.query_too_expensive",
+        "category": "compute",
+        "status": 409,
+        "blocked": True,
+        "stateUnchanged": True,
+        "safeState": "No derived layer was created.",
+        "failurePhase": "preflight",
+        "reasons": [reason],
+        "queryPlanningProbe": (
+            default_probe
+            if probe is None
+            else probe
+        ),
     }
 
 
@@ -926,6 +981,93 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0, code, stderr)
         self.assertEqual(guard, json.loads(stdout)["queryGuard"])
 
+    def test_derived_layer_capabilities_validate_query_planning_contract(self):
+        planning = query_planning()
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            {
+                "configured": True,
+                "schema": "derived_layers",
+                "kinds": ["view", "materialized"],
+                "queryPlanning": planning,
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "capabilities"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(planning, json.loads(stdout)["queryPlanning"])
+
+    def test_derived_layer_capabilities_reject_malformed_query_planning(self):
+        unknown_field = query_planning()
+        unknown_field["future"] = True
+        boolean_limit = query_planning()
+        boolean_limit["maxNestedLoopPairRows"] = True
+        wrong_method = query_planning()
+        wrong_method["method"] = "postgresql-explain"
+        unknown_reason = query_planning()
+        unknown_reason["reasonCodes"] = ["spatial_pair_work"]
+
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            results = []
+            for planning in (
+                unknown_field,
+                boolean_limit,
+                wrong_method,
+                unknown_reason,
+            ):
+                routes[("GET", "/api/derived-layers/capabilities")] = (
+                    200,
+                    {
+                        "configured": True,
+                        "schema": "derived_layers",
+                        "kinds": ["view", "materialized"],
+                        "queryPlanning": planning,
+                    },
+                )
+                results.append(self.invoke(
+                    ["derived-layers", "capabilities"],
+                    store,
+                ))
+
+        for code, stdout, stderr in results:
+            self.assertEqual(EXIT_CONNECTIVITY, code)
+            self.assertEqual("", stdout)
+            self.assertEqual(
+                "derived_layer.invalid_response",
+                json.loads(stderr)["code"],
+            )
+
+    def test_nested_loop_guidance_requires_safe_evidence_and_pair_limit(self):
+        server_error = nested_loop_pair_work_error()
+        matching = query_planning()
+        mismatched = query_planning()
+        mismatched["maxNestedLoopPairRows"] = 99_000_000
+        indeterminate = {
+            **server_error,
+            "failurePhase": "result-reporting",
+            "indeterminate": True,
+        }
+        indeterminate.pop("stateUnchanged")
+        indeterminate.pop("safeState")
+
+        self.assertIsNotNone(_derived_client_guidance(
+            server_error,
+            query_planning=matching,
+        ))
+        self.assertIsNone(_derived_client_guidance(
+            server_error,
+            query_planning=mismatched,
+        ))
+        self.assertIsNone(_derived_client_guidance(indeterminate))
+
     def test_derived_layer_rejects_malformed_materialization_evidence(self):
         routes = standard_routes()
         routes[("GET", "/api/derived-layers/capabilities")] = (
@@ -1074,8 +1216,9 @@ class CliTests(unittest.TestCase):
                 failure["details"]["reconciliation"]["automaticRetry"]
             )
 
-    def test_derived_layer_refresh_preserves_query_plan_probe(self):
+    def test_derived_layer_refresh_preserves_query_plan_and_planning_probes(self):
         probe = query_plan_probe()
+        planning_probe = query_planning_probe()
         routes = standard_routes()
         routes[("POST", "/api/derived-layers/places/refresh")] = (
             200,
@@ -1085,6 +1228,7 @@ class CliTests(unittest.TestCase):
                 "spatialScope": map_extent_scope(),
                 "materializationProbe": materialization_probe(),
                 "queryPlanProbe": probe,
+                "queryPlanningProbe": planning_probe,
             }},
         )
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
@@ -1099,6 +1243,49 @@ class CliTests(unittest.TestCase):
             probe,
             json.loads(stdout)["derivedLayer"]["queryPlanProbe"],
         )
+        self.assertEqual(
+            planning_probe,
+            json.loads(stdout)["derivedLayer"]["queryPlanningProbe"],
+        )
+
+    def test_derived_layer_rejects_malformed_or_over_limit_planning_probe(self):
+        unknown_field = query_planning_probe()
+        unknown_field["future"] = True
+        over_limit = query_planning_probe(estimated_pair_rows=100_000_001)
+        empty_loop_with_work = query_planning_probe()
+        empty_loop_with_work["nestedLoopCount"] = 0
+        routes = standard_routes()
+
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            results = []
+            for index, probe_value in enumerate((
+                unknown_field,
+                over_limit,
+                empty_loop_with_work,
+            )):
+                name = f"places_{index}"
+                routes[("POST", f"/api/derived-layers/{name}/refresh")] = (
+                    200,
+                    {"derivedLayer": {
+                        "name": name,
+                        "kind": "materialized",
+                        "spatialScope": map_extent_scope(),
+                        "queryPlanningProbe": probe_value,
+                    }},
+                )
+                results.append(self.invoke(
+                    ["derived-layers", "refresh", name, "--confirm"],
+                    store,
+                ))
+
+        for code, stdout, stderr in results:
+            self.assertEqual(EXIT_CONNECTIVITY, code)
+            self.assertEqual("", stdout)
+            self.assertEqual(
+                "derived_layer.mutation_indeterminate",
+                json.loads(stderr)["code"],
+            )
 
     def test_derived_layer_create_forwards_map_extent_scope(self):
         captured = {}
@@ -1577,6 +1764,98 @@ class CliTests(unittest.TestCase):
             "derived-op-wrong-name",
         )
 
+    def test_derived_create_adds_generic_nested_loop_guidance(self):
+        server_error = nested_loop_pair_work_error()
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers")] = (409, server_error)
+
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT id, geom FROM etl.places", encoding="utf-8"
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "bounded_places",
+                "--kind", "view",
+                "--query-file", str(query_file),
+                "--source", "etl.places",
+                "--id-column", "id",
+                "--geometry-column", "geom",
+                "--confirm",
+            ], store)
+
+        self.assertEqual(EXIT_CONFLICT, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("derived_layer.query_too_expensive", payload["code"])
+        details = payload["details"]
+        self.assertEqual(
+            set(server_error) | {"clientGuidance"},
+            set(details),
+        )
+        for key, value in server_error.items():
+            self.assertEqual(value, details[key])
+        guidance = details["clientGuidance"]
+        self.assertEqual("nested-loop-pair-work", guidance["topic"])
+        self.assertEqual(
+            ["nested_loop_pair_work"], guidance["triggerReasons"]
+        )
+        self.assertEqual(
+            server_error["queryPlanningProbe"], guidance["evidence"]
+        )
+        self.assertEqual(
+            [
+                "keep-high-cardinality-inputs-indexable",
+                "separate-complete-input-aggregate",
+                "compute-expensive-expression-once",
+                "resubmit-for-preflight",
+            ],
+            [step["id"] for step in guidance["steps"]],
+        )
+
+    def test_derived_create_omits_guidance_for_unproved_pair_work(self):
+        malformed_probe = query_planning_probe(
+            estimated_pair_rows=200_000_000
+        )
+        malformed_probe["future"] = True
+        under_limit_probe = query_planning_probe()
+        wrong_reason = nested_loop_pair_work_error()
+        wrong_reason["reasons"][0]["code"] = "intermediate_rows"
+        errors = (
+            nested_loop_pair_work_error(probe=malformed_probe),
+            nested_loop_pair_work_error(probe=under_limit_probe),
+            wrong_reason,
+        )
+        routes = standard_routes()
+
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT id, geom FROM etl.places", encoding="utf-8"
+            )
+            store = self.configured_store(directory, server.endpoint)
+            results = []
+            for server_error in errors:
+                routes[("POST", "/api/derived-layers")] = (409, server_error)
+                results.append(self.invoke([
+                    "derived-layers", "create", "bounded_places",
+                    "--kind", "view",
+                    "--query-file", str(query_file),
+                    "--source", "etl.places",
+                    "--id-column", "id",
+                    "--geometry-column", "geom",
+                    "--confirm",
+                ], store))
+
+        for result, server_error in zip(results, errors):
+            code, stdout, stderr = result
+            self.assertEqual(EXIT_CONFLICT, code)
+            self.assertEqual("", stdout)
+            details = json.loads(stderr)["details"]
+            self.assertNotIn("clientGuidance", details)
+            self.assertEqual(server_error, details)
+
     def test_derived_create_surfaces_structured_background_guidance(self):
         reason = {
             "code": "custom_routine",
@@ -1636,6 +1915,50 @@ class CliTests(unittest.TestCase):
         preserved = payload["details"]["operation"]["error"]
         self.assertEqual(operation_error["suggestedAction"], preserved["suggestedAction"])
         self.assertEqual([reason], preserved["reasons"])
+
+    def test_derived_create_adds_guidance_to_background_pair_work_error(self):
+        operation_error = nested_loop_pair_work_error()
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers")] = (
+            202,
+            {"operation": {
+                "id": "derived-op-pair-work",
+                "kind": "derived-layer.create",
+                "status": "failed",
+                "error": operation_error,
+            }},
+        )
+
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT id, geom FROM etl.places", encoding="utf-8"
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "bounded_places",
+                "--kind", "view",
+                "--query-file", str(query_file),
+                "--source", "etl.places",
+                "--id-column", "id",
+                "--geometry-column", "geom",
+                "--background",
+                "--confirm",
+            ], store)
+
+        self.assertEqual(EXIT_CONFLICT, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("derived_layer.query_too_expensive", payload["code"])
+        self.assertEqual(
+            operation_error,
+            payload["details"]["operation"]["error"],
+        )
+        guidance = payload["details"]["clientGuidance"]
+        self.assertEqual("nested-loop-pair-work", guidance["topic"])
+        self.assertEqual(
+            operation_error["queryPlanningProbe"], guidance["evidence"]
+        )
 
     def test_invalid_background_waits_stop_before_the_mutation_request(self):
         for option, value in (
@@ -5526,6 +5849,7 @@ class CliTests(unittest.TestCase):
             operation_error["suggestedAction"],
             payload["details"]["operation"]["error"]["suggestedAction"],
         )
+        self.assertNotIn("clientGuidance", payload["details"])
         preserved = payload["details"]["operation"]["error"]
         self.assertTrue(preserved["stateUnchanged"])
         self.assertTrue(preserved["rolledBack"])
