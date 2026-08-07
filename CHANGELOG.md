@@ -10,6 +10,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Visual tests and candidate screenshots now use durable server operations,
+  poll them to completion, preserve failed report artifacts, and return the
+  operation ID when the local wait expires.
 - Documented and regression-tested preservation of server-classified
   derived-database contention as a conflict, including its retryable flag,
   closed contention scope, corrective guidance, and authoritative rollback

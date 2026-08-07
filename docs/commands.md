@@ -1458,6 +1458,12 @@ proves that XYZ loaded, the named layer was present, and a canvas rendered. It
 does not guarantee cartographic quality; review the returned screenshots when
 the change is visually significant.
 
+`visual-test` and `screenshot` submit durable background operations and poll
+them automatically. Use `--wait-timeout` and `--interval` to bound that local
+wait. If it expires, the error retains the operation ID and the server work is
+not cancelled; continue with `operations wait OPERATION_ID` instead of starting
+a second Chromium run.
+
 A browser-validation failure exits with code `6`, but its structured error can
 still contain the selected plan, failed report, and authenticated artifact
 paths from the server's HTTP 422 response. Preserve and review that evidence.
@@ -1542,6 +1548,10 @@ non-empty candidate hash. A mismatched or live-workspace response is rejected.
 The server contract must also advertise the exact command name required by the
 invocation. A related capability action or matching route is insufficient; do
 not bypass a `capability.missing` result.
+
+`preview-test` and `preview-screenshot` use the same durable polling behavior
+and accept `--wait-timeout` and `--interval`. `preview-plan` remains synchronous
+because it does not start Chromium.
 
 Candidate preview is read-only: it neither applies the proposal nor reloads or
 changes the live workspace. A failed test or screenshot exits with code `6`

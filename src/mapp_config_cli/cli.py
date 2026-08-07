@@ -689,6 +689,9 @@ def parser() -> JsonArgumentParser:
             "--artifact-dir",
             help="Fetch returned visual artifacts into this local directory.",
         )
+        if action != "preview-plan":
+            preview.add_argument("--wait-timeout", type=float, default=180)
+            preview.add_argument("--interval", type=float, default=0.5)
         preview.add_argument(
             "--expect-info-text",
             action="append",
@@ -755,6 +758,9 @@ def parser() -> JsonArgumentParser:
             "--artifact-dir",
             help="Fetch returned visual artifacts into this local directory.",
         )
+        if name != "visual-plan":
+            visual.add_argument("--wait-timeout", type=float, default=180)
+            visual.add_argument("--interval", type=float, default=0.5)
         visual.add_argument(
             "--expect-info-text",
             action="append",
@@ -1571,11 +1577,11 @@ def _terminal_operation_error(
         server_code = operation_error.get("code")
         if (
             isinstance(server_code, str)
-            and server_code.startswith("derived_layer.")
+            and server_code.startswith(("derived_layer.", "visual."))
         ):
             error_code = server_code
             server_status = operation_error.get("status")
-            if not indeterminate:
+            if not indeterminate and server_code.startswith("derived_layer."):
                 if server_status in {401, 403}:
                     exit_code = EXIT_AUTHENTICATION
                 elif server_status == 409:
@@ -1984,6 +1990,16 @@ def _complete_background_operation(
     *,
     wait_timeout: float,
     interval: float,
+    failed_exit_code: int = EXIT_VALIDATION,
+    failed_message: str = "Derived-layer background operation failed.",
+    indeterminate_message: str = (
+        "Derived-layer operation is indeterminate; inspect the operation and "
+        "authoritative database state before retrying."
+    ),
+    wait_message: str = (
+        "Derived-layer work is still running after the local wait timeout; "
+        "it was not cancelled."
+    ),
 ) -> tuple[dict[str, Any], str | None]:
     """Resolve an optional 202 operation while accepting synchronous servers."""
     _validate_background_wait(wait_timeout, interval)
@@ -2018,15 +2034,18 @@ def _complete_background_operation(
                             cause=invalid,
                         ) from invalid
                     return result, operation_id
+                terminal_details = (
+                    dict(operation.get("result"))
+                    if isinstance(operation.get("result"), dict)
+                    else {}
+                )
+                terminal_details["operation"] = operation
                 raise _terminal_operation_error(
                     operation,
-                    details={"operation": operation},
-                    failed_exit_code=EXIT_VALIDATION,
-                    failed_message="Derived-layer background operation failed.",
-                    indeterminate_message=(
-                        "Derived-layer operation is indeterminate; inspect the "
-                        "operation and authoritative database state before retrying."
-                    ),
+                    details=terminal_details,
+                    failed_exit_code=failed_exit_code,
+                    failed_message=failed_message,
+                    indeterminate_message=indeterminate_message,
                 )
             if status not in {"running", "cancelling"}:
                 invalid = _invalid_response(
@@ -2043,8 +2062,7 @@ def _complete_background_operation(
             if remaining <= 0:
                 detached = _background_poll_error(operation_id, status)
                 raise CliError(
-                    "Derived-layer work is still running after the local wait "
-                    "timeout; it was not cancelled.",
+                    wait_message,
                     EXIT_CONNECTIVITY,
                     details=detached.safe_details,
                     error_code="operation.wait_timeout",
@@ -6982,12 +7000,32 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 "preview-screenshot": "screenshot",
             }[args.action]
             try:
+                request_payload = visual_payload(args)
+                if args.action != "preview-plan":
+                    request_payload["background"] = True
                 result = client.request(
                     f"/api/proposals/{quote_segment(args.id)}/{endpoint}",
                     method="POST",
-                    payload=visual_payload(args),
+                    payload=request_payload,
                     failure_code=EXIT_VISUAL,
                 )
+                if args.action != "preview-plan":
+                    result, _ = _complete_background_operation(
+                        client,
+                        result,
+                        wait_timeout=args.wait_timeout,
+                        interval=args.interval,
+                        failed_exit_code=EXIT_VISUAL,
+                        failed_message="Visual operation failed.",
+                        indeterminate_message=(
+                            "Visual operation is indeterminate; inspect the "
+                            "durable operation before retrying."
+                        ),
+                        wait_message=(
+                            "Visual operation is still running after the local "
+                            "wait timeout; it was not cancelled."
+                        ),
+                    )
             except CliError as exc:
                 # Browser failures can be HTTP 422 responses containing useful
                 # candidate evidence. Validate its binding before exposing it.
@@ -7297,12 +7335,32 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             else "/api/visual-test"
         )
         try:
+            request_payload = visual_payload(args)
+            if args.command != "visual-plan":
+                request_payload["background"] = True
             result = client.request(
                 path,
                 method="POST",
-                payload=visual_payload(args),
+                payload=request_payload,
                 failure_code=EXIT_VISUAL,
             )
+            if args.command != "visual-plan":
+                result, _ = _complete_background_operation(
+                    client,
+                    result,
+                    wait_timeout=args.wait_timeout,
+                    interval=args.interval,
+                    failed_exit_code=EXIT_VISUAL,
+                    failed_message="Visual operation failed.",
+                    indeterminate_message=(
+                        "Visual operation is indeterminate; inspect the durable "
+                        "operation before retrying."
+                    ),
+                    wait_message=(
+                        "Visual operation is still running after the local wait "
+                        "timeout; it was not cancelled."
+                    ),
+                )
         except CliError as exc:
             details = exc.safe_details
             if isinstance(details, dict) and any(

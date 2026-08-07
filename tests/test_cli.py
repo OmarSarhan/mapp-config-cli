@@ -3635,9 +3635,192 @@ class CliTests(unittest.TestCase):
             captured,
             [
                 ("/api/visual-plan", {"layer": "Bus Stops", "locale": "cy"}),
-                ("/api/visual-test", {"layer": "Bus Stops", "locale": "cy"}),
-                ("/api/visual-test", {"layer": "Bus Stops", "locale": "cy"}),
+                (
+                    "/api/visual-test",
+                    {"layer": "Bus Stops", "locale": "cy", "background": True},
+                ),
+                (
+                    "/api/visual-test",
+                    {"layer": "Bus Stops", "locale": "cy", "background": True},
+                ),
             ],
+        )
+
+    def test_visual_command_waits_for_durable_background_result(self):
+        operation_id = "a" * 32
+
+        def submit(request):
+            self.assertEqual({
+                "layer": "Bus Stops",
+                "background": True,
+            }, request["body"])
+            return 202, {"operation": {
+                "id": operation_id,
+                "kind": "visual.test",
+                "status": "running",
+            }}
+
+        result = {
+            "source": "live",
+            "operationId": operation_id,
+            "plan": {"layer": "Bus Stops"},
+            "visual": {
+                "runId": "run-live",
+                "passed": True,
+                "artifacts": {"report": "run-live/report.json"},
+            },
+        }
+        routes = standard_routes()
+        routes[("POST", "/api/visual-test")] = submit
+        routes[("GET", f"/api/operations/{operation_id}")] = (
+            200,
+            {"operation": {
+                "id": operation_id,
+                "kind": "visual.test",
+                "status": "succeeded",
+                "result": result,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "visual-test", "--layer", "Bus Stops",
+                "--wait-timeout", "1", "--interval", "0.01",
+            ], store)
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(result["visual"], json.loads(stdout)["visual"])
+
+    def test_preview_screenshot_waits_for_durable_background_result(self):
+        operation_id = "b" * 32
+        candidate_hash = "candidate-hash"
+
+        def submit(request):
+            self.assertTrue(request["body"]["background"])
+            return 202, {"operation": {
+                "id": operation_id,
+                "kind": "proposal.screenshot",
+                "status": "running",
+            }}
+
+        result = {
+            "source": "candidate",
+            "proposalId": "proposal-1",
+            "candidateHash": candidate_hash,
+            "operationId": operation_id,
+            "plan": {
+                "layer": "Bus Stops",
+                "evidenceApplicability": {
+                    "original": True,
+                    "candidate": True,
+                },
+            },
+            "visual": {
+                "runId": "run-candidate",
+                "passed": True,
+                "comparison": {
+                    "original": {"passed": True},
+                    "candidate": {"passed": True},
+                },
+                "artifacts": {"afterReport": "run-candidate/report.json"},
+            },
+        }
+        routes = standard_routes()
+        routes[("POST", "/api/proposals/proposal-1/screenshot")] = submit
+        routes[("GET", f"/api/operations/{operation_id}")] = (
+            200,
+            {"operation": {
+                "id": operation_id,
+                "kind": "proposal.screenshot",
+                "status": "succeeded",
+                "result": result,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "proposals", "preview-screenshot", "proposal-1",
+                "--layer", "Bus Stops",
+                "--wait-timeout", "1", "--interval", "0.01",
+            ], store)
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(operation_id, json.loads(stdout)["operationId"])
+
+    def test_visual_wait_timeout_preserves_durable_operation_id(self):
+        operation_id = "c" * 32
+        running = {"operation": {
+            "id": operation_id,
+            "kind": "visual.test",
+            "status": "running",
+        }}
+        routes = standard_routes()
+        routes[("POST", "/api/visual-test")] = (202, running)
+        routes[("GET", f"/api/operations/{operation_id}")] = (200, running)
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "visual-test", "--layer", "Bus Stops",
+                "--wait-timeout", "0.02", "--interval", "0.01",
+            ], store)
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        failure = json.loads(stderr)
+        self.assertEqual("operation.wait_timeout", failure["code"])
+        self.assertEqual(
+            operation_id, failure["details"]["operationId"]
+        )
+        self.assertEqual("running", failure["details"]["status"])
+
+    def test_failed_visual_poll_preserves_partial_report_and_artifacts(self):
+        operation_id = "d" * 32
+        result = {
+            "source": "live",
+            "operationId": operation_id,
+            "plan": {"layer": "Bus Stops"},
+            "visual": {
+                "runId": "run-failed",
+                "passed": False,
+                "diagnosis": {"outcome": "failed"},
+                "artifacts": {"report": "run-failed/report.json"},
+            },
+        }
+        routes = standard_routes()
+        routes[("POST", "/api/visual-test")] = (202, {"operation": {
+            "id": operation_id,
+            "kind": "visual.test",
+            "status": "running",
+        }})
+        routes[("GET", f"/api/operations/{operation_id}")] = (200, {
+            "operation": {
+                "id": operation_id,
+                "kind": "visual.test",
+                "status": "failed",
+                "result": result,
+                "error": {
+                    "code": "visual.failed",
+                    "message": "Browser validation did not pass.",
+                },
+            },
+        })
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "visual-test", "--layer", "Bus Stops",
+                "--wait-timeout", "1", "--interval", "0.01",
+            ], store)
+
+        self.assertEqual(EXIT_VISUAL, code)
+        self.assertEqual("", stdout)
+        failure = json.loads(stderr)
+        self.assertEqual("visual.failed", failure["code"])
+        self.assertEqual(
+            "run-failed/report.json",
+            failure["details"]["visual"]["artifacts"]["report"],
+        )
+        self.assertEqual(
+            operation_id, failure["details"]["operation"]["id"]
         )
 
     def test_visual_command_can_fetch_returned_artifacts(self):
@@ -4126,10 +4309,15 @@ class CliTests(unittest.TestCase):
             [body for _, body in captured],
             [
                 {"layer": "Bus Stops", "locale": "cy"},
-                {"layer": "Bus Stops", "locale": "cy"},
                 {
                     "layer": "Bus Stops",
                     "locale": "cy",
+                    "background": True,
+                },
+                {
+                    "layer": "Bus Stops",
+                    "locale": "cy",
+                    "background": True,
                     "viewMode": "default",
                     "panels": ["filtering", "styling"],
                     "expectedPanelText": ["Cost"],
