@@ -636,6 +636,15 @@ classification. Inspect `derived-layers list`, `derived-layers show`, and
 `catalog list` before retrying an ambiguous mutation; never resubmit it
 automatically.
 
+`derived_layer.database_contention` is different from an ambiguous timeout.
+When it has `stateUnchanged: true`, `retryable: true`, and
+`contentionScope: "derived-mutation"` or `"postgresql-lock"`, wait for the
+active derived operation, source-table write, or maintenance transaction to
+finish, then manually retry the same reviewed request. If no active operation
+explains repeated `derived-mutation` conflicts, ask a database operator to
+inspect active derived-owner transactions and advisory locks. Never turn the
+retryable flag into an automatic retry loop.
+
 Expected background guard failures retain the same derived-layer code and
 guidance under `operation.error`. The CLI promotes the nested `userMessage` and
 stable code to its top-level structured error and retains `suggestedAction`,

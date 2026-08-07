@@ -5625,6 +5625,55 @@ class CliTests(unittest.TestCase):
         self.assertTrue(preserved["rolledBack"])
         self.assertEqual("database-transaction", preserved["failurePhase"])
 
+    def test_operation_wait_preserves_database_contention_guidance(self):
+        operation_error = {
+            "error": "Another derived-layer database transaction is active.",
+            "userMessage": (
+                "Another derived-layer database transaction is active."
+            ),
+            "suggestedAction": (
+                "Wait for the active derived-layer operation to finish, then "
+                "retry the same reviewed request."
+            ),
+            "code": "derived_layer.database_contention",
+            "category": "contention",
+            "contentionScope": "derived-mutation",
+            "status": 409,
+            "blocked": True,
+            "retryable": True,
+            "stateUnchanged": True,
+            "safeState": "No derived layer was created.",
+            "rolledBack": True,
+            "failurePhase": "database-transaction",
+        }
+        routes = standard_routes()
+        routes[("GET", "/api/operations/op-derived-contention")] = (
+            200,
+            {"operation": {
+                "id": "op-derived-contention",
+                "kind": "derived-layer.create",
+                "status": "failed",
+                "error": operation_error,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["operations", "wait", "op-derived-contention"],
+                store,
+            )
+
+        self.assertEqual(EXIT_CONFLICT, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("derived_layer.database_contention", payload["code"])
+        self.assertEqual(operation_error["userMessage"], payload["error"])
+        preserved = payload["details"]["operation"]["error"]
+        self.assertEqual("derived-mutation", preserved["contentionScope"])
+        self.assertTrue(preserved["retryable"])
+        self.assertTrue(preserved["stateUnchanged"])
+        self.assertTrue(preserved["rolledBack"])
+
     def test_input_extract_and_private_output_file_are_composable(self):
         routes = standard_routes()
         routes[("POST", "/api/visual-plan")] = (
