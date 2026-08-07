@@ -340,6 +340,12 @@ not change membership may retain group context.
 Report the returned candidate hash with the proposal ID. Exit code `6` still
 preserves structured failed evidence and artifacts for review. Never describe
 a candidate preview as applied or live.
+If a candidate or live visual command returns no structured report, an absent
+candidate hash, or unbound browser artifacts, treat the evidence as incomplete
+rather than as a pass. Preserve the operation ID and structured failure (for
+example `visual.binding_mismatch`), disclose the gap in the review, and raise a
+backend defect when a retry cannot produce a bound report. Do not substitute a
+similar visual endpoint to claim the missing evidence.
 The contract must advertise the exact command required by the CLI; a
 similar-looking action ID or endpoint does not authorize bypassing the
 client-side contract gate. Do not call the evidence complete until every
@@ -637,6 +643,13 @@ pairs; a materialized CTE containing all transformed source rows hides the
 expression index. Transform each generated cell once, compute intersection and
 source areas once for accepted pairs, then aggregate pair-local metrics. Keep
 complete-input benchmarks in a separate one-row aggregate attached afterward.
+
+Do not attach that one-row aggregate with `CROSS JOIN` or `JOIN ... ON TRUE`:
+the derived-layer guard rejects those as Cartesian joins, even when the right
+side has one row. Keep the aggregate CTE independent and reference its values
+with scalar subqueries in the final metric projection, for example
+`(SELECT national_total FROM national_totals)`. This preserves a complete-input
+denominator without weakening the bounded spatial join.
 
 Restricted server search paths can expose extension-wrapper assumptions. If a
 higher-level H3/PostGIS wrapper fails with missing `geometry`, `st_dump`, or

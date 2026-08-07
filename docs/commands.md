@@ -47,6 +47,10 @@ required.
 
 The same regular-file, no-symlink, and 5 MiB local-read boundary applies to
 `validate --file` candidates and derived-layer `--query-file` SQL.
+Do not pass `/dev/stdin` or a process-substitution path as `--query-file`:
+they are rejected as non-regular or symlinked files. When an automation must
+generate a derived query in memory, use the documented global `--input -` JSON
+object with `query` and `sources` instead.
 
 Extraction accepts dot-separated object keys and numeric list indices, with an
 optional `$` or `$.` prefix, for example `revision`,
@@ -917,6 +921,14 @@ candidates and then filter or aggregate their generated polygons with a
 reviewed exact predicate, such as `ST_Intersects`, against the complete original
 relation. Do not sample source rows when a layer-level average, sum, window, or
 other value must use the complete declared input.
+
+When a complete-input aggregate is needed beside spatially filtered results,
+place it in a separate one-row CTE but do not attach it with `CROSS JOIN` or
+`JOIN ... ON TRUE`. The derived-layer guard rejects those constructs as
+Cartesian joins even for a one-row CTE. Reference the aggregate with scalar
+subqueries in the final projection instead, such as
+`(SELECT national_total FROM national_totals)`, while retaining the bounded
+spatial predicate for the candidate join.
 
 Some H3/PostGIS convenience wrappers assume a broader PostgreSQL search path
 than the derived-layer runner provides. Errors such as unresolved `geometry`
