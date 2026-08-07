@@ -1,4 +1,4 @@
-source_areas AS (
+WITH source_areas AS (
   SELECT
     oa.ts018_0004,
     oa.ts018_0001,
@@ -8,7 +8,13 @@ source_areas AS (
   WHERE oa.geom IS NOT NULL
     AND oa.ts018_0004 IS NOT NULL
     AND oa.ts018_0001 IS NOT NULL
-    AND public.ST_Intersects(oa.geom, public.ST_MakeEnvelope(-2.867459375, 53.360537816492, -0.230740625, 54.236487833856, 4326))
+    AND public.ST_Intersects(
+      oa.geom,
+      public.ST_MakeEnvelope(
+        -2.867459375, 53.360537816492,
+        -0.230740625, 54.236487833856, 4326
+      )
+    )
 ),
 scope_cells AS (
   SELECT h3_polygon_to_cells(_mapp_h3_scope.geom_4326, 9) AS h3_id
@@ -18,8 +24,7 @@ cells AS (
   SELECT
     scope_cells.h3_id,
     public.ST_GeomFromWKB(
-      h3_cell_to_boundary_wkb(scope_cells.h3_id),
-      4326
+      h3_cell_to_boundary_wkb(scope_cells.h3_id), 4326
     )::public.geometry(Polygon, 4326) AS geom_4326
   FROM scope_cells
 ),
@@ -47,18 +52,32 @@ cell_overlaps AS (
 weighted AS (
   SELECT
     overlap.h3_id,
+    overlap.geom_4326,
+    SUM(
+      overlap.ts018_0004 * overlap.overlap_m2 /
+      NULLIF(overlap.area_m2, 0.0)
+    )::double precision AS arrived_age_0_4,
+    SUM(
+      overlap.ts018_0001 * overlap.overlap_m2 /
+      NULLIF(overlap.area_m2, 0.0)
+    )::double precision AS total_population
+  FROM cell_overlaps AS overlap
+  GROUP BY overlap.h3_id, overlap.geom_4326
+),
 metrics AS (
   SELECT
     weighted.*,
-    100.0 * weighted.arrived_age_0_4 / NULLIF(weighted.total_population, 0.0) AS local_percent,
-    100.0 * (SELECT SUM(COALESCE(ts018_0004, 0.0)) FROM leeds.census_2021_england_oa) /
-      NULLIF((SELECT SUM(COALESCE(ts018_0001, 0.0)) FROM leeds.census_2021_england_oa), 0.0) AS national_average_percent
+    100.0 * weighted.arrived_age_0_4 /
+      NULLIF(weighted.total_population, 0.0) AS local_percent,
+    100.0 *
+      (SELECT SUM(COALESCE(ts018_0004, 0.0))
+       FROM leeds.census_2021_england_oa) /
+      NULLIF(
+        (SELECT SUM(COALESCE(ts018_0001, 0.0))
+         FROM leeds.census_2021_england_oa),
+        0.0
+      ) AS national_average_percent
   FROM weighted
-)
-    100.0 * national.national_arrived_age_0_4 / NULLIF(national.national_total_population, 0.0) AS national_average_percent
-  FROM weighted
-  JOIN national_totals AS national
-    ON national.national_total_population IS NOT NULL
 )
 SELECT
   h3_id::text AS h3_id,
@@ -78,7 +97,8 @@ SELECT
   to_char(round(total_population::numeric, 1), 'FM999G999G999G990D0')::text AS total_population_display,
   to_char(round(local_percent::numeric, 1), 'FM990D0') || '%' AS local_percent_display,
   to_char(round(national_average_percent::numeric, 1), 'FM990D0') || '%' AS national_average_display,
-  ('Arrived aged 0–4: ' || to_char(round(arrived_age_0_4::numeric, 1), 'FM999G999G999G990D0') ||
+  ('Arrived aged 0–4: ' ||
+    to_char(round(arrived_age_0_4::numeric, 1), 'FM999G999G999G990D0') ||
     ' (' || to_char(round(local_percent::numeric, 1), 'FM990D0') || '%)')::text AS hover_text,
   public.ST_Transform(geom_4326, 3857)::public.geometry(Polygon, 3857) AS geom_3857
 FROM metrics
