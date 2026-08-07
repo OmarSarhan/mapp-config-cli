@@ -701,12 +701,14 @@ writing the derived SQL. This applies to table and view relations only;
 PostgreSQL, PostGIS, and H3 functions used inside the query do not need
 semantic profiles.
 
-Put the query in a file so shell parsing cannot change it:
+Put the query in a file so shell parsing cannot change it. Store generated SQL
+drafts in the repository-local, git-ignored `tmp/` directory rather than the
+repository root, and do not commit them:
 
 ```sh
 config-cli derived-layers create paths_h3_r9 \
   --kind view \
-  --query-file paths-h3-r9.sql \
+  --query-file tmp/paths-h3-r9.sql \
   --source leeds.definitive_paths \
   --id-column h3_id \
   --geometry-column geom_3857 \
@@ -728,7 +730,7 @@ does not change this mandatory behavior:
 config-cli derived-layers map-extent --locale Leeds
 config-cli derived-layers create paths_h3_r9 \
   --kind materialized \
-  --query-file paths-h3-r9.sql \
+  --query-file tmp/paths-h3-r9.sql \
   --source leeds.definitive_paths \
   --id-column h3_id \
   --geometry-column geom_3857 \
@@ -879,7 +881,7 @@ Atomically replace a definition or convert its kind:
 ```sh
 config-cli derived-layers replace paths_h3_r9 \
   --kind materialized \
-  --query-file paths-h3-r9.sql \
+  --query-file tmp/paths-h3-r9.sql \
   --source leeds.definitive_paths \
   --id-column h3_id \
   --geometry-column geom_3857 \

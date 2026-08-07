@@ -327,6 +327,12 @@ relation does not add it to XYZ. Inspect the new catalog relation and use the
 normal revision-bound proposal and approval workflow for the workspace layer
 as a separate step.
 
+Store agent- or operator-generated derived-layer SQL drafts under the
+repository-local, git-ignored `tmp/` directory, for example
+`tmp/paths-h3-r9.sql`. Do not put temporary SQL in the repository root or
+commit it. The CLI reads the selected `--query-file`; it does not require the
+draft to be tracked.
+
 Managed derived relation names must match
 `^[a-z][a-z0-9_]{0,62}$`: start with a lowercase ASCII letter, then use only
 lowercase letters, digits, and underscores, up to 63 characters. Use the same
