@@ -3837,6 +3837,7 @@ class CliTests(unittest.TestCase):
                     "artifacts": {
                         "beforePage": "run-1/before-page.png",
                         "afterPage": "run-1/after-page.png",
+                        "hoverTooltip": None,
                     },
                 },
             },
@@ -3876,6 +3877,7 @@ class CliTests(unittest.TestCase):
         payload = json.loads(stdout)
         self.assertEqual(payload["localArtifacts"]["beforePage"], str(before))
         self.assertEqual(payload["localArtifacts"]["afterPage"], str(after))
+        self.assertNotIn("hoverTooltip", payload["localArtifacts"])
         self.assertEqual(before_bytes, b"before")
         self.assertEqual(after_bytes, b"after")
         self.assertEqual(root_mode, 0o700)

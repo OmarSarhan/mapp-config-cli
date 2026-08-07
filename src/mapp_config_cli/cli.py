@@ -4167,6 +4167,11 @@ def _artifact_paths(data: dict[str, Any]) -> dict[str, str]:
     invalid: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
     for name, path in artifacts.items():
+        # Visual reports include optional artifact slots (for example hover or
+        # panel captures) as null when that capture was not requested or did
+        # not occur. They are absent artifacts, not unsafe paths.
+        if path is None:
+            continue
         reason = None
         if not isinstance(name, str) or not name:
             reason = "artifact name is not a non-empty string"
