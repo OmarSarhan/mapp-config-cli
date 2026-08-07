@@ -179,6 +179,13 @@ names, and tables are different identifiers.
 - A theme or feature-driven style may override a simple default colour. Explain
   that limitation rather than claiming the change affects every feature.
 
+When categorized symbology needs the actual stored categories, use
+`layers values LAYER FIELD [--limit N]` instead of guessing labels from field
+metadata or sampling raw rows. The response contains bounded category counts,
+null and distinct totals, and a `truncated` flag. It requires the same
+`derive + semantic:inspect` authority as managed derived-layer creation; do not
+request that elevated authority solely for an ordinary metadata inspection.
+
 Do not confuse a layer's `markerLetter` icon with XYZ's selected-location pin.
 The pinned XYZ framework builds that UI pin at runtime from
 `locale.locations.pinStyle`, then supplies:

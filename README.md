@@ -112,6 +112,7 @@ Inspect the bound instance:
 config-cli --profile production describe
 config-cli --profile production workspace get
 config-cli --profile production layers get "Bus Stops"
+config-cli --profile production layers values "Bus Stops" town --limit 100
 config-cli --profile production semantic catalog search "bus stops"
 config-cli --profile production semantic catalog show ASSET_ID
 config-cli --profile production semantic catalog history ASSET_ID

@@ -184,6 +184,13 @@ def positive_integer(value: str) -> int:
     return number
 
 
+def layer_values_limit(value: str) -> int:
+    number = positive_integer(value)
+    if number > 500:
+        raise argparse.ArgumentTypeError("value must not exceed 500")
+    return number
+
+
 def prompt(message: str, stream: TextIO) -> str:
     """Write interactive prompts to the diagnostic stream, never JSON stdout."""
     print(message, end="", file=stream, flush=True)
@@ -326,6 +333,17 @@ def parser() -> JsonArgumentParser:
     layer_get = layer_actions.add_parser("get")
     layer_get.add_argument("key")
     layer_get.add_argument("--locale")
+    layer_values = layer_actions.add_parser(
+        "values",
+        help=(
+            "Return bounded category counts for a stored layer field; "
+            "requires derived-layer creation authority."
+        ),
+    )
+    layer_values.add_argument("key")
+    layer_values.add_argument("field")
+    layer_values.add_argument("--locale")
+    layer_values.add_argument("--limit", type=layer_values_limit, default=100)
     layer_style_elements = layer_actions.add_parser(
         "style-elements",
         help="Inspect the effective XYZ Styling-panel elements for one layer.",
@@ -5857,6 +5875,50 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
         return _with_context(result, context)
 
     if args.command == "layers":
+        if args.action == "values":
+            query = {"field": args.field, "limit": args.limit}
+            if args.locale is not None:
+                query["locale"] = args.locale
+            result = client.request(
+                "/api/layers/"
+                + urllib.parse.quote(args.key, safe="")
+                + "/values?"
+                + urllib.parse.urlencode(query)
+            )
+            count_fields = (
+                "totalCount", "nonNullCount", "nullCount", "distinctCount",
+            )
+            values = result.get("values")
+            if (
+                not isinstance(result.get("revision"), str)
+                or not result["revision"]
+                or not isinstance(result.get("locale"), str)
+                or not result["locale"]
+                or result.get("key") != args.key
+                or result.get("field") != args.field
+                or not isinstance(result.get("fieldType"), str)
+                or not result["fieldType"]
+                or any(
+                    not _nonnegative_integer(result.get(field))
+                    for field in count_fields
+                )
+                or not isinstance(values, list)
+                or any(
+                    not isinstance(item, dict)
+                    or set(item) != {"value", "count"}
+                    or not _nonnegative_integer(item.get("count"))
+                    for item in values
+                )
+                or result.get("limit") != args.limit
+                or not isinstance(result.get("truncated"), bool)
+            ):
+                raise _invalid_response(
+                    "Layer values",
+                    result,
+                    error_code="layer.values_invalid_response",
+                )
+            return _with_context(result, context)
+
         layers_path = "/api/layers"
         if args.locale is not None:
             layers_path += "?" + urllib.parse.urlencode({"locale": args.locale})

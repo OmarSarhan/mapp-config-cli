@@ -410,7 +410,10 @@ class CliTests(unittest.TestCase):
 
     def test_describe_includes_target_workspace_auth_and_versions(self):
         routes = standard_routes()
-        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            JsonServer(routes) as server,
+        ):
             store = self.configured_store(directory, server.endpoint)
             code, stdout, stderr = self.invoke(["describe"], store)
         self.assertEqual(code, 0, stderr)
@@ -4795,6 +4798,53 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         payload = json.loads(stdout)
         self.assertEqual(list(payload["layers"]), ["Bus Stops", "Paths"])
+
+    def test_layer_values_requests_bounded_aggregates_for_symbology(self):
+        captured = {}
+
+        def values(request):
+            captured["query"] = request["query"]
+            return 200, {
+                "revision": "rev-1",
+                "locale": "cy",
+                "key": "Arrival Areas",
+                "field": "arrival age",
+                "fieldType": "text",
+                "totalCount": 12,
+                "nonNullCount": 10,
+                "nullCount": 2,
+                "distinctCount": 3,
+                "values": [
+                    {"value": "0-4", "count": 6},
+                    {"value": "5-10", "count": 3},
+                ],
+                "limit": 2,
+                "truncated": True,
+            }
+
+        routes = standard_routes()
+        routes[(
+            "GET", "/api/layers/Arrival%20Areas/values"
+        )] = values
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "layers", "values", "Arrival Areas", "arrival age",
+                    "--locale", "cy", "--limit", "2",
+                ],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            "field=arrival+age&limit=2&locale=cy",
+            captured["query"],
+        )
+        payload = json.loads(stdout)
+        self.assertEqual(3, payload["distinctCount"])
+        self.assertTrue(payload["truncated"])
+        self.assertEqual("0-4", payload["values"][0]["value"])
 
     def test_style_elements_reports_configured_effective_and_rendered_controls(self):
         routes = standard_routes()
