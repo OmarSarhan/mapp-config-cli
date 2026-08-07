@@ -356,10 +356,12 @@ and materialized views; preserve the accepted
 `nested_loop_pair_work` and valid over-limit planning evidence receives
 additive `details.clientGuidance` from the CLI. Present the server's unchanged
 message, action, reasons, and probe first, then use that client guidance to
-rewrite the query: keep high-cardinality join inputs directly indexable,
-move complete-input totals into a one-row scalar result referenced after
-selective aggregation, preserve row-dependent window semantics, compute
-repeated expensive expressions once, and resubmit the revised definition so
+rewrite the query: perform the selective candidate match on a native geometry
+or the exact prepared transform expression before materializing joined rows;
+aggregate pair-local metrics only after that match; compute compatible
+complete-input totals together in a single one-row aggregate referenced after the
+selective aggregation; preserve row-dependent window semantics; compute
+transformations, intersections, and areas once at that narrowed stage; and resubmit the revised definition so
 server preflight runs again. Do not
 automatically rewrite SQL. Preserve complete-input totals and the exact spatial
 acceptance predicate while reducing work.
@@ -408,6 +410,14 @@ potentially flooding PostgreSQL logs. If a derived-layer create or refresh
 reports HTTP `5xx`,
 inspect `derived-layers list|show` and the catalog before retrying because the
 database relation may already have committed.
+
+For UK metric area weighting, the bundled platform prepares the exact
+`ST_Transform(source.geom, 27700)` GiST expression. Put that expression in the
+selective `&&`/`ST_Intersects` candidate predicate before materializing matched
+pairs; a materialized CTE containing all transformed source rows hides the
+expression index. Transform each generated cell once, compute intersection and
+source areas once for accepted pairs, then aggregate pair-local metrics. Keep
+complete-input benchmarks in a separate one-row aggregate attached afterward.
 
 Lower-level H3 point input uses PostgreSQL point order `(longitude, latitude)`.
 When line-to-cell generation is required, segment endpoint traversal plus a

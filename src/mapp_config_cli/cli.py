@@ -1477,25 +1477,27 @@ def _derived_client_guidance(
             {
                 "id": "keep-high-cardinality-inputs-indexable",
                 "message": (
-                    "Keep high-cardinality join inputs directly visible to "
-                    "the planner and place selective predicates where an "
-                    "applicable index can be used."
+                    "Perform the selective candidate match on a native "
+                    "geometry or an exact prepared transform expression "
+                    "before materializing or aggregating joined rows."
                 ),
             },
             {
                 "id": "separate-complete-input-aggregate",
                 "message": (
-                    "Move complete-input totals out of the high-cardinality "
-                    "join path. Compute global totals as a one-row scalar "
-                    "result and reference them after selective aggregation; "
-                    "preserve row-dependent window semantics."
+                    "Aggregate pair-local metrics after the selective match. "
+                    "Move complete-input totals out of that join path, "
+                    "compute compatible global totals together in a single "
+                    "one-row aggregate, and attach it afterward; preserve "
+                    "row-dependent window semantics."
                 ),
             },
             {
                 "id": "compute-expensive-expression-once",
                 "message": (
-                    "Compute each repeated expensive expression once at the "
-                    "narrowest reusable stage."
+                    "Compute transformations, intersections, and areas once "
+                    "after the selective match. An inline CTE alias does not "
+                    "guarantee one evaluation."
                 ),
             },
             {

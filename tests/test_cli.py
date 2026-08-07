@@ -1813,6 +1813,21 @@ class CliTests(unittest.TestCase):
             ],
             [step["id"] for step in guidance["steps"]],
         )
+        messages = {
+            step["id"]: step["message"] for step in guidance["steps"]
+        }
+        self.assertIn(
+            "exact prepared transform expression",
+            messages["keep-high-cardinality-inputs-indexable"],
+        )
+        self.assertIn(
+            "single one-row aggregate",
+            messages["separate-complete-input-aggregate"],
+        )
+        self.assertIn(
+            "inline CTE alias",
+            messages["compute-expensive-expression-once"],
+        )
 
     def test_derived_create_omits_guidance_for_unproved_pair_work(self):
         malformed_probe = query_planning_probe(

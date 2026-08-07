@@ -591,10 +591,13 @@ repair a dependency declaration.
 For `derived_layer.query_too_expensive` reason `nested_loop_pair_work`, a valid
 over-limit `queryPlanningProbe` lets the CLI add
 `details.clientGuidance` without changing the server error. Use its generic
-authoring steps: keep high-cardinality join inputs directly indexable; compute
-complete-input global totals as a one-row scalar result referenced after the
-selective aggregation while preserving row-dependent window semantics;
-compute repeated expensive expressions once; and resubmit the revised
+authoring steps: perform the selective candidate match on a native geometry or
+the exact prepared transform expression before materializing joined rows;
+aggregate pair-local metrics after that match; compute compatible complete-input
+global totals together in a single one-row aggregate referenced after the selective
+aggregation while preserving row-dependent window semantics; compute
+transformations, intersections, and areas once at that narrowed stage rather
+than relying on an inline CTE alias; and resubmit the revised
 definition so preflight runs again. Never auto-rewrite the SQL or change its
 meaning merely to pass admission. Preserve totals intended for the complete
 declared input and retain the exact spatial predicate that turns generated
@@ -626,6 +629,14 @@ deliberately over-select when the goal is "cells that touch" a source feature;
 follow that with an exact `ST_Intersects` or other reviewed predicate against
 the complete original source geometry so the derived table semantics are clear.
 Do not substitute a subset when a layer-wide aggregate must use complete input.
+
+For UK metric area weighting, the bundled platform prepares the exact
+`ST_Transform(source.geom, 27700)` GiST expression. Put that expression in the
+selective `&&`/`ST_Intersects` candidate predicate before materializing matched
+pairs; a materialized CTE containing all transformed source rows hides the
+expression index. Transform each generated cell once, compute intersection and
+source areas once for accepted pairs, then aggregate pair-local metrics. Keep
+complete-input benchmarks in a separate one-row aggregate attached afterward.
 
 Restricted server search paths can expose extension-wrapper assumptions. If a
 higher-level H3/PostGIS wrapper fails with missing `geometry`, `st_dump`, or

@@ -815,10 +815,13 @@ those two lists match instead of treating the failure as query cost.
 When a compute failure contains reason `nested_loop_pair_work` and a valid
 over-limit `queryPlanningProbe`, the CLI adds `details.clientGuidance` without
 altering any server field. The guidance is an authoring aid, not a SQL rewrite:
-keep high-cardinality join inputs directly visible to applicable indexes;
-calculate complete-input global totals as a one-row scalar result referenced
-after selective aggregation while preserving row-dependent window semantics;
-calculate repeated expensive expressions once; then resubmit the revised
+perform the selective candidate match on a native geometry or the exact
+prepared transform expression before materializing joined rows; aggregate
+pair-local metrics after that match; calculate compatible complete-input
+global totals together in a single one-row aggregate referenced after selective
+aggregation while preserving row-dependent window semantics; calculate
+transformations, intersections, and areas once at that narrowed stage rather
+than relying on an inline CTE alias; then resubmit the revised
 definition so the server reruns preflight before mutation. Do not reduce pair
 work by sampling or map-filtering totals whose intended meaning covers the
 complete declared input, and retain the reviewed exact spatial predicate after
