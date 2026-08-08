@@ -89,6 +89,7 @@ named-command gate.
 | `describe`, `schema`, `rules`, `examples`, `explain-error` | Identity, contract/connect, workspace, and guidance reads | Command-advertised read | `inspect` after unauthenticated public identity |
 | `capabilities list\|show` | `/api/capabilities` | Returns `actions[]` | Any authenticated credential, including a semantic-only token |
 | `plugins list\|show\|validate\|usage` | `/api/plugins` | Command-advertised read | `inspect` |
+| `dependencies list\|check` | `/api/dependencies` | Command-advertised read of active workspace and derived-layer relation references | `inspect` |
 | `workspace get`, `layers list\|get\|style-elements\|filters`, `catalog list`, `icons list`, `sql capabilities` | Corresponding authenticated GET routes | Command-advertised reads; layer commands require the `layers effective` compatibility marker | `inspect` |
 | `layers values`, `layers statistics` | `/api/layers/{key}/values`, `/api/layers/{key}/statistics` | `layers.values`, `layers.statistics`; statistics also requires the exact `layers statistics` command | `derive` + `semantic:inspect` |
 | `validate` | `/api/validate` | Command-advertised non-saving validation | Legacy `full` or administrator session |
@@ -723,6 +724,22 @@ existing renderer from numeric to text, the current live entry may not be
 selectable through standalone `sql test`; the exact complete candidate must
 still pass `proposals check`. A standalone selector error does not establish
 that an expression is valid or invalid by itself.
+
+## Platform dependencies
+
+Before deleting a PostgreSQL table, view, or materialized view outside the
+managed derived-layer commands, inspect platform references:
+
+```sh
+config-cli dependencies check --alias MAPP --schema leeds --relation bus_stops
+```
+
+`dependencies list` reports every known relation referenced by the effective
+workspace or managed derived-layer catalog. `dependencies check` returns
+`blocked: true` when the selected relation still has platform references. This
+is read-only advisory evidence from the platform; it does not discover external
+readers, grant database access, or replace the normal proposal workflow needed
+to remove workspace references.
 
 ## Managed derived layers
 

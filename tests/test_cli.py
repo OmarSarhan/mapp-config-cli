@@ -4036,6 +4036,15 @@ class CliTests(unittest.TestCase):
                 ["layers", "statistics", "Areas", "percentage"],
             ),
             (
+                "dependencies check",
+                [
+                    "dependencies", "check",
+                    "--alias", "MAPP",
+                    "--schema", "leeds",
+                    "--relation", "areas",
+                ],
+            ),
+            (
                 "derived-layers plan-area-weighted-h3",
                 [
                     "derived-layers", "plan-area-weighted-h3",
@@ -5355,6 +5364,82 @@ class CliTests(unittest.TestCase):
         self.assertEqual(3, payload["distinctCount"])
         self.assertTrue(payload["truncated"])
         self.assertEqual("0-4", payload["values"][0]["value"])
+
+    def test_dependencies_list_and_check_inspect_platform_references(self):
+        captured = {}
+        dependencies = [
+            {
+                "alias": "MAPP",
+                "relation": "leeds.bus_stops",
+                "workspaceLayers": ["locale:Bus Stops"],
+                "derivedLayers": ["bus_stop_density"],
+                "futureField": "accepted",
+            },
+        ]
+
+        def dependencies_route(request):
+            captured["query"] = request["query"]
+            if not request["query"]:
+                return 200, {"dependencies": dependencies}
+            return 200, {
+                "alias": "MAPP",
+                "schema": "leeds",
+                "relation": "bus_stops",
+                "matches": dependencies,
+                "blocked": True,
+                "message": "Delete is blocked by active platform references.",
+            }
+
+        routes = standard_routes()
+        routes[("GET", "/api/dependencies")] = dependencies_route
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            list_code, list_stdout, list_stderr = self.invoke(
+                ["dependencies", "list"],
+                store,
+            )
+            check_code, check_stdout, check_stderr = self.invoke(
+                [
+                    "dependencies", "check",
+                    "--alias", "MAPP",
+                    "--schema", "leeds",
+                    "--relation", "bus_stops",
+                ],
+                store,
+            )
+
+        self.assertEqual(0, list_code, list_stderr)
+        listed = json.loads(list_stdout)
+        self.assertEqual("leeds.bus_stops", listed["dependencies"][0]["relation"])
+        self.assertEqual("accepted", listed["dependencies"][0]["futureField"])
+        self.assertEqual(0, check_code, check_stderr)
+        self.assertEqual(
+            "alias=MAPP&schema=leeds&relation=bus_stops",
+            captured["query"],
+        )
+        checked = json.loads(check_stdout)
+        self.assertTrue(checked["blocked"])
+        self.assertEqual(["locale:Bus Stops"], checked["matches"][0]["workspaceLayers"])
+
+    def test_dependencies_reject_malformed_reference_responses(self):
+        routes = standard_routes()
+        routes[("GET", "/api/dependencies")] = (200, {
+            "dependencies": [{
+                "alias": "MAPP",
+                "relation": "leeds.bus_stops",
+                "workspaceLayers": ["locale:Bus Stops"],
+            }],
+        })
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(["dependencies", "list"], store)
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(
+            "dependencies.invalid_response",
+            json.loads(stderr)["code"],
+        )
 
     def test_layer_statistics_requests_bounded_numeric_aggregates(self):
         captured = {}

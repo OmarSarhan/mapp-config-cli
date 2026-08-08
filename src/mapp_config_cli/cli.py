@@ -317,6 +317,25 @@ def parser() -> JsonArgumentParser:
     capability_actions.add_parser("list")
     capability_show = capability_actions.add_parser("show")
     capability_show.add_argument("id")
+    dependencies_command = commands.add_parser(
+        "dependencies",
+        help="Inspect platform workspace and derived-layer relation references.",
+    )
+    dependency_actions = dependencies_command.add_subparsers(
+        dest="action",
+        required=True,
+    )
+    dependency_actions.add_parser(
+        "list",
+        help="List database relations referenced by workspace and derived layers.",
+    )
+    dependency_check = dependency_actions.add_parser(
+        "check",
+        help="Check whether one database relation has active platform references.",
+    )
+    dependency_check.add_argument("--alias", required=True, type=nonempty)
+    dependency_check.add_argument("--schema", required=True, type=nonempty)
+    dependency_check.add_argument("--relation", required=True, type=nonempty)
     plugins_command = commands.add_parser(
         "plugins",
         help="Inspect the server-audited pinned XYZ plugin system.",
@@ -935,7 +954,8 @@ def required_contract_command(args) -> str:
         return "rules"
     if args.command in {
         "workspace", "catalog", "icons", "auth", "xyz", "sql",
-        "capabilities", "plugins", "operations", "derived-layers",
+        "capabilities", "dependencies", "plugins", "operations",
+        "derived-layers",
     }:
         return f"{args.command} {args.action}"
     if args.command == "layers":
@@ -3416,6 +3436,74 @@ def _validate_layer_statistics_response(
             "Layer statistics",
             data,
             error_code="layer.statistics_invalid_response",
+        )
+
+
+def _dependency_reference(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and {"alias", "relation", "workspaceLayers", "derivedLayers"} <= set(value)
+        and isinstance(value.get("alias"), str)
+        and bool(value["alias"])
+        and isinstance(value.get("relation"), str)
+        and bool(value["relation"])
+        and isinstance(value.get("workspaceLayers"), list)
+        and isinstance(value.get("derivedLayers"), list)
+        and all(
+            isinstance(item, str) and bool(item)
+            for item in value["workspaceLayers"]
+        )
+        and all(
+            isinstance(item, str) and bool(item)
+            for item in value["derivedLayers"]
+        )
+    )
+
+
+def _validate_dependencies_list_response(data: dict[str, Any]) -> None:
+    dependencies = data.get("dependencies")
+    if (
+        not _has_exact_response_keys(data, {"dependencies"})
+        or not isinstance(dependencies, list)
+        or not all(_dependency_reference(item) for item in dependencies)
+        or len({
+            (item["alias"], item["relation"])
+            for item in dependencies
+            if isinstance(item, dict)
+        }) != len(dependencies)
+    ):
+        raise _invalid_response(
+            "Dependencies",
+            data,
+            error_code="dependencies.invalid_response",
+        )
+
+
+def _validate_dependencies_check_response(
+    data: dict[str, Any],
+    *,
+    args: Any,
+) -> None:
+    matches = data.get("matches")
+    if (
+        not _has_exact_response_keys(
+            data,
+            {"alias", "schema", "relation", "matches", "blocked", "message"},
+        )
+        or data.get("alias") != args.alias
+        or data.get("schema") != args.schema
+        or data.get("relation") != args.relation
+        or not isinstance(matches, list)
+        or not all(_dependency_reference(item) for item in matches)
+        or not isinstance(data.get("blocked"), bool)
+        or data["blocked"] != bool(matches)
+        or not isinstance(data.get("message"), str)
+        or not data["message"]
+    ):
+        raise _invalid_response(
+            "Dependency check",
+            data,
+            error_code="dependencies.invalid_response",
         )
 
 
@@ -6444,6 +6532,20 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 error_code="rules.not_found",
             )
         return _with_context({"rule": match}, context)
+
+    if args.command == "dependencies":
+        if args.action == "list":
+            result = client.request("/api/dependencies")
+            _validate_dependencies_list_response(result)
+        else:
+            query = urllib.parse.urlencode({
+                "alias": args.alias,
+                "schema": args.schema,
+                "relation": args.relation,
+            })
+            result = client.request(f"/api/dependencies?{query}")
+            _validate_dependencies_check_response(result, args=args)
+        return _with_context(result, context)
 
     if args.command == "workspace":
         result = client.request("/api/workspace")

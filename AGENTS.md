@@ -360,6 +360,14 @@ or prevent index use. Always explain new or changed SQL and require explicit
 approval. The CLI is not an unrestricted SQL shell and cannot perform database
 schema or row changes.
 
+Before deleting a PostgreSQL table, view, or materialized view through any
+non-CLI database path, inspect platform references with
+`config-cli dependencies check --alias ALIAS --schema SCHEMA --relation NAME`.
+`dependencies list` and `check` are read-only and report only platform-known
+workspace and managed derived-layer references; they do not discover external
+database readers or replace the proposal workflow for removing workspace
+references.
+
 Managed derived layers are a separate privileged workflow. They create only a
 server-validated view or materialized view in `derived_layers` and require the
 `derive` scope. Present and obtain explicit authorization for creation,

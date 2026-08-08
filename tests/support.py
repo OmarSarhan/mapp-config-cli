@@ -111,6 +111,8 @@ def standard_routes(
                     "examples",
                     "capabilities list",
                     "capabilities show",
+                    "dependencies list",
+                    "dependencies check",
                     "plugins list",
                     "plugins show",
                     "plugins validate",

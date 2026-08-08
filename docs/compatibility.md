@@ -188,6 +188,10 @@ Numeric distribution inspection additionally requires the exact
 `layers.statistics` schema explicitly with `capabilities show`; ordinary
 command execution does not refetch action schemas after verifying the command
 contract.
+Platform dependency inspection requires the exact `dependencies list` or
+`dependencies check` command before calling `/api/dependencies`; older
+compatible servers can omit it, and the CLI must then report
+`capability.missing` instead of guessing references from workspace JSON alone.
 The area-weighted H3 planner likewise requires the exact
 `derived-layers plan-area-weighted-h3` command. Inspect
 `derived-layers.plan-area-weighted-h3` explicitly for its current request,
