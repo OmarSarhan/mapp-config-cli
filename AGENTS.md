@@ -186,6 +186,16 @@ null and distinct totals, and a `truncated` flag. It requires the same
 `derive + semantic:inspect` authority as managed derived-layer creation; do not
 request that elevated authority solely for an ordinary metadata inspection.
 
+For numeric symbology and Filtering controls backed by a rounded derived-layer
+display field, inspect the complete, non-truncated published values first. Use
+regular requested increments through the observed maximum, then make the final
+theme category a partial interval ending at that maximum. With
+`graduated_breaks: "less_than"`, set that final category's technical cutoff one
+display increment above the maximum so its top value is included. Likewise,
+set a numeric filter's `max` one display increment above the observed maximum,
+while retaining the requested increment; do not put the highest value directly
+on either exclusive thematic or UI control boundary.
+
 Do not confuse a layer's `markerLetter` icon with XYZ's selected-location pin.
 The pinned XYZ framework builds that UI pin at runtime from
 `locale.locations.pinStyle`, then supplies:
