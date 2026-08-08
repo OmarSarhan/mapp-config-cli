@@ -2168,9 +2168,10 @@ def _complete_background_operation(
                             cause=invalid,
                         ) from invalid
                     return result, operation_id
+                operation_result = operation.get("result")
                 terminal_details = (
-                    dict(operation.get("result"))
-                    if isinstance(operation.get("result"), dict)
+                    dict(operation_result)
+                    if isinstance(operation_result, dict)
                     else {}
                 )
                 terminal_details["operation"] = operation
@@ -6098,15 +6099,18 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
         if not isinstance(external, list) or any(not isinstance(item, dict) for item in external):
             raise _invalid_response("Plugins", result, error_code="plugins.invalid_response")
         if args.action == "show":
-            selected = next((item for item in bundled if item.get("key") == args.key), None)
-            selected = selected or next((
+            plugin_selected: dict[str, Any] | None = next(
+                (item for item in bundled if item.get("key") == args.key),
+                None,
+            )
+            plugin_selected = plugin_selected or next((
                 item for item in external
                 if args.key in {
                     item.get("id"), item.get("registrationKey"),
                     item.get("configurationKey"), item.get("entryUrl"),
                 }
             ), None)
-            if selected is None:
+            if plugin_selected is None:
                 raise CliError(
                     f"The connected platform does not advertise plugin {args.key}.",
                     EXIT_VALIDATION,
@@ -6118,7 +6122,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 "xyzCommit": manifest.get("xyzCommit"),
                 "pluginCatalogueFingerprint": manifest.get("fingerprint"),
                 "registrySource": manifest.get("registrySource"),
-                "plugin": selected,
+                "plugin": plugin_selected,
                 "loading": manifest.get("loading"),
                 "dispatch": manifest.get("dispatch"),
                 "security": manifest.get("security"),
@@ -6169,18 +6173,18 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
         if args.action in {"wait", "cancel"}:
             _validate_background_wait(args.wait_timeout, args.interval)
             deadline = time.monotonic() + args.wait_timeout
-        result = None
+        operation_response: dict[str, Any] | None = None
         if args.action == "cancel":
-            result = client.request(
+            operation_response = client.request(
                 f"/api/operations/{quote_segment(args.id)}/cancel",
                 method="POST",
                 payload={"confirmed": True},
             )
         last_status: Any = "unknown"
         while True:
-            if result is None:
+            if operation_response is None:
                 try:
-                    result = client.request(
+                    operation_response = client.request(
                         f"/api/operations/{quote_segment(args.id)}"
                     )
                 except CliError as exc:
@@ -6191,11 +6195,11 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                             cause=exc,
                         ) from exc
                     raise
-            operation = result.get("operation")
+            operation = operation_response.get("operation")
             if not isinstance(operation, dict) or not isinstance(operation.get("status"), str):
                 raise _invalid_response(
                     "Operation",
-                    result,
+                    operation_response,
                     error_code="operation.invalid_response",
                 )
             last_status = operation["status"]
@@ -6206,7 +6210,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     status = operation["status"]
                     raise _terminal_operation_error(
                         operation,
-                        details=result,
+                        details=operation_response,
                         failed_exit_code=(
                             EXIT_VISUAL
                             if status == "failed"
@@ -6225,7 +6229,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     if operation["status"] == "indeterminate":
                         raise _terminal_operation_error(
                             operation,
-                            details=result,
+                            details=operation_response,
                             failed_exit_code=EXIT_CONFLICT,
                             failed_message="Operation could not be cancelled.",
                             indeterminate_message=(
@@ -6236,14 +6240,14 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     raise CliError(
                         "The operation reached a terminal state before cancellation was confirmed.",
                         EXIT_CONFLICT,
-                        details=result,
+                        details=operation_response,
                         error_code="operation.cancel_not_applied",
                     )
-                return _with_context(result, context)
+                return _with_context(operation_response, context)
             if operation["status"] not in {"running", "cancelling"}:
                 raise _invalid_response(
                     "Operation",
-                    result,
+                    operation_response,
                     error_code="operation.invalid_response",
                 )
             if time.monotonic() >= deadline:
@@ -6266,7 +6270,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     error_code="operation.wait_timeout",
                 )
             time.sleep(args.interval)
-            result = None
+            operation_response = None
 
     if args.command == "doctor":
         actor, scopes = _auth_from_response(target.connection)

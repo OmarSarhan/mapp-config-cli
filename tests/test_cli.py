@@ -6756,7 +6756,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(EXIT_VISUAL, code)
         self.assertEqual("", stdout)
         self.assertEqual(
-            "operation.failed",
+            "visual.failed",
             json.loads(stderr)["code"],
         )
 
