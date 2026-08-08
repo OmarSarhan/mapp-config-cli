@@ -42,7 +42,9 @@ edit, upload, or replace the remote `workspace.json` directly.
    screenshot is not complete evidence for a mixed proposal. Present the
    proposal ID, target identity, base revision, explanation, focused JSON diff,
    validation results, warnings, SQL risks, the coverage checklist, available
-   visual evidence, and every disclosed evidence gap to the user.
+   visual evidence, and every disclosed evidence gap to the user. Present the
+   key before/after screenshots inline in the chat; artifact paths are
+   supporting material, not the primary review surface.
 9. Treat the original change request as intent, not approval. Wait for a
    separate, explicit approval of the reviewed proposal.
 10. Only after approval, apply the exact proposal with:
