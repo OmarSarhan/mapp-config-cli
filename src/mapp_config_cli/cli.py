@@ -6,6 +6,7 @@ import getpass
 import json
 import math
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -13,7 +14,7 @@ import time
 import urllib.parse
 import webbrowser
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, NoReturn, Sequence, TextIO
+from typing import Any, NoReturn, Sequence, TextIO, cast
 
 from .client import (
     MAX_RESPONSE_BYTES,
@@ -76,6 +77,8 @@ _SAFE_DEFAULT_DEVICE_SCOPES = frozenset({
 MAX_LOCAL_FILE_BYTES = 5 * 1024 * 1024
 MAX_VISUAL_ARTIFACTS = 16
 MAX_VISUAL_ARTIFACT_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_LAYER_STATISTICS_BINS = 50
+MAX_LAYER_STATISTICS_CUTS = 20
 _LOCAL_READ_CHUNK_BYTES = 64 * 1024
 
 
@@ -188,6 +191,15 @@ def layer_values_limit(value: str) -> int:
     number = positive_integer(value)
     if number > 500:
         raise argparse.ArgumentTypeError("value must not exceed 500")
+    return number
+
+
+def layer_statistics_bins(value: str) -> int:
+    number = positive_integer(value)
+    if number > MAX_LAYER_STATISTICS_BINS:
+        raise argparse.ArgumentTypeError(
+            f"value must not exceed {MAX_LAYER_STATISTICS_BINS}"
+        )
     return number
 
 
@@ -347,6 +359,40 @@ def parser() -> JsonArgumentParser:
     layer_values.add_argument("field")
     layer_values.add_argument("--locale")
     layer_values.add_argument("--limit", type=layer_values_limit, default=100)
+    layer_statistics = layer_actions.add_parser(
+        "statistics",
+        help=(
+            "Return bounded distribution statistics for a numeric layer field; "
+            "requires derived-layer creation authority."
+        ),
+    )
+    layer_statistics.add_argument("key")
+    layer_statistics.add_argument("field")
+    layer_statistics.add_argument("--locale")
+    layer_statistics.add_argument(
+        "--bins",
+        type=layer_statistics_bins,
+        default=10,
+        help="Histogram bin count from 1 to 50 (default: 10).",
+    )
+    layer_statistics.add_argument(
+        "--threshold",
+        dest="thresholds",
+        action="append",
+        type=finite_float,
+        default=[],
+        metavar="NUMBER",
+        help="Count values below and at/above this cutoff; repeat up to 20 times.",
+    )
+    layer_statistics.add_argument(
+        "--break",
+        dest="breaks",
+        action="append",
+        type=finite_float,
+        default=[],
+        metavar="NUMBER",
+        help="Build classes from strictly increasing cutoffs; repeat up to 20 times.",
+    )
     layer_style_elements = layer_actions.add_parser(
         "style-elements",
         help="Inspect the effective XYZ Styling-panel elements for one layer.",
@@ -378,7 +424,26 @@ def parser() -> JsonArgumentParser:
         help="Preview the server-resolved workspace map extent.",
     )
     derived_map_extent.add_argument("--locale", type=nonempty)
+    derived_h3_plan = derived_actions.add_parser(
+        "plan-area-weighted-h3",
+        help=(
+            "Plan and preflight a scope-bounded area-weighted H3 definition "
+            "without applying a mutation."
+        ),
+    )
+    derived_h3_plan.add_argument(
+        "--input",
+        default=argparse.SUPPRESS,
+        metavar="FILE",
+        help="Read the area-weighted H3 recipe request from a JSON object file.",
+    )
     derived_create = derived_actions.add_parser("create")
+    derived_create.add_argument(
+        "--input",
+        default=argparse.SUPPRESS,
+        metavar="FILE",
+        help="Read the reviewed create request from a JSON object file.",
+    )
     derived_create.add_argument("name", nargs="?")
     derived_create.add_argument("--kind", choices=("view", "materialized"))
     derived_create.add_argument("--query-file")
@@ -874,6 +939,8 @@ def required_contract_command(args) -> str:
     }:
         return f"{args.command} {args.action}"
     if args.command == "layers":
+        if args.action == "statistics":
+            return "layers statistics"
         return "layers effective"
     if args.command == "proposals":
         return f"proposals {args.action}"
@@ -899,6 +966,32 @@ def require_contract_command(contract: dict[str, Any], args) -> None:
             EXIT_CONFLICT,
             details={"requiredCommand": command},
             error_code="capability.missing",
+        )
+
+
+def _validate_layer_statistics_arguments(args: Any) -> None:
+    if len(args.thresholds) > MAX_LAYER_STATISTICS_CUTS:
+        raise CliError(
+            f"At most {MAX_LAYER_STATISTICS_CUTS} thresholds may be requested.",
+            EXIT_USAGE,
+            details={"maximum": MAX_LAYER_STATISTICS_CUTS},
+            error_code="usage.statistics_threshold_limit",
+        )
+    if len(args.breaks) > MAX_LAYER_STATISTICS_CUTS:
+        raise CliError(
+            f"At most {MAX_LAYER_STATISTICS_CUTS} breaks may be requested.",
+            EXIT_USAGE,
+            details={"maximum": MAX_LAYER_STATISTICS_CUTS},
+            error_code="usage.statistics_break_limit",
+        )
+    if any(
+        current <= previous
+        for previous, current in zip(args.breaks, args.breaks[1:])
+    ):
+        raise CliError(
+            "Breaks must be strictly increasing without duplicates.",
+            EXIT_USAGE,
+            error_code="usage.statistics_break_order",
         )
 
 
@@ -3084,6 +3177,248 @@ def _finite_nonnegative_number(value: Any) -> bool:
     )
 
 
+def _validate_layer_statistics_response(
+    data: dict[str, Any],
+    *,
+    args: Any,
+) -> None:
+    required = {
+        "revision",
+        "locale",
+        "key",
+        "field",
+        "fieldType",
+        "totalCount",
+        "nonNullCount",
+        "nullCount",
+        "finiteCount",
+        "nonFiniteCount",
+        "min",
+        "max",
+        "quantiles",
+        "histogram",
+        "thresholds",
+        "classes",
+        "binsRequested",
+        "binsReturned",
+    }
+    count_fields = (
+        "totalCount",
+        "nonNullCount",
+        "nullCount",
+        "finiteCount",
+        "nonFiniteCount",
+    )
+
+    def finite_number(value: Any) -> bool:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+        ) or (
+            isinstance(value, float)
+            and math.isfinite(value)
+        )
+
+    def nullable_finite_number(value: Any) -> bool:
+        return value is None or finite_number(value)
+
+    interval_keys = {
+        "index",
+        "lower",
+        "upper",
+        "count",
+        "lowerInclusive",
+        "upperInclusive",
+    }
+
+    def interval(item: Any, *, nullable_bounds: bool) -> bool:
+        if not isinstance(item, dict) or not interval_keys <= set(item):
+            return False
+        valid_bound = nullable_finite_number if nullable_bounds else finite_number
+        return (
+            _nonnegative_integer(item.get("index"))
+            and valid_bound(item.get("lower"))
+            and valid_bound(item.get("upper"))
+            and _nonnegative_integer(item.get("count"))
+            and isinstance(item.get("lowerInclusive"), bool)
+            and isinstance(item.get("upperInclusive"), bool)
+        )
+
+    quantiles = data.get("quantiles")
+    histogram = data.get("histogram")
+    thresholds = data.get("thresholds")
+    classes = data.get("classes")
+    valid = (
+        required <= set(data)
+        and isinstance(data.get("revision"), str)
+        and bool(data["revision"])
+        and isinstance(data.get("locale"), str)
+        and bool(data["locale"])
+        and data.get("key") == args.key
+        and data.get("field") == args.field
+        and isinstance(data.get("fieldType"), str)
+        and bool(data["fieldType"])
+        and all(_nonnegative_integer(data.get(field)) for field in count_fields)
+        and nullable_finite_number(data.get("min"))
+        and nullable_finite_number(data.get("max"))
+        and isinstance(quantiles, list)
+        and all(
+            isinstance(item, dict)
+            and {"probability", "value"} <= set(item)
+            and finite_number(item.get("probability"))
+            and 0 <= item["probability"] <= 1
+            and finite_number(item.get("value"))
+            for item in quantiles
+        )
+        and isinstance(histogram, list)
+        and len(histogram) <= MAX_LAYER_STATISTICS_BINS
+        and all(interval(item, nullable_bounds=False) for item in histogram)
+        and isinstance(thresholds, list)
+        and len(thresholds) == len(args.thresholds)
+        and all(
+            isinstance(item, dict)
+            and {"value", "belowCount", "atOrAboveCount"} <= set(item)
+            and finite_number(item.get("value"))
+            and _nonnegative_integer(item.get("belowCount"))
+            and _nonnegative_integer(item.get("atOrAboveCount"))
+            for item in thresholds
+        )
+        and all(
+            item["value"] == requested
+            for item, requested in zip(thresholds, args.thresholds)
+        )
+        and isinstance(classes, list)
+        and len(classes) == (len(args.breaks) + 1 if args.breaks else 0)
+        and all(interval(item, nullable_bounds=True) for item in classes)
+        and all(
+            item["lower"] == (None if index == 0 else args.breaks[index - 1])
+            and item["upper"] == (
+                None if index == len(args.breaks) else args.breaks[index]
+            )
+            for index, item in enumerate(classes)
+        )
+        and _nonnegative_integer(data.get("binsRequested"))
+        and data["binsRequested"] == args.bins
+        and _nonnegative_integer(data.get("binsReturned"))
+        and data["binsReturned"] == len(histogram)
+        and data["binsReturned"] <= args.bins
+    )
+    if valid:
+        quantile_items = cast(list[dict[str, Any]], quantiles)
+        histogram_items = cast(list[dict[str, Any]], histogram)
+        threshold_items = cast(list[dict[str, Any]], thresholds)
+        class_items = cast(list[dict[str, Any]], classes)
+        total_count = data["totalCount"]
+        non_null_count = data["nonNullCount"]
+        finite_count = data["finiteCount"]
+        minimum = data["min"]
+        maximum = data["max"]
+        expected_probabilities = (
+            [] if finite_count == 0 else [0.0, 0.25, 0.5, 0.75, 1.0]
+        )
+        quantile_values = [item["value"] for item in quantile_items]
+        extrema_valid = (
+            finite_count == 0
+            and minimum is None
+            and maximum is None
+        ) or (
+            finite_count > 0
+            and finite_number(minimum)
+            and finite_number(maximum)
+            and minimum <= maximum
+        )
+        quantiles_valid = (
+            [item["probability"] for item in quantile_items]
+            == expected_probabilities
+            and all(
+                previous <= current
+                for previous, current in zip(
+                    quantile_values,
+                    quantile_values[1:],
+                )
+            )
+            and (
+                not quantile_values
+                or (
+                    finite_number(minimum)
+                    and finite_number(maximum)
+                    and quantile_values[0] == minimum
+                    and quantile_values[-1] == maximum
+                )
+            )
+        )
+
+        if finite_count == 0:
+            histogram_valid = not histogram_items
+        elif minimum == maximum:
+            histogram_valid = (
+                len(histogram_items) == 1
+                and histogram_items[0]["index"] == 1
+                and histogram_items[0]["lower"] == minimum
+                and histogram_items[0]["upper"] == maximum
+                and histogram_items[0]["count"] == finite_count
+                and histogram_items[0]["lowerInclusive"] is True
+                and histogram_items[0]["upperInclusive"] is True
+            )
+        else:
+            histogram_valid = (
+                len(histogram_items) == args.bins
+                and [item["index"] for item in histogram_items]
+                == list(range(1, args.bins + 1))
+                and histogram_items[0]["lower"] == minimum
+                and histogram_items[-1]["upper"] == maximum
+                and all(
+                    item["lower"] < item["upper"]
+                    and item["lowerInclusive"] is True
+                    and item["upperInclusive"] == (index == args.bins)
+                    for index, item in enumerate(histogram_items, start=1)
+                )
+                and all(
+                    previous["upper"] == current["lower"]
+                    for previous, current in zip(
+                        histogram_items,
+                        histogram_items[1:],
+                    )
+                )
+                and sum(item["count"] for item in histogram_items)
+                == finite_count
+            )
+
+        thresholds_valid = all(
+            item["belowCount"] + item["atOrAboveCount"] == finite_count
+            for item in threshold_items
+        )
+        classes_valid = (
+            not args.breaks
+            and not class_items
+        ) or (
+            bool(args.breaks)
+            and [item["index"] for item in class_items]
+            == list(range(len(class_items)))
+            and all(
+                item["lowerInclusive"] == (index > 0)
+                and item["upperInclusive"] is False
+                for index, item in enumerate(class_items)
+            )
+            and sum(item["count"] for item in class_items) == finite_count
+        )
+        valid = (
+            total_count == non_null_count + data["nullCount"]
+            and non_null_count == finite_count + data["nonFiniteCount"]
+            and extrema_valid
+            and quantiles_valid
+            and histogram_valid
+            and thresholds_valid
+            and classes_valid
+        )
+    if not valid:
+        raise _invalid_response(
+            "Layer statistics",
+            data,
+            error_code="layer.statistics_invalid_response",
+        )
+
+
 def _derived_spatial_scope(
     value: Any,
     *,
@@ -3819,6 +4154,239 @@ def _validate_derived_layer_response(
             data=data,
             label="Derived layer",
         )
+
+
+def _validate_area_weighted_h3_plan_response(
+    data: dict[str, Any],
+    *,
+    request: dict[str, Any],
+) -> None:
+    label = "Area-weighted H3 recipe plan"
+
+    def invalid() -> NoReturn:
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+
+    def nonempty_text(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    def numeric_type(value: Any) -> bool:
+        return nonempty_text(value) and re.fullmatch(
+            r"(?:smallint|integer|bigint|int2|int4|int8|real|float4|float8|"
+            r"double\s+precision|numeric(?:\s*\(\s*\d+\s*"
+            r"(?:,\s*\d+\s*)?\))?|decimal(?:\s*\(\s*\d+\s*"
+            r"(?:,\s*\d+\s*)?\))?)",
+            value.strip(),
+            re.IGNORECASE,
+        ) is not None
+
+    def projection(value: Any, keys: set[str]) -> dict[str, Any]:
+        if not isinstance(value, dict) or not keys <= set(value):
+            invalid()
+        return {key: value[key] for key in keys}
+
+    plan = data.get("recipePlan")
+    recipe = plan.get("recipe") if isinstance(plan, dict) else None
+    create_request = (
+        plan.get("createRequest") if isinstance(plan, dict) else None
+    )
+    source = plan.get("source") if isinstance(plan, dict) else None
+    measures = plan.get("measures") if isinstance(plan, dict) else None
+    output = plan.get("output") if isinstance(plan, dict) else None
+    assumptions = plan.get("assumptions") if isinstance(plan, dict) else None
+    requested_source = request.get("source")
+    requested_measures = request.get("measures")
+    requested_scope = request.get("spatialScope")
+    create_scope = (
+        create_request.get("spatialScope")
+        if isinstance(create_request, dict)
+        else None
+    )
+    kind = (
+        create_request.get("kind")
+        if isinstance(create_request, dict)
+        else None
+    )
+    resolution = request.get("resolution")
+    if (
+        data.get("mutationApplied") is not False
+        or not isinstance(plan, dict)
+        or not isinstance(recipe, dict)
+        or recipe.get("name") != "area-weighted-h3"
+        or not _nonnegative_integer(recipe.get("version"))
+        or recipe["version"] == 0
+        or recipe.get("areaCrs") != "EPSG:27700"
+        or recipe.get("candidateContainment") != "overlapping"
+        or not isinstance(create_request, dict)
+        or not nonempty_text(request.get("name"))
+        or create_request.get("name") != request.get("name")
+        or kind != request.get("kind")
+        or kind not in {"view", "materialized"}
+        or not nonempty_text(create_request.get("query"))
+        or not isinstance(requested_source, dict)
+        or not nonempty_text(requested_source.get("assetId"))
+        or not nonempty_text(requested_source.get("relation"))
+        or create_request.get("sources") != [requested_source.get("relation")]
+        or not nonempty_text(create_request.get("idColumn"))
+        or not nonempty_text(create_request.get("geometryColumn"))
+        or not isinstance(requested_scope, dict)
+        or not isinstance(create_scope, dict)
+        or create_scope.get("type") != "workspace-map-extent"
+        or create_scope.get("type") != requested_scope.get("type")
+        or create_scope.get("locale") != requested_scope.get("locale")
+        or set(create_scope) != (
+            {"type", "locale"}
+            if isinstance(requested_scope.get("locale"), str)
+            else {"type"}
+        )
+        or not _nonnegative_integer(resolution)
+        or not isinstance(resolution, int)
+        or resolution > 15
+        or plan.get("resolution") != resolution
+        or not isinstance(source, dict)
+        or source.get("assetId") != requested_source.get("assetId")
+        or source.get("relation") != requested_source.get("relation")
+        or not isinstance(measures, list)
+        or not isinstance(requested_measures, list)
+        or not measures
+        or len(measures) != len(requested_measures)
+        or not isinstance(output, dict)
+        or output.get("idColumn") != create_request.get("idColumn")
+        or output.get("resolutionColumn") != "h3_resolution"
+        or output.get("geometryColumn") != create_request.get("geometryColumn")
+        or output.get("geometryType") != "Polygon"
+        or output.get("srid") != 3857
+        or not isinstance(assumptions, list)
+        or not assumptions
+        or any(not nonempty_text(value) for value in assumptions)
+    ):
+        invalid()
+
+    binding = source.get("binding")
+    id_column = source.get("idColumn")
+    geometry_column = source.get("geometryColumn")
+    metric_geometry = source.get("metricGeometry")
+    if (
+        not isinstance(binding, dict)
+        or binding.get("adapter") != "postgresql"
+        or not nonempty_text(binding.get("schema"))
+        or not nonempty_text(binding.get("relation"))
+        or f"{binding.get('schema')}.{binding.get('relation')}"
+        != source["relation"]
+        or not isinstance(id_column, dict)
+        or id_column.get("name") != requested_source.get("idColumn")
+        or not nonempty_text(id_column.get("type"))
+        or id_column.get("nullable") is not False
+        or not (
+            id_column.get("primaryKey") is True
+            or id_column.get("unique") is True
+        )
+        or not isinstance(geometry_column, dict)
+        or geometry_column.get("name")
+        != requested_source.get("geometryColumn")
+        or not nonempty_text(geometry_column.get("type"))
+        or re.match(
+            r"^geometry(?:\s*\(|$)",
+            geometry_column["type"].strip(),
+            re.IGNORECASE,
+        ) is None
+        or not isinstance(geometry_column.get("nullable"), bool)
+        or not isinstance(geometry_column.get("geometryType"), str)
+        or geometry_column["geometryType"].upper()
+        not in {"POLYGON", "MULTIPOLYGON"}
+        or not _nonnegative_integer(geometry_column.get("srid"))
+        or geometry_column["srid"] == 0
+        or not isinstance(metric_geometry, dict)
+        or metric_geometry.get("srid") != 27700
+        or metric_geometry.get("mode") != (
+            "native" if geometry_column.get("srid") == 27700 else "transform"
+        )
+        or (
+            "assetVersion" in source
+            and (
+                not _nonnegative_integer(source["assetVersion"])
+                or source["assetVersion"] == 0
+            )
+        )
+    ):
+        invalid()
+
+    for resolved, requested in zip(measures, requested_measures):
+        source_field = (
+            resolved.get("sourceField")
+            if isinstance(resolved, dict)
+            else None
+        )
+        if (
+            not isinstance(resolved, dict)
+            or not isinstance(requested, dict)
+            or not nonempty_text(requested.get("sourceColumn"))
+            or not nonempty_text(requested.get("outputColumn"))
+            or requested.get("nullHandling") not in {"zero", "ignore"}
+            or any(
+                resolved.get(key) != requested.get(key)
+                for key in ("sourceColumn", "outputColumn", "nullHandling")
+            )
+            or not isinstance(source_field, dict)
+            or source_field.get("name") != requested.get("sourceColumn")
+            or not numeric_type(source_field.get("type"))
+            or not isinstance(source_field.get("nullable"), bool)
+            or resolved.get("outputType") != "double precision"
+        ):
+            invalid()
+
+    resolved_scope = plan.get("resolvedSpatialScope")
+    expected_locale = (
+        requested_scope.get("locale")
+        if isinstance(requested_scope, dict)
+        and isinstance(requested_scope.get("locale"), str)
+        else None
+    )
+    _derived_spatial_scope(
+        resolved_scope,
+        data=data,
+        label=label,
+        expected_locale=expected_locale,
+    )
+
+    query_probe = plan.get("queryPlanProbe")
+    query_probe_core = projection(query_probe, _QUERY_PLAN_PROBE_KEYS)
+    query_probe_core["limits"] = projection(
+        query_probe_core["limits"],
+        _QUERY_PLAN_LIMIT_KEYS,
+    )
+    query_probe_core["h3Expansion"] = projection(
+        query_probe_core["h3Expansion"],
+        _QUERY_PLAN_H3_EXPANSION_KEYS,
+    )
+    _query_plan_probe(query_probe_core, data=data, label=label)
+    if query_probe_core["h3Expansion"].get("resolutions") != [resolution]:
+        invalid()
+
+    planning_probe = projection(
+        plan.get("queryPlanningProbe"),
+        _QUERY_PLANNING_PROBE_KEYS,
+    )
+    _query_planning_probe(
+        planning_probe,
+        data=data,
+        label=label,
+        require_within_limit=True,
+    )
+
+    if kind == "materialized":
+        if "materializationProbe" not in plan:
+            invalid()
+        _materialization_probe(
+            plan["materializationProbe"],
+            data=data,
+            label=label,
+        )
+    elif "materializationProbe" in plan:
+        invalid()
 
 
 def _validate_semantic_status(data: dict[str, Any]) -> dict[str, Any]:
@@ -5883,15 +6451,35 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
         return _with_context(result, context)
 
     if args.command == "layers":
-        if args.action == "values":
-            query = {"field": args.field, "limit": args.limit}
+        if args.action == "statistics":
+            statistics_query = [
+                ("field", args.field),
+                ("bins", args.bins),
+            ]
             if args.locale is not None:
-                query["locale"] = args.locale
+                statistics_query.append(("locale", args.locale))
+            statistics_query.extend(
+                ("threshold", value) for value in args.thresholds
+            )
+            statistics_query.extend(("break", value) for value in args.breaks)
+            result = client.request(
+                "/api/layers/"
+                + urllib.parse.quote(args.key, safe="")
+                + "/statistics?"
+                + urllib.parse.urlencode(statistics_query)
+            )
+            _validate_layer_statistics_response(result, args=args)
+            return _with_context(result, context)
+
+        if args.action == "values":
+            values_query = {"field": args.field, "limit": args.limit}
+            if args.locale is not None:
+                values_query["locale"] = args.locale
             result = client.request(
                 "/api/layers/"
                 + urllib.parse.quote(args.key, safe="")
                 + "/values?"
-                + urllib.parse.urlencode(query)
+                + urllib.parse.urlencode(values_query)
             )
             count_fields = (
                 "totalCount", "nonNullCount", "nullCount", "distinctCount",
@@ -6795,6 +7383,17 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 label="Derived-layer map extent",
                 expected_locale=args.locale,
             )
+        elif args.action == "plan-area-weighted-h3":
+            request_payload = input_object(args)
+            result = client.request(
+                f"{base}/recipes/area-weighted-h3/plan",
+                method="POST",
+                payload=request_payload,
+            )
+            _validate_area_weighted_h3_plan_response(
+                result,
+                request=request_payload,
+            )
         elif args.action == "show":
             result = client.request(f"{base}/{quote_segment(args.name)}")
             _validate_derived_layer_response(
@@ -6805,6 +7404,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
         elif args.action in {"create", "replace"}:
             if args.background:
                 _validate_background_wait(args.wait_timeout, args.interval)
+            supplied = input_object(args)
             payload: dict[str, Any] = {}
             for key, value in (
                 ("name", args.name),
@@ -6815,14 +7415,15 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             ):
                 if value is not None:
                     payload[key] = value
-            payload["spatialScope"] = {
-                "type": "workspace-map-extent",
-                **(
-                    {"locale": args.locale}
-                    if args.locale is not None
-                    else {}
-                ),
-            }
+            if args.locale is not None or "spatialScope" not in supplied:
+                payload["spatialScope"] = {
+                    "type": "workspace-map-extent",
+                    **(
+                        {"locale": args.locale}
+                        if args.locale is not None
+                        else {}
+                    ),
+                }
             if args.source:
                 payload["sources"] = args.source
             if args.query_file:
@@ -6834,7 +7435,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     too_large_code="derived_layer.query_file_too_large",
                     invalid_utf8_code="derived_layer.query_file",
                 )
-            payload = merge_input(args, payload)
+            payload = merge_supplied_input(supplied, payload)
             required = {
                 "name", "query", "sources", "idColumn", "geometryColumn"
             }
@@ -6846,6 +7447,9 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     details={"missing": missing},
                     error_code="derived_layer.missing_input",
                 )
+            mutation_name = (
+                args.name if args.action == "replace" else payload["name"]
+            )
             if (
                 isinstance(payload.get("query"), str)
                 and _query_invokes_h3(payload["query"])
@@ -6862,7 +7466,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     if args.action == "replace"
                     else base
                 ),
-                name=args.name,
+                name=mutation_name,
                 action=args.action,
                 payload=payload,
             )
@@ -6880,7 +7484,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     if exc.error_code != "operation.invalid_response":
                         raise
                     raise _derived_mutation_indeterminate(
-                        args.name,
+                        mutation_name,
                         args.action,
                         response=submitted,
                         cause=exc,
@@ -6889,7 +7493,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             try:
                 _validate_derived_layer_response(
                     result,
-                    expected_name=args.name,
+                    expected_name=mutation_name,
                     require_spatial_scope=True,
                     expected_locale=(
                         requested_spatial_scope.get("locale")
@@ -6909,7 +7513,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                         cause=exc,
                     ) from exc
                 raise _derived_mutation_indeterminate(
-                    args.name,
+                    mutation_name,
                     args.action,
                     response=result,
                 ) from exc
@@ -7517,12 +8121,25 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
 
 def run(args, store: ConfigStore | None = None) -> dict[str, Any]:
     store = store or ConfigStore()
+    if args.command == "layers" and args.action == "statistics":
+        _validate_layer_statistics_arguments(args)
+    if (
+        args.command == "derived-layers"
+        and args.action == "plan-area-weighted-h3"
+        and not args.input
+    ):
+        raise CliError(
+            "Area-weighted H3 planning requires --input.",
+            EXIT_USAGE,
+            error_code="input.required",
+        )
     input_supported = (
         args.command in {
             "validate", "sql", "set", "amend", "unset",
             "visual-plan", "visual-test", "screenshot",
         }
-        or args.command == "derived-layers" and args.action == "create"
+        or args.command == "derived-layers"
+        and args.action in {"create", "plan-area-weighted-h3"}
         or args.command == "proposals"
         and args.action in {
             "check", "create", "preview-plan", "preview-test",

@@ -90,6 +90,80 @@ def map_extent_scope(locale: str = "Leeds") -> dict:
     }
 
 
+def layer_statistics_response(*, bins_requested: int = 2) -> dict:
+    return {
+        "revision": "rev-1",
+        "locale": "cy",
+        "key": "Arrival Areas",
+        "field": "arrival_percent",
+        "fieldType": "double precision",
+        "totalCount": 8,
+        "nonNullCount": 7,
+        "nullCount": 1,
+        "finiteCount": 6,
+        "nonFiniteCount": 1,
+        "min": 0,
+        "max": 31,
+        "quantiles": [
+            {"probability": 0.0, "value": 0},
+            {"probability": 0.25, "value": 5},
+            {"probability": 0.5, "value": 12.25},
+            {"probability": 0.75, "value": 22},
+            {"probability": 1.0, "value": 31},
+        ],
+        "histogram": [
+            {
+                "index": 1,
+                "lower": 0,
+                "upper": 15.5,
+                "count": 4,
+                "lowerInclusive": True,
+                "upperInclusive": False,
+            },
+            {
+                "index": 2,
+                "lower": 15.5,
+                "upper": 31,
+                "count": 2,
+                "lowerInclusive": True,
+                "upperInclusive": True,
+            },
+        ],
+        "thresholds": [
+            {"value": 0.05, "belowCount": 1, "atOrAboveCount": 5},
+            {"value": 25, "belowCount": 5, "atOrAboveCount": 1},
+        ],
+        "classes": [
+            {
+                "index": 0,
+                "lower": None,
+                "upper": 10,
+                "count": 2,
+                "lowerInclusive": False,
+                "upperInclusive": False,
+            },
+            {
+                "index": 1,
+                "lower": 10,
+                "upper": 20,
+                "count": 3,
+                "lowerInclusive": True,
+                "upperInclusive": False,
+            },
+            {
+                "index": 2,
+                "lower": 20,
+                "upper": None,
+                "count": 1,
+                "lowerInclusive": True,
+                "upperInclusive": False,
+            },
+        ],
+        "binsRequested": bins_requested,
+        "binsReturned": 2,
+    }
+
+
 def materialization_probe() -> dict:
     return {
         "method": "postgresql-explain",
@@ -201,6 +275,120 @@ def query_planning_probe(*, estimated_pair_rows: int = 2_000_000) -> dict:
         "nestedLoopCount": 1,
         "maxEstimatedNestedLoopPairRows": estimated_pair_rows,
         "maxAllowedNestedLoopPairRows": 100_000_000,
+    }
+
+
+def area_weighted_h3_request(*, kind: str = "materialized") -> dict:
+    return {
+        "name": "population_h3_r9",
+        "kind": kind,
+        "source": {
+            "assetId": "asset-census",
+            "relation": "census.areas",
+            "idColumn": "area_id",
+            "geometryColumn": "source_geom",
+        },
+        "resolution": 9,
+        "measures": [{
+            "sourceColumn": "population",
+            "outputColumn": "population_estimate",
+            "nullHandling": "zero",
+        }],
+        "spatialScope": {
+            "type": "workspace-map-extent",
+            "locale": "city-centre",
+        },
+    }
+
+
+def area_weighted_h3_response(*, kind: str = "materialized") -> dict:
+    request = area_weighted_h3_request(kind=kind)
+    scope = map_extent_scope("city-centre")
+    plan_probe = query_plan_probe()
+    plan_probe["futureEvidence"] = {"accepted": True}
+    plan_probe["limits"]["futureLimit"] = 1
+    plan_probe["h3Expansion"]["futureEstimate"] = 1
+    planning_probe = query_planning_probe()
+    planning_probe["futureEvidence"] = {"accepted": True}
+    plan = {
+        "recipe": {
+            "name": "area-weighted-h3",
+            "version": 1,
+            "areaCrs": "EPSG:27700",
+            "candidateContainment": "overlapping",
+            "futureRecipeField": True,
+        },
+        "createRequest": {
+            "name": request["name"],
+            "kind": kind,
+            "query": "SELECT h3_id, population_estimate, geom_3857 FROM cells",
+            "sources": [request["source"]["relation"]],
+            "idColumn": "h3_id",
+            "geometryColumn": "geom_3857",
+            "spatialScope": request["spatialScope"],
+        },
+        "resolvedSpatialScope": scope,
+        "source": {
+            "assetId": request["source"]["assetId"],
+            "assetVersion": 7,
+            "relation": request["source"]["relation"],
+            "binding": {
+                "adapter": "postgresql",
+                "schema": "census",
+                "relation": "areas",
+            },
+            "idColumn": {
+                "id": "field-area-id",
+                "name": "area_id",
+                "type": "text",
+                "nullable": False,
+                "primaryKey": True,
+            },
+            "geometryColumn": {
+                "id": "field-geometry",
+                "name": "source_geom",
+                "type": "geometry(MultiPolygon,4326)",
+                "nullable": False,
+                "geometryType": "MULTIPOLYGON",
+                "srid": 4326,
+            },
+            "metricGeometry": {"srid": 27700, "mode": "transform"},
+        },
+        "resolution": 9,
+        "measures": [{
+            **request["measures"][0],
+            "sourceField": {
+                "id": "field-population",
+                "name": "population",
+                "type": "bigint",
+                "nullable": False,
+            },
+            "outputType": "double precision",
+        }],
+        "output": {
+            "idColumn": "h3_id",
+            "resolutionColumn": "h3_resolution",
+            "geometryColumn": "geom_3857",
+            "geometryType": "Polygon",
+            "srid": 3857,
+        },
+        "assumptions": [
+            "Each measure is additive and uniformly distributed.",
+            "Only scope-intersecting H3 cells are candidates.",
+        ],
+        "queryPlanProbe": plan_probe,
+        "queryPlanningProbe": planning_probe,
+        "futurePlanField": {"accepted": True},
+    }
+    if kind == "materialized":
+        plan["materializationProbe"] = {
+            **materialization_probe(),
+            "futureEstimate": 1,
+        }
+    return {
+        "recipePlan": plan,
+        "mutationApplied": False,
+        "futureResponseField": True,
     }
 
 
@@ -590,6 +778,300 @@ class CliTests(unittest.TestCase):
             json.loads(stdout)["derivedLayer"]["queryPlanProbe"],
             query_plan_probe(),
         )
+
+    def test_area_weighted_h3_planner_posts_object_and_preserves_plan(self):
+        captured = {}
+        request_payload = area_weighted_h3_request()
+        response_payload = area_weighted_h3_response()
+
+        def plan(request):
+            captured["body"] = request["body"]
+            return 200, response_payload
+
+        routes = standard_routes()
+        routes[(
+            "POST", "/api/derived-layers/recipes/area-weighted-h3/plan"
+        )] = plan
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "recipe.json"
+            input_file.write_text(json.dumps(request_payload), encoding="utf-8")
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers", "plan-area-weighted-h3",
+                    "--input", str(input_file),
+                ],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(request_payload, captured["body"])
+        payload = json.loads(stdout)
+        self.assertFalse(payload["mutationApplied"])
+        self.assertEqual(
+            "area-weighted-h3",
+            payload["recipePlan"]["recipe"]["name"],
+        )
+        self.assertEqual(
+            request_payload["spatialScope"],
+            payload["recipePlan"]["createRequest"]["spatialScope"],
+        )
+        self.assertIn("envelopes", payload["recipePlan"]["resolvedSpatialScope"])
+        self.assertTrue(payload["recipePlan"]["futurePlanField"]["accepted"])
+        self.assertTrue(
+            payload["recipePlan"]["queryPlanProbe"]["futureEvidence"]["accepted"]
+        )
+
+    def test_area_weighted_h3_planner_accepts_global_input_position(self):
+        request_payload = area_weighted_h3_request()
+        routes = standard_routes()
+        routes[(
+            "POST", "/api/derived-layers/recipes/area-weighted-h3/plan"
+        )] = (200, area_weighted_h3_response())
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "recipe.json"
+            input_file.write_text(json.dumps(request_payload), encoding="utf-8")
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "--input", str(input_file), "derived-layers",
+                    "plan-area-weighted-h3",
+                ],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(request_payload, server.requests[-1]["body"])
+        self.assertFalse(json.loads(stdout)["mutationApplied"])
+
+    def test_area_weighted_h3_planner_requires_input_before_connecting(self):
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "plan-area-weighted-h3"],
+                store,
+            )
+
+        self.assertEqual(EXIT_USAGE, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("input.required", json.loads(stderr)["code"])
+        self.assertEqual([], server.requests)
+
+    def test_derived_create_accepts_reviewed_planner_request_input(self):
+        create_request = area_weighted_h3_response()["recipePlan"]["createRequest"]
+        captured = {}
+
+        def create(request):
+            captured["body"] = request["body"]
+            return 201, {
+                "derivedLayer": {
+                    "name": create_request["name"],
+                    "kind": create_request["kind"],
+                    "spatialScope": map_extent_scope("city-centre"),
+                    "queryPlanProbe": query_plan_probe(),
+                    "queryPlanningProbe": query_planning_probe(),
+                    "materializationProbe": materialization_probe(),
+                },
+            }
+
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers")] = create
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "create-request.json"
+            input_file.write_text(json.dumps(create_request), encoding="utf-8")
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers", "create", "--input", str(input_file),
+                    "--confirm",
+                ],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(create_request, captured["body"])
+        self.assertEqual(
+            {"type": "workspace-map-extent", "locale": "city-centre"},
+            captured["body"]["spatialScope"],
+        )
+        self.assertEqual(
+            create_request["name"],
+            json.loads(stdout)["derivedLayer"]["name"],
+        )
+
+    def test_derived_create_rejects_locale_conflicting_with_reviewed_input(self):
+        create_request = area_weighted_h3_response()["recipePlan"]["createRequest"]
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "create-request.json"
+            input_file.write_text(json.dumps(create_request), encoding="utf-8")
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers", "create", "--input", str(input_file),
+                    "--locale", "another-locale", "--confirm",
+                ],
+                store,
+            )
+
+        self.assertEqual(EXIT_USAGE, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("input.conflict", json.loads(stderr)["code"])
+        self.assertFalse(any(
+            request["method"] == "POST" for request in server.requests
+        ))
+
+    def test_area_weighted_h3_planner_rejects_malformed_success_responses(self):
+        materialized_request = area_weighted_h3_request()
+        invalid_responses = []
+        for name, mutation in (
+            (
+                "mutation reported",
+                lambda value: value.__setitem__("mutationApplied", True),
+            ),
+            (
+                "wrong recipe",
+                lambda value: value["recipePlan"]["recipe"].__setitem__(
+                    "name", "another-recipe"
+                ),
+            ),
+            (
+                "unsafe candidate containment",
+                lambda value: value["recipePlan"]["recipe"].__setitem__(
+                    "candidateContainment", "center"
+                ),
+            ),
+            (
+                "missing query plan",
+                lambda value: value["recipePlan"].pop("queryPlanProbe"),
+            ),
+            (
+                "missing planning probe",
+                lambda value: value["recipePlan"].pop("queryPlanningProbe"),
+            ),
+            (
+                "missing materialization probe",
+                lambda value: value["recipePlan"].pop("materializationProbe"),
+            ),
+            (
+                "non-replayable create scope",
+                lambda value: value["recipePlan"]["createRequest"][
+                    "spatialScope"
+                ].__setitem__("sourceView", {}),
+            ),
+            (
+                "unresolved source",
+                lambda value: value["recipePlan"].__setitem__("source", {}),
+            ),
+            (
+                "missing assumptions",
+                lambda value: value["recipePlan"].__setitem__("assumptions", []),
+            ),
+            (
+                "non-unique source identifier",
+                lambda value: value["recipePlan"]["source"]["idColumn"].update({
+                    "nullable": True,
+                    "primaryKey": False,
+                }),
+            ),
+            (
+                "non-polygon source geometry",
+                lambda value: value["recipePlan"]["source"][
+                    "geometryColumn"
+                ].update({"geometryType": "POINT"}),
+            ),
+            (
+                "invalid source geometry SRID",
+                lambda value: value["recipePlan"]["source"][
+                    "geometryColumn"
+                ].update({"srid": 0}),
+            ),
+            (
+                "metric geometry mode mismatch",
+                lambda value: value["recipePlan"]["source"][
+                    "metricGeometry"
+                ].update({"mode": "native"}),
+            ),
+            (
+                "non-numeric measure source",
+                lambda value: value["recipePlan"]["measures"][0][
+                    "sourceField"
+                ].update({"type": "text"}),
+            ),
+        ):
+            value = area_weighted_h3_response()
+            mutation(value)
+            invalid_responses.append((name, materialized_request, value))
+        view_request = area_weighted_h3_request(kind="view")
+        view_response = area_weighted_h3_response(kind="view")
+        view_response["recipePlan"]["materializationProbe"] = materialization_probe()
+        invalid_responses.append((
+            "unexpected view materialization probe",
+            view_request,
+            view_response,
+        ))
+
+        current_response = {"value": invalid_responses[0][2]}
+
+        def plan(_request):
+            return 200, current_response["value"]
+
+        routes = standard_routes()
+        routes[(
+            "POST", "/api/derived-layers/recipes/area-weighted-h3/plan"
+        )] = plan
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "recipe.json"
+            store = self.configured_store(directory, server.endpoint)
+            for name, request_payload, response_payload in invalid_responses:
+                with self.subTest(name=name):
+                    input_file.write_text(
+                        json.dumps(request_payload),
+                        encoding="utf-8",
+                    )
+                    current_response["value"] = response_payload
+                    code, stdout, stderr = self.invoke(
+                        [
+                            "derived-layers", "plan-area-weighted-h3",
+                            "--input", str(input_file),
+                        ],
+                        store,
+                    )
+                    self.assertEqual(EXIT_CONNECTIVITY, code)
+                    self.assertEqual("", stdout)
+                    self.assertEqual(
+                        "derived_layer.invalid_response",
+                        json.loads(stderr)["code"],
+                    )
+
+    def test_area_weighted_h3_planner_requires_object_input(self):
+        called = []
+
+        def plan(request):
+            called.append(request)
+            return 200, area_weighted_h3_response()
+
+        routes = standard_routes()
+        routes[(
+            "POST", "/api/derived-layers/recipes/area-weighted-h3/plan"
+        )] = plan
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "recipe.json"
+            input_file.write_text("[]", encoding="utf-8")
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers", "plan-area-weighted-h3",
+                    "--input", str(input_file),
+                ],
+                store,
+            )
+
+        self.assertEqual(EXIT_USAGE, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("input.not_object", json.loads(stderr)["code"])
+        self.assertEqual([], called)
 
     def test_h3_query_detector_ignores_literals_comments_and_column_names(self):
         for query in (
@@ -3549,6 +4031,17 @@ class CliTests(unittest.TestCase):
         for command, arguments in (
             ("workspace get", ["workspace", "get"]),
             ("layers effective", ["layers", "list"]),
+            (
+                "layers statistics",
+                ["layers", "statistics", "Areas", "percentage"],
+            ),
+            (
+                "derived-layers plan-area-weighted-h3",
+                [
+                    "derived-layers", "plan-area-weighted-h3",
+                    "--input", "missing.json",
+                ],
+            ),
             ("xyz reload", ["reload-xyz", "--confirm"]),
         ):
             with self.subTest(command=command):
@@ -4862,6 +5355,277 @@ class CliTests(unittest.TestCase):
         self.assertEqual(3, payload["distinctCount"])
         self.assertTrue(payload["truncated"])
         self.assertEqual("0-4", payload["values"][0]["value"])
+
+    def test_layer_statistics_requests_bounded_numeric_aggregates(self):
+        captured = {}
+        response = layer_statistics_response()
+        response["quantiles"][0]["futureLabel"] = "minimum"
+        response["histogram"][0]["futureWidth"] = 15.5
+        response["thresholds"][0]["futureRule"] = "fixed-filter"
+        response["classes"][0]["futureLabel"] = "first"
+
+        def statistics(request):
+            captured["query"] = request["query"]
+            return 200, response
+
+        routes = standard_routes()
+        routes[(
+            "GET", "/api/layers/Arrival%20Areas/statistics"
+        )] = statistics
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "layers", "statistics", "Arrival Areas", "arrival_percent",
+                    "--locale", "cy", "--bins", "2",
+                    "--threshold", "0.05", "--threshold", "25",
+                    "--break", "10", "--break", "20",
+                ],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            (
+                "field=arrival_percent&bins=2&locale=cy&"
+                "threshold=0.05&threshold=25.0&break=10.0&break=20.0"
+            ),
+            captured["query"],
+        )
+        payload = json.loads(stdout)
+        self.assertEqual(31, payload["max"])
+        self.assertIsInstance(payload["max"], int)
+        self.assertEqual(12.25, payload["quantiles"][2]["value"])
+        self.assertIsInstance(payload["quantiles"][2]["value"], float)
+        self.assertFalse(payload["classes"][1]["upperInclusive"])
+        self.assertEqual("minimum", payload["quantiles"][0]["futureLabel"])
+        self.assertEqual("first", payload["classes"][0]["futureLabel"])
+
+    def test_layer_statistics_defaults_and_input_bounds(self):
+        parsed = parser().parse_args(
+            ["layers", "statistics", "Areas", "percentage"]
+        )
+        self.assertEqual(10, parsed.bins)
+
+        parse_failures = (
+            ["--bins", "0"],
+            ["--bins", "51"],
+            ["--threshold", "nan"],
+            ["--break", "inf"],
+        )
+        for suffix in parse_failures:
+            with self.subTest(suffix=suffix), self.assertRaises(CliError) as raised:
+                parser().parse_args(
+                    ["layers", "statistics", "Areas", "percentage", *suffix]
+                )
+            self.assertEqual(EXIT_USAGE, raised.exception.exit_code)
+
+        runtime_failures = (
+            [option for value in range(21) for option in ("--threshold", str(value))],
+            [option for value in range(21) for option in ("--break", str(value))],
+            ["--break", "10", "--break", "10"],
+            ["--break", "20", "--break", "10"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            for suffix in runtime_failures:
+                with self.subTest(suffix=suffix):
+                    code, stdout, stderr = self.invoke(
+                        [
+                            "layers", "statistics", "Areas", "percentage",
+                            *suffix,
+                        ],
+                        store,
+                    )
+                    self.assertEqual(EXIT_USAGE, code)
+                    self.assertEqual("", stdout)
+                    self.assertTrue(json.loads(stderr)["code"].startswith("usage."))
+
+    def test_layer_statistics_accepts_an_empty_finite_distribution(self):
+        captured = {}
+        response = layer_statistics_response(bins_requested=10)
+        response.update({
+            "totalCount": 3,
+            "nonNullCount": 1,
+            "nullCount": 2,
+            "finiteCount": 0,
+            "nonFiniteCount": 1,
+            "min": None,
+            "max": None,
+            "quantiles": [],
+            "histogram": [],
+            "thresholds": [],
+            "classes": [],
+            "binsReturned": 0,
+        })
+
+        def statistics(request):
+            captured["query"] = request["query"]
+            return 200, response
+
+        routes = standard_routes()
+        routes[(
+            "GET", "/api/layers/Arrival%20Areas/statistics"
+        )] = statistics
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["layers", "statistics", "Arrival Areas", "arrival_percent"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("field=arrival_percent&bins=10", captured["query"])
+        payload = json.loads(stdout)
+        self.assertIsNone(payload["min"])
+        self.assertEqual([], payload["histogram"])
+
+    def test_layer_statistics_accepts_a_constant_finite_distribution(self):
+        response = layer_statistics_response(bins_requested=10)
+        response.update({
+            "totalCount": 3,
+            "nonNullCount": 2,
+            "nullCount": 1,
+            "finiteCount": 2,
+            "nonFiniteCount": 0,
+            "min": 5,
+            "max": 5,
+            "quantiles": [
+                {"probability": probability, "value": 5}
+                for probability in (0.0, 0.25, 0.5, 0.75, 1.0)
+            ],
+            "histogram": [{
+                "index": 1,
+                "lower": 5,
+                "upper": 5,
+                "count": 2,
+                "lowerInclusive": True,
+                "upperInclusive": True,
+            }],
+            "thresholds": [],
+            "classes": [],
+            "binsReturned": 1,
+        })
+        routes = standard_routes()
+        routes[(
+            "GET", "/api/layers/Arrival%20Areas/statistics"
+        )] = (200, response)
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["layers", "statistics", "Arrival Areas", "arrival_percent"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(1, payload["binsReturned"])
+        self.assertEqual(2, payload["histogram"][0]["count"])
+
+    def test_layer_statistics_rejects_malformed_response_numbers_and_shapes(self):
+        response = {"value": layer_statistics_response()}
+
+        def statistics(_request):
+            return 200, response["value"]
+
+        routes = standard_routes()
+        routes[(
+            "GET", "/api/layers/Arrival%20Areas/statistics"
+        )] = statistics
+        invalid_responses = []
+        for name, mutation in (
+            ("missing minimum", lambda value: value.pop("min")),
+            (
+                "boolean count",
+                lambda value: value.__setitem__("finiteCount", True),
+            ),
+            (
+                "nullable quantile",
+                lambda value: value["quantiles"][0].__setitem__("value", None),
+            ),
+            (
+                "nullable histogram bound",
+                lambda value: value["histogram"][0].__setitem__("lower", None),
+            ),
+            (
+                "wrong threshold identity",
+                lambda value: value["thresholds"][0].__setitem__("value", 0.06),
+            ),
+            (
+                "wrong class identity",
+                lambda value: value["classes"][0].__setitem__("upper", 11),
+            ),
+            (
+                "wrong requested bins",
+                lambda value: value.__setitem__("binsRequested", 10),
+            ),
+            (
+                "inconsistent total count",
+                lambda value: value.__setitem__("totalCount", 9),
+            ),
+            (
+                "missing finite evidence",
+                lambda value: value.update({
+                    "quantiles": [],
+                    "histogram": [],
+                    "binsReturned": 0,
+                }),
+            ),
+            (
+                "incomplete quantile catalogue",
+                lambda value: value["quantiles"].pop(),
+            ),
+            (
+                "wrong quantile endpoint",
+                lambda value: value["quantiles"][0].__setitem__("value", 1),
+            ),
+            (
+                "wrong histogram total",
+                lambda value: value["histogram"][0].__setitem__("count", 5),
+            ),
+            (
+                "wrong histogram inclusivity",
+                lambda value: value["histogram"][0].__setitem__(
+                    "upperInclusive", True
+                ),
+            ),
+            (
+                "wrong threshold total",
+                lambda value: value["thresholds"][0].__setitem__(
+                    "belowCount", 2
+                ),
+            ),
+            (
+                "wrong class inclusivity",
+                lambda value: value["classes"][0].__setitem__(
+                    "lowerInclusive", True
+                ),
+            ),
+        ):
+            value = json.loads(json.dumps(layer_statistics_response()))
+            mutation(value)
+            invalid_responses.append((name, value))
+
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            for name, invalid in invalid_responses:
+                with self.subTest(name=name):
+                    response["value"] = invalid
+                    code, stdout, stderr = self.invoke(
+                        [
+                            "layers", "statistics", "Arrival Areas",
+                            "arrival_percent", "--bins", "2",
+                            "--threshold", "0.05", "--threshold", "25",
+                            "--break", "10", "--break", "20",
+                        ],
+                        store,
+                    )
+                    self.assertEqual(EXIT_CONNECTIVITY, code)
+                    self.assertEqual("", stdout)
+                    self.assertEqual(
+                        "layer.statistics_invalid_response",
+                        json.loads(stderr)["code"],
+                    )
 
     def test_style_elements_reports_configured_effective_and_rendered_controls(self):
         routes = standard_routes()

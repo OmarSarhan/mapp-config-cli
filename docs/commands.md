@@ -66,16 +66,20 @@ Specialized `--output human` rendering is currently provided for `doctor`,
 
 `--input` is supported by `validate`, `sql test`, the dry-run mutation
 commands, live visual commands, workspace proposal check/create, semantic
-proposal check, and proposal candidate preview commands. Other commands reject
-it with `input.unsupported`.
+proposal check, proposal candidate preview, derived-layer create, and the
+area-weighted H3 planner commands. Other commands reject it with
+`input.unsupported`.
 
 ## Runtime command and API map
 
-The connected platform, not this document, is authoritative. The CLI reads the
-exact command set from `GET /api/contract` and action schemas from
-`GET /api/capabilities`. It fails with `capability.missing` when the required
-command or compatibility marker is absent; a related action ID or a known URL
-is not permission to bypass that gate.
+The connected platform, not this document, is authoritative. Every
+authenticated invocation reads the exact command set from `GET /api/contract`
+and fails with `capability.missing` when its required command or compatibility
+marker is absent. Action schemas are fetched only by an explicit
+`capabilities list|show` invocation; inspect them before first using a
+specialized action or when its current input, risk, route, or scope contract
+matters. A related action ID or a known URL is not permission to bypass the
+named-command gate.
 
 | CLI family | Server API | Advertised action | Scope |
 | --- | --- | --- | --- |
@@ -86,10 +90,12 @@ is not permission to bypass that gate.
 | `capabilities list\|show` | `/api/capabilities` | Returns `actions[]` | Any authenticated credential, including a semantic-only token |
 | `plugins list\|show\|validate\|usage` | `/api/plugins` | Command-advertised read | `inspect` |
 | `workspace get`, `layers list\|get\|style-elements\|filters`, `catalog list`, `icons list`, `sql capabilities` | Corresponding authenticated GET routes | Command-advertised reads; layer commands require the `layers effective` compatibility marker | `inspect` |
+| `layers values`, `layers statistics` | `/api/layers/{key}/values`, `/api/layers/{key}/statistics` | `layers.values`, `layers.statistics`; statistics also requires the exact `layers statistics` command | `derive` + `semantic:inspect` |
 | `validate` | `/api/validate` | Command-advertised non-saving validation | Legacy `full` or administrator session |
 | `set`, `unset`, `amend` | `/api/mutate` with `save: false` | Command-advertised dry run | Legacy `full` or administrator session |
 | `sql test` | `/api/sql/test` | Command-advertised bounded probe | Legacy `full` or administrator session |
 | `derived-layers capabilities\|list\|show\|map-extent` | `/api/derived-layers/*` GET routes | `derived-layers.map-extent` for the preview | `inspect` |
+| `derived-layers plan-area-weighted-h3` | `/api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3`; exact command required | `derive` + `semantic:inspect`; read-only plan |
 | `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also need `semantic:inspect` |
 | `proposals check\|create` | Workspace proposal routes | `proposals.check`, `proposals.create` | `propose` |
 | `proposals list\|show` | Workspace proposal GET routes | Command-advertised reads | `inspect` |
@@ -448,6 +454,33 @@ config-cli layers get "Bus Stops"
 config-cli layers get "Bus Stops" --locale en-GB
 ```
 
+### `layers statistics`
+
+Inspect a numeric field without returning raw records:
+
+```sh
+config-cli layers statistics "Population cells" population_percent
+config-cli layers statistics "Population cells" population_percent \
+  --locale en-GB --bins 20 --threshold 0.05 \
+  --break 10 --break 20 --break 30
+```
+
+`--bins` defaults to 10 and accepts 1 through 50. Repeat `--threshold` or
+`--break` at most 20 times; every value must be finite, and breaks must be
+strictly increasing without duplicates. The response retains numeric JSON
+values and reports null/non-finite counts, min/max, quantiles, bounded
+histogram bins, requested threshold counts, and candidate class counts. It
+does not return source rows. Quantiles are fixed discrete ranks drawn from
+observed finite values, so even extreme finite doubles remain valid JSON.
+
+Use the raw numeric field for graduated styling, fixed filters, and numeric
+Filtering controls. Keep a separately formatted text field for hover and
+clicked-feature display. Thresholds audit a rule such as excluding values
+below `0.05`. Pass the exact proposed technical category cutoffs as repeated
+breaks and inspect each class's `lowerInclusive` and `upperInclusive` flags and
+count; for an exclusive `less_than` upper bound, put the final cutoff one
+display increment above the observed maximum so the maximum remains included.
+
 ### `layers style-elements`
 
 Inspect the effective XYZ Styling-panel configuration for one layer:
@@ -722,6 +755,60 @@ source sync ... --confirm` and inspect the resulting generated profile before
 writing the derived SQL. This applies to table and view relations only;
 PostgreSQL, PostGIS, and H3 functions used inside the query do not need
 semantic profiles.
+
+### Area-weighted H3 planner
+
+The supported polygon-to-H3 recipe is planned from a JSON object:
+
+```json
+{
+  "name": "population_h3_r9",
+  "kind": "materialized",
+  "source": {
+    "assetId": "ASSET_ID",
+    "relation": "census.areas",
+    "idColumn": "area_id",
+    "geometryColumn": "source_geom"
+  },
+  "resolution": 9,
+  "measures": [{
+    "sourceColumn": "population",
+    "outputColumn": "population_estimate",
+    "nullHandling": "zero"
+  }],
+  "spatialScope": {
+    "type": "workspace-map-extent",
+    "locale": "city-centre"
+  }
+}
+```
+
+```sh
+config-cli derived-layers plan-area-weighted-h3 \
+  --input tmp/population-h3-recipe.json
+```
+
+Planning is read-only: `mutationApplied` must be `false`. The server verifies
+the selected ready PostgreSQL semantic profile and fields, generates the
+area-weighted query with overlap-mode scope candidates, resolves the bounded
+workspace map scope, and runs query, pair-planning, and—only for a materialized
+kind—storage preflight. Review the returned source and measures, assumptions,
+generated SQL, canonical
+`createRequest.spatialScope`, full `resolvedSpatialScope`, and every probe.
+
+The planner does not authorize or create the relation. After separate approval,
+copy the exact reviewed `recipePlan.createRequest` object to a private JSON
+file and submit it as a new command:
+
+```sh
+config-cli derived-layers create \
+  --input tmp/reviewed-population-h3-create.json \
+  --confirm
+```
+
+Create re-resolves the scope and repeats semantic and database preflight. A
+workspace, catalog, or plan change can therefore reject the later mutation;
+do not alter or automatically resubmit the reviewed request.
 
 Put the query in a file so shell parsing cannot change it. Store generated SQL
 drafts in the repository-local, git-ignored `tmp/` directory rather than the

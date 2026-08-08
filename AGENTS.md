@@ -192,15 +192,21 @@ null and distinct totals, and a `truncated` flag. It requires the same
 `derive + semantic:inspect` authority as managed derived-layer creation; do not
 request that elevated authority solely for an ordinary metadata inspection.
 
-For numeric symbology and Filtering controls backed by a rounded derived-layer
-display field, inspect the complete, non-truncated published values first. Use
-regular requested increments through the observed maximum, then make the final
-theme category a partial interval ending at that maximum. With
-`graduated_breaks: "less_than"`, set that final category's technical cutoff one
-display increment above the maximum so its top value is included. Likewise,
-set a numeric filter's `max` one display increment above the observed maximum,
-while retaining the requested increment; do not put the highest value directly
-on either exclusive thematic or UI control boundary.
+For numeric symbology and Filtering controls, inspect the raw numeric field
+with `layers statistics LAYER FIELD`, not the rounded display text or a
+truncated `layers values` result. Use repeated `--threshold` values to audit
+fixed filters and repeated, strictly increasing `--break` values to audit the
+exact proposed class cutoffs. Read the returned class counts and inclusive
+flags before describing the distribution. It returns aggregates rather than
+rows but requires the same `derive + semantic:inspect` authority as
+`layers values`. Use regular requested increments through the observed
+maximum, then make the final theme category a partial interval ending at that
+maximum. With `graduated_breaks: "less_than"`, pass the technical cutoffs as
+`--break` values and set the final cutoff one display increment above the
+maximum so its top value is included. Likewise, set a numeric filter's `max`
+one display increment above the observed maximum, while retaining the
+requested increment; do not put the highest value directly on either exclusive
+thematic or UI control boundary.
 
 For a one-decimal percentage, style and filter on the raw numeric percentage,
 while using a separately formatted text field only in feature information and
@@ -363,6 +369,29 @@ the flag is a local command guard, not evidence of user approval. Creating the
 relation does not add it to XYZ. Inspect the new catalog relation and use the
 normal revision-bound proposal and approval workflow for the workspace layer
 as a separate step.
+
+For additive polygon measures allocated into H3 cells by intersection-area
+share, prefer the supported read-only planner over hand-authored SQL:
+
+```sh
+config-cli derived-layers plan-area-weighted-h3 --input RECIPE.json
+```
+
+The planner must report `mutationApplied: false`. It validates the ready
+PostgreSQL semantic profile and requested fields, resolves the fixed map scope,
+and returns query-plan, pair-planning, and materialization probes as applicable.
+Review its source, measures, assumptions, generated query, canonical
+`createRequest`, full `resolvedSpatialScope`, and probes. Do not treat a passing
+plan as approval. Only after separate authorization, save the exact reviewed
+`recipePlan.createRequest` object and submit it in a separate invocation:
+
+```sh
+config-cli derived-layers create --input REVIEWED_CREATE.json --confirm
+```
+
+Create authoritatively resolves the scope and preflights again, so stop on
+workspace, semantic-catalog, or plan drift rather than modifying or retrying
+the reviewed request automatically.
 
 Store agent- or operator-generated derived-layer SQL drafts under the
 repository-local, git-ignored `tmp/` directory, for example

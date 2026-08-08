@@ -457,6 +457,12 @@ layer's fixed default filter for every related layer. Do not filter on the
 formatted text field. This removes zero-count cells as well as positive values
 below the visible precision threshold.
 
+Inspect that raw field with `layers statistics LAYER FIELD`. Add
+`--threshold 0.05` to audit the fixed filter and repeat `--break` with the
+exact proposed technical cutoffs to receive candidate class counts and
+inclusive-bound flags. The bounded statistics response contains no raw rows;
+do not use a truncated category-value result as distribution evidence.
+
 Every graduated category owns its effective `fillColor`, `strokeColor`,
 `fillOpacity`, and `strokeOpacity`; changing `style.default` alone does not
 recolour a themed polygon. For a group of mutually exclusive metrics, give each
@@ -607,6 +613,18 @@ the flag is a local command guard, not evidence of user approval. Adding the
 result to XYZ is a second operation: inspect it in the catalog, create a
 revision-bound workspace proposal, present that diff, and wait for its own
 approval before applying.
+
+For additive polygon measures allocated to H3 by intersection-area share, run
+`derived-layers plan-area-weighted-h3 --input RECIPE.json`. This read-only
+planner validates the ready semantic source profile, resolves the bounded map
+scope, generates overlap-mode candidates so coarse and boundary-intersecting
+cells are retained, prefilters source polygons in their native SRID, and
+completes query, pair-planning, and materialization preflight as applicable.
+Review the returned source, measures, assumptions,
+`createRequest`, full `resolvedSpatialScope`, and probes. After
+separate authorization, pass the exact reviewed `recipePlan.createRequest` to
+`derived-layers create --input REVIEWED.json --confirm`. Create re-resolves and
+preflights, so catalog or workspace drift remains a blocking result.
 
 The mandatory extent guard changes spatial scope only. Continue to use
 semantic catalog profiles as the authority for source and field meaning, and

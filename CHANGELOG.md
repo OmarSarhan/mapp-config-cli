@@ -29,6 +29,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Read-only `derived-layers plan-area-weighted-h3` support with replayable
+  reviewed create requests, semantic/source resolution, bounded spatial-scope
+  evidence, preflight probes, and a separate confirmed create boundary.
+- Capability-gated `layers statistics` inspection for bounded numeric
+  distributions, thresholds, and candidate breaks without returning raw rows,
+  with strict request and response validation and raw-field styling guidance.
 - Closed validation for the optional versioned derived query-planning
   capability and success probe, plus generic CLI-owned authoring guidance for
   proven over-limit nested-loop pair work across synchronous and durable

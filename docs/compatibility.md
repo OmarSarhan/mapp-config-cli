@@ -182,6 +182,18 @@ metadata-only response and the newer explicit false/false context report.
 Layer inspection requires the server's `layers effective` capability. A CLI
 must fail closed when that capability is absent rather than reimplementing XYZ
 locale composition or assuming `/api/layers` exists on an older `1.x` server.
+Numeric distribution inspection additionally requires the exact
+`layers statistics` command before using
+`/api/layers/{layerKey}/statistics`. Inspect the current
+`layers.statistics` schema explicitly with `capabilities show`; ordinary
+command execution does not refetch action schemas after verifying the command
+contract.
+The area-weighted H3 planner likewise requires the exact
+`derived-layers plan-area-weighted-h3` command. Inspect
+`derived-layers.plan-area-weighted-h3` explicitly for its current request,
+risk, route, and scope schema. Its successful response must remain non-mutating
+and include a replayable create request plus resolved scope and preflight
+evidence.
 
 ## Upgrade procedure
 
