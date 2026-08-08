@@ -59,6 +59,15 @@ non-empty `group` string render in one drawer. Use
 focused `/locale/layers/LAYER/group` (or named-locale override) proposal
 operation to add or move a layer. Unset the property to remove membership.
 
+Group colour is a deployed CSS concern exposed by XYZ through each member's
+`groupClassList`. The first layer that creates the drawer supplies its class
+list, so inspect the exact group and set the same verified deployed class list
+on every member. A hex value is not a class, and `groupColor`/`groupColour` are
+not framework properties. If the requested class is not present in the
+deployed map stylesheet, disclose that deployment gap instead of proposing a
+workspace value that cannot render. Preview the affected group drawer before
+approval.
+
 Inspect `layers style-elements "LAYER KEY"` before changing the interactive
 Styling drawer. `style.elements` controls order and inclusion only; each
 built-in element still needs its corresponding `style.<key>` configuration.
@@ -311,6 +320,16 @@ config-cli proposals preview-screenshot PROPOSAL_ID \
   --artifact-dir "./visual-evidence/PROPOSAL_ID-bus-stops"
 ```
 
+For a layer with a fixed default filter, the planner must select its feature
+count, extent, representative feature, and focus bounds from the effective
+filtered dataset. A representative feature from the unfiltered backing
+relation can be correctly removed by the default filter, leaving no map
+feature to hover or click and producing misleading visual failures for sparse
+metrics. Treat that as a planning defect, not evidence that the configured
+layer lacks data. A terminal visual operation must always preserve its result
+or structured error and artifacts; do not submit duplicate browser work while
+the original operation remains running.
+
 For a proposal that changes initial layer visibility, capture the genuine
 startup state instead of forcing the requested layer into both URLs:
 
@@ -420,6 +439,42 @@ Determine layer geometry and effective style before selecting a property:
   require a catalog column. Inspect schema and effective style first.
 - Theme- or feature-driven styles may override a simple default. Explain that
   limitation rather than claiming the change affects every feature.
+
+### Graduated H3 metric layers
+
+Keep the workspace layer key, visible `layer.name`, and backing relation name
+separate. Use a stable ASCII-safe key (for example,
+`Passport_holders_United_Kingdom`) for JSON Pointer paths and XYZ URL layer
+activation, while retaining spaces and punctuation in the visible `name`.
+Candidate activation of newly added grouped layers may not bind reliably when a
+display-formatted key is used as the layer key.
+
+For a percentage metric displayed to one decimal place, use the raw numeric
+field for styling and filtering, and use a separate formatted text field only
+for information and hover. If cells that display as `0.0%` must be hidden, the
+equivalent raw-numeric predicate is `metric_percent >= 0.05`; apply it in the
+layer's fixed default filter for every related layer. Do not filter on the
+formatted text field. This removes zero-count cells as well as positive values
+below the visible precision threshold.
+
+Every graduated category owns its effective `fillColor`, `strokeColor`,
+`fillOpacity`, and `strokeOpacity`; changing `style.default` alone does not
+recolour a themed polygon. For a group of mutually exclusive metrics, give each
+layer its own complete white-to-hue ramp rather than reusing a shared set of
+intermediate blue tints with only a different final colour. Set the category
+outline colour to the matching category fill colour and choose a lower
+`strokeOpacity` than `fillOpacity` when a lighter outline is requested. Update
+the default and highlight states deliberately as well, because those states do
+not inherit themed opacity.
+
+When a rounded metric's observed maximum defines the final graduated class,
+use the displayed maximum in the label but a technical final `less_than`
+cutoff one display increment higher so that the maximum is included. The same
+one-increment headroom belongs on numeric Filtering maxima. Equal-width classes
+can make a sparse high-end class difficult to see when the distribution is
+skewed; inspect the distribution before calling the resulting classes
+balanced, and use a separately approved quantile or custom-break design when
+the user needs comparable class populations.
 
 “Pin” is ambiguous in XYZ. A layer may render point features with a
 `markerLetter` icon, but XYZ also uses `markerLetter` for selected-location UI

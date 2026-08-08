@@ -4784,8 +4784,16 @@ class CliTests(unittest.TestCase):
             "revision": "rev-1",
             "locale": "locale",
             "layers": {
-                "Bus Stops": {"format": "mvt", "group": "Transport"},
-                "Paths": {"format": "mvt", "group": "Transport"},
+                "Bus Stops": {
+                    "format": "mvt",
+                    "group": "Transport",
+                    "groupClassList": "transport-group-blue",
+                },
+                "Paths": {
+                    "format": "mvt",
+                    "group": "Transport",
+                    "groupClassList": "transport-group-blue",
+                },
                 "Boundaries": {"format": "mvt", "group": "Reference"},
                 "Ungrouped": {"format": "mvt"},
             },
@@ -4800,6 +4808,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         payload = json.loads(stdout)
         self.assertEqual(list(payload["layers"]), ["Bus Stops", "Paths"])
+        self.assertEqual(
+            {
+                layer["groupClassList"]
+                for layer in payload["layers"].values()
+            },
+            {"transport-group-blue"},
+        )
 
     def test_layer_values_requests_bounded_aggregates_for_symbology(self):
         captured = {}

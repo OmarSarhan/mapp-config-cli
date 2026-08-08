@@ -606,6 +606,28 @@ the layer back to the ungrouped list. For named locales, target the raw
 `/locales/LOCALE/layers/...` override that should own the value; do not flatten
 the effective locale.
 
+XYZ colours a group drawer through a CSS class supplied as `groupClassList` by
+the first layer that creates the drawer. Inspect every member first, verify the
+class exists in the deployed map stylesheet, and set the same class list on
+every member:
+
+```sh
+config-cli layers list --group "Transport"
+config-cli schema --pointer '/$defs/layer/properties/groupClassList'
+config-cli proposals check \
+  --base-revision REVISION \
+  --set '/locale/layers/Bus Stops/groupClassList="transport-group-blue"' \
+  --set '/locale/layers/Rail Stations/groupClassList="transport-group-blue"' \
+  --explanation 'Uses the verified deployed transport-group-blue stylesheet class for the complete Transport drawer.'
+```
+
+`transport-group-blue` above represents a class verified in that deployment;
+it is not supplied by the CLI. Do not put a hex colour in `groupClassList` or
+invent `groupColor`/`groupColour`. If no deployed class provides the requested
+colour, a stylesheet deployment is required before the workspace proposal can
+have an effect. Candidate evidence must show the affected group drawer, not
+only a rendered child layer.
+
 ### `catalog list`
 
 List server-approved database relations, geometry fields, identifiers, and

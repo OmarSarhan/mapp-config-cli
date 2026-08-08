@@ -10,6 +10,9 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Added backend-aligned operator guidance for XYZ layer-group colours through
+  a verified deployed `groupClassList`, including first-member precedence,
+  consistent member values, and candidate drawer evidence.
 - Updated derived-layer scope guidance to treat the selected effective
   locale's configured north/east/south/west extent as authoritative, while
   documenting the server's legacy view-derived fallback for incomplete bounds.

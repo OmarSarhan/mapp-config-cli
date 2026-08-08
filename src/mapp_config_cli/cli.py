@@ -328,7 +328,10 @@ def parser() -> JsonArgumentParser:
     layer_list.add_argument("--locale")
     layer_list.add_argument(
         "--group",
-        help="Only return layers in this exact XYZ layer-folder group.",
+        help=(
+            "Return every layer in this exact XYZ folder so shared "
+            "groupClassList styling can be inspected."
+        ),
     )
     layer_get = layer_actions.add_parser("get")
     layer_get.add_argument("key")

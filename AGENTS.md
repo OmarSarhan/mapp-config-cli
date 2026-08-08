@@ -156,6 +156,12 @@ column or database data.
 First determine the layer geometry and effective style. Layer keys, display
 names, and tables are different identifiers.
 
+Use stable ASCII-safe layer keys for workspace object paths and URL activation
+(for example, `Passport_holders_United_Kingdom`), while putting punctuation,
+spaces, and human-readable wording only in `layer.name`. Preview and XYZ URL
+layer activation can fail to bind a newly added grouped layer when its key uses
+display punctuation such as an em dash, even though the schema accepts it.
+
 - Filled point symbols (`dot`, `target`, `triangle`, `square`, `diamond`,
   `semiCircle`) use `style.default.icon.fillColor`.
 - `circle` points use `style.default.icon.strokeColor`.
@@ -195,6 +201,27 @@ display increment above the maximum so its top value is included. Likewise,
 set a numeric filter's `max` one display increment above the observed maximum,
 while retaining the requested increment; do not put the highest value directly
 on either exclusive thematic or UI control boundary.
+
+For a one-decimal percentage, style and filter on the raw numeric percentage,
+while using a separately formatted text field only in feature information and
+hover. “Do not show 0.0% cells” means `raw_percent >= 0.05`, not a comparison
+against formatted text; apply that fixed default filter consistently to every
+related layer. A themed category owns its effective fill, outline, and opacity,
+so change every category (and the requested default/highlight states) rather
+than only `style.default`. For related metrics, give each layer a complete
+white-to-its-own-hue gradient, set each outline to its matching fill colour,
+and use a lower outline opacity when requested. Never describe equal-width
+classes as equal-population classes without distribution evidence.
+
+XYZ can colour a layer-group drawer only through the native per-layer
+`groupClassList`: it copies that stylesheet class list from the first layer
+that creates the group. Inspect every exact group member and the deployed map
+stylesheet, then set the same verified class list on every member so layer
+order or locale composition cannot change the result. `groupClassList` is not
+a CSS colour value; do not put a hex value there or invent `groupColor` or
+`groupColour`. If no suitable deployed class can be verified, report that the
+colour needs a deployment stylesheet change rather than proposing an inert
+workspace value. Require candidate drawer screenshot evidence for the group.
 
 Do not confuse a layer's `markerLetter` icon with XYZ's selected-location pin.
 The pinned XYZ framework builds that UI pin at runtime from
@@ -398,6 +425,13 @@ distinct from `derived_layer.query_invalid` (fix malformed/non-SELECT SQL) and
 `derived_layer.query_not_allowed` (remove or replace the prohibited SQL or
 catalog dependency). Present each reason's own `suggestedAction`, plus
 `safeState` when `stateUnchanged` is true; do not substitute a generic H3 hint.
+When a safe preflight rejection supplies a mechanical, semantics-preserving
+rewrite (for example, replacing an unprovable fixed-width `unnest` expansion
+with an equivalent bounded `VALUES` catalogue), make that local rewrite and
+resubmit automatically under the original derived-layer authorization. Report
+the rejected construct, server reason, replacement, and preserved calculation;
+ask again only if the rewrite changes the requested metric, geographic scope,
+source relation, materialization kind, or disclosure risk.
 The separate materialized-size probe returns
 `derivedLayer.materializationProbe`. Only
 `derived_layer.materialization_too_large` may recommend `view`; preserve its
