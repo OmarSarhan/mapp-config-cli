@@ -6736,7 +6736,10 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 client.request(f"/api/federation/aliases/{alias}"), context
             )
         if args.action == "register":
-            payload = {
+            # Distinct local names: this handler function already binds
+            # "payload" for a derived-layer mutation further down, and
+            # shadowing it here made that annotated assignment a redefinition.
+            registration = {
                 "alias": args.alias,
                 "kind": "postgresql",
                 "connectionRef": args.connection_ref,
@@ -6746,12 +6749,12 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 "dataHandlingAcknowledged": args.acknowledge_data_handling,
             }
             if args.display_name:
-                payload["displayName"] = args.display_name
+                registration["displayName"] = args.display_name
             return _with_context(
                 client.request(
                     "/api/federation/aliases",
                     method="POST",
-                    payload=payload,
+                    payload=registration,
                 ),
                 context,
             )
@@ -6759,7 +6762,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             # Only send an acknowledgement that was actually given: the route
             # rejects unknown properties, and a false one reads as a decision
             # the operator did not make.
-            payload: dict[str, Any] = {
+            exposure: dict[str, Any] = {
                 "expectedObservationId": args.expected_observation_id,
             }
             for given, prop in (
@@ -6771,14 +6774,14 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 (args.acknowledge_physical_rebind, "acknowledge_physical_rebind"),
             ):
                 if given:
-                    payload[prop] = True
+                    exposure[prop] = True
             return _with_context(
                 _request_federation_exposure_change(
                     client,
                     f"/api/federation/aliases/{alias}/provision",
                     alias=args.alias,
                     action="provision",
-                    payload=payload,
+                    payload=exposure,
                 ),
                 context,
             )
