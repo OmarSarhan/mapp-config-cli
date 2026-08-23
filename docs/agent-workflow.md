@@ -878,6 +878,59 @@ whole profile or claim a generated column was removed. Conversely, profile
 archival is an administrator lifecycle action, not a shortcut around the
 semantic proposal approval boundary.
 
+## Federated PostgreSQL sources
+
+Use `federation` when the data an operator wants lives in a PostgreSQL server
+MAPP does not own. The platform reaches it over `postgres_fdw`, exposing only
+an explicit relation allowlist as foreign tables in a `source_<alias>` schema.
+It is available whenever the deployment has a local database, so in `bundled`
+and `federated` modes but not `external`; the routes answer
+`federation.not_configured` otherwise.
+
+The scopes are elevated and absent from the default device credential, so
+request them explicitly and only the ones needed. `federation:provision` is
+the one to be careful with — it is the only device scope that can expose a
+third-party database through the platform:
+
+```bash
+config-cli auth device --scope federation:observe --scope federation:register \
+  --scope federation:provision
+```
+
+The lifecycle is ordered, and each step means something different:
+
+1. `federation register <alias> ...` records intent. It opens no connection
+   and exposes nothing. `--acknowledge-data-handling` is required rather than
+   defaulted, because the point of the field is that a person accepted the
+   licensing and personal-data implications. Do not assert it on a human's
+   behalf without asking.
+2. `federation observe <alias>` connects and records what it found. Read the
+   result; the observation identifier is what the next step is bound to.
+3. `federation provision <alias> --expected-observation-id N --confirm` is the
+   only step that serves data. `N` must be the observation you actually read,
+   so that provisioning cannot approve something nobody looked at.
+4. `federation retire <alias> --confirm` withdraws a source. It archives
+   rather than drops, and refuses while anything still reads it.
+
+Three conditions need a deliberate acknowledgement flag on `provision`:
+`--acknowledge-row-level-security`, `--acknowledge-schema-change`, and
+`--acknowledge-physical-rebind`. Treat a refusal naming one of these as a
+question for the operator, never as a flag to add and retry. The rebind guard
+in particular means the source is a **different physical database** than the
+one previously approved — a restored backup or a swapped host keeps every name
+and column identical, so this is the only signal that it changed.
+
+`provision` and `retire` distinguish a refusal from a lost outcome. A 4xx is
+the server declining. Anything else exits `5` with
+`federation.exposure_indeterminate` and `reconciliation.automaticRetry:
+false`, meaning the change may have committed before the response was lost.
+Run `config-cli federation show <alias>` to establish what actually happened.
+Do not resend either command.
+
+Retiring a source does not delete what was learned from it. Semantic profiles
+built on its relations are flagged unavailable rather than removed, and are
+restored if the source returns, so do not rebuild them speculatively.
+
 ## Non-negotiable safeguards
 
 - Use `config-cli` as the only remote workspace write interface.
@@ -888,3 +941,7 @@ semantic proposal approval boundary.
 - Never expose a token or other secret.
 - Never mount or expose a remote Docker socket.
 - Never assume ambiguous layer, marker, locale, style-state, or SQL intent.
+- Never resend a federation `provision` or `retire` whose outcome was
+  reported indeterminate; inspect the alias instead.
+- Never add a federation acknowledgement flag to get past a refusal
+  without the operator deciding it.
