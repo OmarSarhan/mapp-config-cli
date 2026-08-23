@@ -66,6 +66,14 @@ _DEVICE_SCOPE_CHOICES = (
     "semantic:propose",
     "semantic:apply",
     "semantic:admin",
+    # Elevated, and deliberately absent from _SAFE_DEFAULT_DEVICE_SCOPES below:
+    # federation:provision is the only scope in this list that can expose a
+    # third-party database through the platform. They are selectable because
+    # control_plane.DEVICE_SCOPES has always accepted them, so rejecting them
+    # here left the device flow unable to authorize any federation command.
+    "federation:observe",
+    "federation:register",
+    "federation:provision",
 )
 _DEVICE_SCOPES = frozenset(_DEVICE_SCOPE_CHOICES)
 _SAFE_DEFAULT_DEVICE_SCOPES = frozenset({
@@ -336,6 +344,96 @@ def parser() -> JsonArgumentParser:
     dependency_check.add_argument("--alias", required=True, type=nonempty)
     dependency_check.add_argument("--schema", required=True, type=nonempty)
     dependency_check.add_argument("--relation", required=True, type=nonempty)
+    federation = commands.add_parser(
+        "federation",
+        help="Manage federated PostgreSQL source aliases.",
+    )
+    federation_actions = federation.add_subparsers(dest="action", required=True)
+    federation_actions.add_parser(
+        "list",
+        help="List registered source aliases and their status.",
+    )
+    federation_show = federation_actions.add_parser(
+        "show",
+        help="Show one alias, retired ones included.",
+    )
+    federation_show.add_argument("alias", type=nonempty)
+    federation_register = federation_actions.add_parser(
+        "register",
+        help="Record intent to attach a source. Exposes nothing.",
+    )
+    federation_register.add_argument("alias", type=nonempty)
+    federation_register.add_argument(
+        "--connection-ref",
+        required=True,
+        type=nonempty,
+        help="Suffix of the FEDERATION_DBS_<REF> variable holding the secret.",
+    )
+    federation_register.add_argument(
+        "--relation",
+        action="append",
+        required=True,
+        type=nonempty,
+        metavar="SCHEMA.RELATION",
+        help="Allowed relation; repeat per relation. The whole exposure surface.",
+    )
+    federation_register.add_argument(
+        "--tls-policy",
+        default="require",
+        choices=("require", "verify-ca", "verify-full"),
+    )
+    federation_register.add_argument("--display-name", type=nonempty)
+    federation_register.add_argument(
+        "--data-handling",
+        required=True,
+        type=nonempty,
+        help="Licensing, attribution and personal-data classification.",
+    )
+    federation_register.add_argument(
+        "--acknowledge-data-handling",
+        action="store_true",
+        required=True,
+        help="Acknowledge the data-handling implications; the server requires it.",
+    )
+    federation_observe = federation_actions.add_parser(
+        "observe",
+        help="Probe the source live and record an observation.",
+    )
+    federation_observe.add_argument("alias", type=nonempty)
+    federation_provision = federation_actions.add_parser(
+        "provision",
+        help="Expose the allowed relations. The only step that serves data.",
+    )
+    federation_provision.add_argument("alias", type=nonempty)
+    federation_provision.add_argument(
+        "--expected-observation-id",
+        required=True,
+        type=int,
+        help="The observation you read; provisioning refuses if anything moved.",
+    )
+    federation_provision.add_argument(
+        "--acknowledge-row-level-security",
+        action="store_true",
+    )
+    federation_provision.add_argument(
+        "--acknowledge-schema-change",
+        action="store_true",
+    )
+    federation_provision.add_argument(
+        "--acknowledge-physical-rebind",
+        action="store_true",
+    )
+    federation_provision.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+    )
+    federation_retire = federation_actions.add_parser(
+        "retire",
+        help="Withdraw a source. Archives rather than drops.",
+    )
+    federation_retire.add_argument("alias", type=nonempty)
+    federation_retire.add_argument("--confirm", action="store_true", required=True)
     plugins_command = commands.add_parser(
         "plugins",
         help="Inspect the server-audited pinned XYZ plugin system.",
@@ -955,7 +1053,7 @@ def required_contract_command(args) -> str:
     if args.command in {
         "workspace", "catalog", "icons", "auth", "xyz", "sql",
         "capabilities", "dependencies", "plugins", "operations",
-        "derived-layers",
+        "derived-layers", "federation",
     }:
         return f"{args.command} {args.action}"
     if args.command == "layers":
@@ -1854,6 +1952,100 @@ def _derived_mutation_indeterminate(
         EXIT_INTERRUPTED if interrupted else EXIT_CONNECTIVITY,
         details=details,
         error_code="derived_layer.mutation_indeterminate",
+    )
+
+
+def _request_federation_exposure_change(
+    client: ApiClient,
+    path: str,
+    *,
+    alias: str,
+    action: str,
+    expected_status: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """POST a provision or retire, distinguishing refusal from lost outcome.
+
+    Both change what the platform serves. A 4xx is the server declining, which
+    is authoritative and safe to report as a failure. Anything else -- a
+    timeout, a dropped connection, a 5xx -- may have committed before the
+    response was lost, so the alias has to be inspected rather than the request
+    resent. Same discrimination as _request_derived_mutation.
+
+    A 2xx is only believed if it says what committed. client.request accepts
+    any JSON object, so an empty or mismatched body would otherwise exit 0 and
+    report success for a change to served data that nothing established.
+    """
+    try:
+        result = client.request(path, method="POST", payload=payload)
+    except KeyboardInterrupt as exc:
+        raise _federation_exposure_indeterminate(
+            alias, action, interrupted=True
+        ) from exc
+    except CliError as exc:
+        if (
+            exc.http_status is not None
+            and 400 <= exc.http_status < 500
+            and exc.http_status != 408
+        ):
+            raise
+        raise _federation_exposure_indeterminate(
+            alias, action, cause=exc
+        ) from exc
+    state = result.get("alias") if isinstance(result, dict) else None
+    if (
+        not isinstance(state, dict)
+        or state.get("alias") != alias
+        or state.get("status") != expected_status
+    ):
+        raise _federation_exposure_indeterminate(
+            alias, action, response=result if isinstance(result, dict) else None
+        )
+    return result
+
+
+def _federation_exposure_indeterminate(
+    alias: str,
+    action: str,
+    *,
+    cause: CliError | None = None,
+    response: dict[str, Any] | None = None,
+    interrupted: bool = False,
+) -> CliError:
+    details: dict[str, Any] = {
+        "alias": alias,
+        "action": action,
+        "indeterminate": True,
+        "failurePhase": "request-response",
+        "reconciliation": {
+            "required": True,
+            "automaticRetry": False,
+            "commands": [
+                {
+                    "command": "config-cli federation show",
+                    "arguments": [alias],
+                },
+            ],
+        },
+    }
+    if cause is not None:
+        details["cause"] = {
+            "code": cause.error_code,
+            "httpStatus": cause.http_status,
+            "details": cause.safe_details,
+        }
+    if response is not None:
+        details["response"] = response
+    if interrupted:
+        details["interrupted"] = True
+    return CliError(
+        (
+            f"Federation {action} outcome is indeterminate. Do not resend; "
+            "inspect the alias to see whether the change took effect."
+        ),
+        EXIT_INTERRUPTED if interrupted else EXIT_CONNECTIVITY,
+        details=details,
+        error_code="federation.exposure_indeterminate",
     )
 
 
@@ -6550,6 +6742,89 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             result = client.request(f"/api/dependencies?{query}")
             _validate_dependencies_check_response(result, args=args)
         return _with_context(result, context)
+
+    if args.command == "federation":
+        if args.action == "list":
+            return _with_context(
+                client.request("/api/federation/aliases"), context
+            )
+        alias = quote_segment(args.alias)
+        if args.action == "show":
+            return _with_context(
+                client.request(f"/api/federation/aliases/{alias}"), context
+            )
+        if args.action == "register":
+            # Distinct local names: this handler function already binds
+            # "payload" for a derived-layer mutation further down, and
+            # shadowing it here made that annotated assignment a redefinition.
+            registration = {
+                "alias": args.alias,
+                "kind": "postgresql",
+                "connectionRef": args.connection_ref,
+                "tlsPolicy": args.tls_policy,
+                "allowedRelations": args.relation,
+                "dataHandlingClassification": args.data_handling,
+                "dataHandlingAcknowledged": args.acknowledge_data_handling,
+            }
+            if args.display_name:
+                registration["displayName"] = args.display_name
+            return _with_context(
+                client.request(
+                    "/api/federation/aliases",
+                    method="POST",
+                    payload=registration,
+                ),
+                context,
+            )
+        if args.action == "provision":
+            # Only send an acknowledgement that was actually given: the route
+            # rejects unknown properties, and a false one reads as a decision
+            # the operator did not make.
+            exposure: dict[str, Any] = {
+                "expectedObservationId": args.expected_observation_id,
+            }
+            for given, prop in (
+                (
+                    args.acknowledge_row_level_security,
+                    "acknowledge_row_level_security",
+                ),
+                (args.acknowledge_schema_change, "acknowledge_schema_change"),
+                (args.acknowledge_physical_rebind, "acknowledge_physical_rebind"),
+            ):
+                if given:
+                    exposure[prop] = True
+            return _with_context(
+                _request_federation_exposure_change(
+                    client,
+                    f"/api/federation/aliases/{alias}/provision",
+                    alias=args.alias,
+                    action="provision",
+                    expected_status="active",
+                    payload=exposure,
+                ),
+                context,
+            )
+        # Both take an empty body, but only retire changes what is served.
+        if args.action == "retire":
+            return _with_context(
+                _request_federation_exposure_change(
+                    client,
+                    f"/api/federation/aliases/{alias}/retire",
+                    alias=args.alias,
+                    action="retire",
+                    expected_status="retired",
+                    payload={},
+                ),
+                context,
+            )
+        return _with_context(
+            client.request(
+                f"/api/federation/aliases/{alias}/observe",
+                method="POST",
+                payload={},
+            ),
+            context,
+        )
 
     if args.command == "workspace":
         result = client.request("/api/workspace")

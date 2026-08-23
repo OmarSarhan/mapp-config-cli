@@ -92,7 +92,10 @@ init` with a private token file instead; see [Installation](docs/installation.md
 thirty-day agent token using the verified server contract's safe advertised
 defaults. The current platform defaults to inspect, propose, visual, and
 semantic-inspect work; workspace apply, reload, derived-layer lifecycle
-authority, and elevated semantic changes remain separate grants. After `auth
+authority, elevated semantic changes, and the `federation:*` scopes
+remain separate grants. Request `federation:provision` only when the
+computer genuinely needs it: it is the only device scope that can expose
+a third-party database through the platform. After `auth
 status` confirms the replacement, revoke the bootstrap token in the remote
 dashboard.
 

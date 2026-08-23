@@ -52,6 +52,9 @@ DEVICE_SCOPES = (
     "semantic:propose",
     "semantic:apply",
     "semantic:admin",
+    "federation:observe",
+    "federation:register",
+    "federation:provision",
 )
 SAFE_DEFAULT_DEVICE_SCOPES = (
     "inspect",
@@ -5364,6 +5367,221 @@ class CliTests(unittest.TestCase):
         self.assertEqual(3, payload["distinctCount"])
         self.assertTrue(payload["truncated"])
         self.assertEqual("0-4", payload["values"][0]["value"])
+
+    def test_federation_list_and_show_read_the_alias_registry(self):
+        routes = standard_routes()
+        routes[("GET", "/api/federation/aliases")] = (
+            200,
+            {"aliases": [{"alias": "leeds_ext", "status": "active"}]},
+        )
+        routes[("GET", "/api/federation/aliases/leeds_ext")] = (
+            200,
+            {"alias": {"alias": "leeds_ext", "status": "active"}},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            listed = self.invoke(["federation", "list"], store)
+            shown = self.invoke(["federation", "show", "leeds_ext"], store)
+
+        self.assertEqual(listed[0], 0, listed[2])
+        self.assertIn("leeds_ext", listed[1])
+        self.assertEqual(shown[0], 0, shown[2])
+        self.assertIn("leeds_ext", shown[1])
+
+    def test_federation_register_sends_the_documented_payload(self):
+        captured = {}
+
+        def register(request):
+            captured.update(request["body"])
+            return 201, {"alias": {"alias": request["body"]["alias"]}}
+
+        routes = standard_routes()
+        routes[("POST", "/api/federation/aliases")] = register
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, _, stderr = self.invoke([
+                "federation", "register", "leeds_ext",
+                "--connection-ref", "LEEDS_EXT",
+                "--relation", "leeds.smoke_control_orders",
+                "--relation", "leeds.bus_stops",
+                "--data-handling", "Public open data, OGL v3.",
+                "--acknowledge-data-handling",
+            ], store)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(captured, {
+            "alias": "leeds_ext",
+            "kind": "postgresql",
+            "connectionRef": "LEEDS_EXT",
+            "tlsPolicy": "require",
+            "allowedRelations": [
+                "leeds.smoke_control_orders",
+                "leeds.bus_stops",
+            ],
+            "dataHandlingClassification": "Public open data, OGL v3.",
+            "dataHandlingAcknowledged": True,
+        })
+
+    def test_federation_provision_sends_only_acknowledgements_given(self):
+        captured = {}
+
+        def provision(request):
+            captured.update(request["body"])
+            return 200, {"alias": {"alias": "leeds_ext", "status": "active"}}
+
+        routes = standard_routes()
+        routes[("POST", "/api/federation/aliases/leeds_ext/provision")] = (
+            provision
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, _, stderr = self.invoke([
+                "federation", "provision", "leeds_ext",
+                "--expected-observation-id", "88",
+                "--acknowledge-physical-rebind",
+                "--confirm",
+            ], store)
+
+        self.assertEqual(code, 0, stderr)
+        # An acknowledgement nobody gave must be absent, not false: the route
+        # rejects unknown properties and a false one reads as a decision.
+        self.assertEqual(captured, {
+            "expectedObservationId": 88,
+            "acknowledge_physical_rebind": True,
+        })
+
+    def test_federation_exposure_loss_is_indeterminate_not_failed(self):
+        # A 5xx may have committed before the response was lost, so the alias
+        # has to be inspected rather than the request resent.
+        routes = standard_routes()
+        routes[("POST", "/api/federation/aliases/leeds_ext/provision")] = (
+            503,
+            {"error": "upstream gone"},
+        )
+        routes[("POST", "/api/federation/aliases/leeds_ext/retire")] = (
+            503,
+            {"error": "upstream gone"},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            provision = self.invoke([
+                "federation", "provision", "leeds_ext",
+                "--expected-observation-id", "88", "--confirm",
+            ], store)
+            retire = self.invoke(
+                ["federation", "retire", "leeds_ext", "--confirm"], store
+            )
+
+        for code, stdout, stderr in (provision, retire):
+            self.assertEqual(EXIT_CONNECTIVITY, code)
+            self.assertEqual("", stdout)
+            failure = json.loads(stderr)
+            self.assertEqual(
+                "federation.exposure_indeterminate", failure["code"]
+            )
+            reconciliation = failure["details"]["reconciliation"]
+            self.assertFalse(reconciliation["automaticRetry"])
+            self.assertEqual(
+                [{
+                    "command": "config-cli federation show",
+                    "arguments": ["leeds_ext"],
+                }],
+                reconciliation["commands"],
+            )
+
+    def test_federation_success_must_say_what_committed(self):
+        # A 200 that does not establish the alias and its new state is not
+        # evidence the change happened, and these two change served data.
+        cases = (
+            ("provision", {}),
+            ("provision", {"alias": {"alias": "leeds_ext"}}),
+            ("provision", {"alias": {"alias": "other", "status": "active"}}),
+            ("retire", {"alias": {"alias": "leeds_ext", "status": "active"}}),
+        )
+        for action, body in cases:
+            with self.subTest(action=action, body=body):
+                routes = standard_routes()
+                routes[
+                    ("POST", f"/api/federation/aliases/leeds_ext/{action}")
+                ] = (200, body)
+                arguments = ["federation", action, "leeds_ext", "--confirm"]
+                if action == "provision":
+                    arguments[3:3] = ["--expected-observation-id", "88"]
+                with tempfile.TemporaryDirectory() as directory, JsonServer(
+                    routes
+                ) as server:
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(arguments, store)
+
+                self.assertEqual(EXIT_CONNECTIVITY, code)
+                self.assertEqual("", stdout)
+                failure = json.loads(stderr)
+                self.assertEqual(
+                    "federation.exposure_indeterminate", failure["code"]
+                )
+
+    def test_federation_retire_accepts_the_retired_state(self):
+        routes = standard_routes()
+        routes[("POST", "/api/federation/aliases/leeds_ext/retire")] = (
+            200,
+            {"alias": {"alias": "leeds_ext", "status": "retired"}},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["federation", "retire", "leeds_ext", "--confirm"], store
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertIn("retired", stdout)
+
+    def test_federation_refusal_stays_a_refusal(self):
+        # A 4xx is the server declining. Reporting that as indeterminate would
+        # send the operator inspecting an alias that never changed.
+        routes = standard_routes()
+        routes[("POST", "/api/federation/aliases/leeds_ext/provision")] = (
+            409,
+            {
+                "error": "Derived layers are mutating.",
+                "code": "federation.derived_layers_busy",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, _, stderr = self.invoke([
+                "federation", "provision", "leeds_ext",
+                "--expected-observation-id", "88", "--confirm",
+            ], store)
+
+        self.assertNotEqual(EXIT_CONNECTIVITY, code)
+        failure = json.loads(stderr)
+        self.assertEqual("federation.derived_layers_busy", failure["code"])
+
+    def test_federation_exposure_changes_require_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.configured_store(directory, "https://example.invalid")
+            for arguments in (
+                [
+                    "federation", "provision", "leeds_ext",
+                    "--expected-observation-id", "88",
+                ],
+                ["federation", "retire", "leeds_ext"],
+            ):
+                code, _, stderr = self.invoke(arguments, store)
+                self.assertEqual(code, 2, stderr)
+                self.assertIn("--confirm", stderr)
 
     def test_dependencies_list_and_check_inspect_platform_references(self):
         captured = {}
