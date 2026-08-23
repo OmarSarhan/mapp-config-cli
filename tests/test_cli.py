@@ -5365,6 +5365,108 @@ class CliTests(unittest.TestCase):
         self.assertTrue(payload["truncated"])
         self.assertEqual("0-4", payload["values"][0]["value"])
 
+    def test_federation_list_and_show_read_the_alias_registry(self):
+        routes = standard_routes()
+        routes[("GET", "/api/federation/aliases")] = (
+            200,
+            {"aliases": [{"alias": "leeds_ext", "status": "active"}]},
+        )
+        routes[("GET", "/api/federation/aliases/leeds_ext")] = (
+            200,
+            {"alias": {"alias": "leeds_ext", "status": "active"}},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            listed = self.invoke(["federation", "list"], store)
+            shown = self.invoke(["federation", "show", "leeds_ext"], store)
+
+        self.assertEqual(listed[0], 0, listed[2])
+        self.assertIn("leeds_ext", listed[1])
+        self.assertEqual(shown[0], 0, shown[2])
+        self.assertIn("leeds_ext", shown[1])
+
+    def test_federation_register_sends_the_documented_payload(self):
+        captured = {}
+
+        def register(request):
+            captured.update(request["body"])
+            return 201, {"alias": {"alias": request["body"]["alias"]}}
+
+        routes = standard_routes()
+        routes[("POST", "/api/federation/aliases")] = register
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, _, stderr = self.invoke([
+                "federation", "register", "leeds_ext",
+                "--connection-ref", "LEEDS_EXT",
+                "--relation", "leeds.smoke_control_orders",
+                "--relation", "leeds.bus_stops",
+                "--data-handling", "Public open data, OGL v3.",
+                "--acknowledge-data-handling",
+            ], store)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(captured, {
+            "alias": "leeds_ext",
+            "kind": "postgresql",
+            "connectionRef": "LEEDS_EXT",
+            "tlsPolicy": "require",
+            "allowedRelations": [
+                "leeds.smoke_control_orders",
+                "leeds.bus_stops",
+            ],
+            "dataHandlingClassification": "Public open data, OGL v3.",
+            "dataHandlingAcknowledged": True,
+        })
+
+    def test_federation_provision_sends_only_acknowledgements_given(self):
+        captured = {}
+
+        def provision(request):
+            captured.update(request["body"])
+            return 200, {"alias": {"alias": "leeds_ext", "status": "active"}}
+
+        routes = standard_routes()
+        routes[("POST", "/api/federation/aliases/leeds_ext/provision")] = (
+            provision
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, _, stderr = self.invoke([
+                "federation", "provision", "leeds_ext",
+                "--expected-observation-id", "88",
+                "--acknowledge-physical-rebind",
+                "--confirm",
+            ], store)
+
+        self.assertEqual(code, 0, stderr)
+        # An acknowledgement nobody gave must be absent, not false: the route
+        # rejects unknown properties and a false one reads as a decision.
+        self.assertEqual(captured, {
+            "expectedObservationId": 88,
+            "acknowledge_physical_rebind": True,
+        })
+
+    def test_federation_exposure_changes_require_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.configured_store(directory, "https://example.invalid")
+            for arguments in (
+                [
+                    "federation", "provision", "leeds_ext",
+                    "--expected-observation-id", "88",
+                ],
+                ["federation", "retire", "leeds_ext"],
+            ):
+                code, _, stderr = self.invoke(arguments, store)
+                self.assertEqual(code, 2, stderr)
+                self.assertIn("--confirm", stderr)
+
     def test_dependencies_list_and_check_inspect_platform_references(self):
         captured = {}
         dependencies = [

@@ -336,6 +336,96 @@ def parser() -> JsonArgumentParser:
     dependency_check.add_argument("--alias", required=True, type=nonempty)
     dependency_check.add_argument("--schema", required=True, type=nonempty)
     dependency_check.add_argument("--relation", required=True, type=nonempty)
+    federation = commands.add_parser(
+        "federation",
+        help="Manage federated PostgreSQL source aliases.",
+    )
+    federation_actions = federation.add_subparsers(dest="action", required=True)
+    federation_actions.add_parser(
+        "list",
+        help="List registered source aliases and their status.",
+    )
+    federation_show = federation_actions.add_parser(
+        "show",
+        help="Show one alias, retired ones included.",
+    )
+    federation_show.add_argument("alias", type=nonempty)
+    federation_register = federation_actions.add_parser(
+        "register",
+        help="Record intent to attach a source. Exposes nothing.",
+    )
+    federation_register.add_argument("alias", type=nonempty)
+    federation_register.add_argument(
+        "--connection-ref",
+        required=True,
+        type=nonempty,
+        help="Suffix of the FEDERATION_DBS_<REF> variable holding the secret.",
+    )
+    federation_register.add_argument(
+        "--relation",
+        action="append",
+        required=True,
+        type=nonempty,
+        metavar="SCHEMA.RELATION",
+        help="Allowed relation; repeat per relation. The whole exposure surface.",
+    )
+    federation_register.add_argument(
+        "--tls-policy",
+        default="require",
+        choices=("require", "verify-ca", "verify-full"),
+    )
+    federation_register.add_argument("--display-name", type=nonempty)
+    federation_register.add_argument(
+        "--data-handling",
+        required=True,
+        type=nonempty,
+        help="Licensing, attribution and personal-data classification.",
+    )
+    federation_register.add_argument(
+        "--acknowledge-data-handling",
+        action="store_true",
+        required=True,
+        help="Acknowledge the data-handling implications; the server requires it.",
+    )
+    federation_observe = federation_actions.add_parser(
+        "observe",
+        help="Probe the source live and record an observation.",
+    )
+    federation_observe.add_argument("alias", type=nonempty)
+    federation_provision = federation_actions.add_parser(
+        "provision",
+        help="Expose the allowed relations. The only step that serves data.",
+    )
+    federation_provision.add_argument("alias", type=nonempty)
+    federation_provision.add_argument(
+        "--expected-observation-id",
+        required=True,
+        type=int,
+        help="The observation you read; provisioning refuses if anything moved.",
+    )
+    federation_provision.add_argument(
+        "--acknowledge-row-level-security",
+        action="store_true",
+    )
+    federation_provision.add_argument(
+        "--acknowledge-schema-change",
+        action="store_true",
+    )
+    federation_provision.add_argument(
+        "--acknowledge-physical-rebind",
+        action="store_true",
+    )
+    federation_provision.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+    )
+    federation_retire = federation_actions.add_parser(
+        "retire",
+        help="Withdraw a source. Archives rather than drops.",
+    )
+    federation_retire.add_argument("alias", type=nonempty)
+    federation_retire.add_argument("--confirm", action="store_true", required=True)
     plugins_command = commands.add_parser(
         "plugins",
         help="Inspect the server-audited pinned XYZ plugin system.",
@@ -955,7 +1045,7 @@ def required_contract_command(args) -> str:
     if args.command in {
         "workspace", "catalog", "icons", "auth", "xyz", "sql",
         "capabilities", "dependencies", "plugins", "operations",
-        "derived-layers",
+        "derived-layers", "federation",
     }:
         return f"{args.command} {args.action}"
     if args.command == "layers":
@@ -6550,6 +6640,71 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             result = client.request(f"/api/dependencies?{query}")
             _validate_dependencies_check_response(result, args=args)
         return _with_context(result, context)
+
+    if args.command == "federation":
+        if args.action == "list":
+            return _with_context(
+                client.request("/api/federation/aliases"), context
+            )
+        alias = quote_segment(args.alias)
+        if args.action == "show":
+            return _with_context(
+                client.request(f"/api/federation/aliases/{alias}"), context
+            )
+        if args.action == "register":
+            payload = {
+                "alias": args.alias,
+                "kind": "postgresql",
+                "connectionRef": args.connection_ref,
+                "tlsPolicy": args.tls_policy,
+                "allowedRelations": args.relation,
+                "dataHandlingClassification": args.data_handling,
+                "dataHandlingAcknowledged": args.acknowledge_data_handling,
+            }
+            if args.display_name:
+                payload["displayName"] = args.display_name
+            return _with_context(
+                client.request(
+                    "/api/federation/aliases",
+                    method="POST",
+                    payload=payload,
+                ),
+                context,
+            )
+        if args.action == "provision":
+            # Only send an acknowledgement that was actually given: the route
+            # rejects unknown properties, and a false one reads as a decision
+            # the operator did not make.
+            payload: dict[str, Any] = {
+                "expectedObservationId": args.expected_observation_id,
+            }
+            for given, prop in (
+                (
+                    args.acknowledge_row_level_security,
+                    "acknowledge_row_level_security",
+                ),
+                (args.acknowledge_schema_change, "acknowledge_schema_change"),
+                (args.acknowledge_physical_rebind, "acknowledge_physical_rebind"),
+            ):
+                if given:
+                    payload[prop] = True
+            return _with_context(
+                client.request(
+                    f"/api/federation/aliases/{alias}/provision",
+                    method="POST",
+                    payload=payload,
+                ),
+                context,
+            )
+        # observe and retire both take an empty body.
+        return _with_context(
+            client.request(
+                f"/api/federation/aliases/{alias}/{args.action}",
+                method="POST",
+                payload={},
+            ),
+            context,
+        )
 
     if args.command == "workspace":
         result = client.request("/api/workspace")

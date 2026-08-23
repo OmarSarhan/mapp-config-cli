@@ -90,6 +90,9 @@ named-command gate.
 | `capabilities list\|show` | `/api/capabilities` | Returns `actions[]` | Any authenticated credential, including a semantic-only token |
 | `plugins list\|show\|validate\|usage` | `/api/plugins` | Command-advertised read | `inspect` |
 | `dependencies list\|check` | `/api/dependencies` | Command-advertised read of active workspace and derived-layer relation references | `inspect` |
+| `federation list\|show` | `/api/federation/aliases` | Command-advertised read of the federated source registry, retired aliases included | `federation:observe` |
+| `federation register` | `POST /api/federation/aliases` | Records intent; exposes nothing | `federation:register` |
+| `federation observe\|provision\|retire` | `POST /api/federation/aliases/{alias}/{action}` | Live probe, exposure, and withdrawal; `provision` and `retire` require `--confirm` | `federation:provision` |
 | `workspace get`, `layers list\|get\|style-elements\|filters`, `catalog list`, `icons list`, `sql capabilities` | Corresponding authenticated GET routes | Command-advertised reads; layer commands require the `layers effective` compatibility marker | `inspect` |
 | `layers values`, `layers statistics` | `/api/layers/{key}/values`, `/api/layers/{key}/statistics` | `layers.values`, `layers.statistics`; statistics also requires the exact `layers statistics` command | `derive` + `semantic:inspect` |
 | `validate` | `/api/validate` | Command-advertised non-saving validation | Legacy `full` or administrator session |
