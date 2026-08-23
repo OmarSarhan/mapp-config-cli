@@ -93,6 +93,15 @@ named-command gate.
 | `federation list\|show` | `/api/federation/aliases` | Command-advertised read of the federated source registry, retired aliases included | `federation:observe` |
 | `federation register` | `POST /api/federation/aliases` | Records intent; exposes nothing | `federation:register` |
 | `federation observe\|provision\|retire` | `POST /api/federation/aliases/{alias}/{action}` | Live probe, exposure, and withdrawal; `provision` and `retire` require `--confirm` | `federation:provision` |
+
+`provision` and `retire` change what the platform serves, so they report a
+lost outcome rather than a failure. A 4xx is the server declining and is
+reported as such. Anything else — a timeout, a dropped connection, a 5xx —
+exits `5` with `federation.exposure_indeterminate` and
+`reconciliation.automaticRetry: false`, because the change may have committed
+before the response was lost. Run `config-cli federation show <alias>` to see
+whether it took effect; do not resend. `observe` records an observation
+without changing exposure, so it is an ordinary request.
 | `workspace get`, `layers list\|get\|style-elements\|filters`, `catalog list`, `icons list`, `sql capabilities` | Corresponding authenticated GET routes | Command-advertised reads; layer commands require the `layers effective` compatibility marker | `inspect` |
 | `layers values`, `layers statistics` | `/api/layers/{key}/values`, `/api/layers/{key}/statistics` | `layers.values`, `layers.statistics`; statistics also requires the exact `layers statistics` command | `derive` + `semantic:inspect` |
 | `validate` | `/api/validate` | Command-advertised non-saving validation | Legacy `full` or administrator session |
@@ -275,8 +284,11 @@ advertised safe defaults. The current platform advertises `inspect`,
 semantic support falls back to `inspect`, `propose`, and `visual`. Malformed,
 unsupported, unknown, or elevated advertised defaults are rejected.
 Workspace apply/reload, `derive`, and the elevated `semantic:source`,
-`semantic:propose`, `semantic:generate`, `semantic:data`, `semantic:apply`, and
-`semantic:admin` scopes remain explicit grants. Semantic generation also
+`semantic:propose`, `semantic:generate`, `semantic:data`, `semantic:apply`,
+`semantic:admin`, `federation:observe`, `federation:register`, and
+`federation:provision` scopes remain explicit grants. `federation:provision`
+deserves particular care: it is the only device scope that can expose a
+third-party database through the platform. Semantic generation also
 requires `semantic:inspect`; it is
 not included in the safe default device authority because it sends authorized
 metadata to an external model. The

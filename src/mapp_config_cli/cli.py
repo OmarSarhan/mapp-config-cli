@@ -66,6 +66,14 @@ _DEVICE_SCOPE_CHOICES = (
     "semantic:propose",
     "semantic:apply",
     "semantic:admin",
+    # Elevated, and deliberately absent from _SAFE_DEFAULT_DEVICE_SCOPES below:
+    # federation:provision is the only scope in this list that can expose a
+    # third-party database through the platform. They are selectable because
+    # control_plane.DEVICE_SCOPES has always accepted them, so rejecting them
+    # here left the device flow unable to authorize any federation command.
+    "federation:observe",
+    "federation:register",
+    "federation:provision",
 )
 _DEVICE_SCOPES = frozenset(_DEVICE_SCOPE_CHOICES)
 _SAFE_DEFAULT_DEVICE_SCOPES = frozenset({
@@ -1944,6 +1952,82 @@ def _derived_mutation_indeterminate(
         EXIT_INTERRUPTED if interrupted else EXIT_CONNECTIVITY,
         details=details,
         error_code="derived_layer.mutation_indeterminate",
+    )
+
+
+def _request_federation_exposure_change(
+    client: ApiClient,
+    path: str,
+    *,
+    alias: str,
+    action: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """POST a provision or retire, distinguishing refusal from lost outcome.
+
+    Both change what the platform serves. A 4xx is the server declining, which
+    is authoritative and safe to report as a failure. Anything else -- a
+    timeout, a dropped connection, a 5xx -- may have committed before the
+    response was lost, so the alias has to be inspected rather than the request
+    resent. Same discrimination as _request_derived_mutation.
+    """
+    try:
+        return client.request(path, method="POST", payload=payload)
+    except KeyboardInterrupt as exc:
+        raise _federation_exposure_indeterminate(
+            alias, action, interrupted=True
+        ) from exc
+    except CliError as exc:
+        if (
+            exc.http_status is not None
+            and 400 <= exc.http_status < 500
+            and exc.http_status != 408
+        ):
+            raise
+        raise _federation_exposure_indeterminate(
+            alias, action, cause=exc
+        ) from exc
+
+
+def _federation_exposure_indeterminate(
+    alias: str,
+    action: str,
+    *,
+    cause: CliError | None = None,
+    interrupted: bool = False,
+) -> CliError:
+    details: dict[str, Any] = {
+        "alias": alias,
+        "action": action,
+        "indeterminate": True,
+        "failurePhase": "request-response",
+        "reconciliation": {
+            "required": True,
+            "automaticRetry": False,
+            "commands": [
+                {
+                    "command": "config-cli federation show",
+                    "arguments": [alias],
+                },
+            ],
+        },
+    }
+    if cause is not None:
+        details["cause"] = {
+            "code": cause.error_code,
+            "httpStatus": cause.http_status,
+            "details": cause.safe_details,
+        }
+    if interrupted:
+        details["interrupted"] = True
+    return CliError(
+        (
+            f"Federation {action} outcome is indeterminate. Do not resend; "
+            "inspect the alias to see whether the change took effect."
+        ),
+        EXIT_INTERRUPTED if interrupted else EXIT_CONNECTIVITY,
+        details=details,
+        error_code="federation.exposure_indeterminate",
     )
 
 
@@ -6689,17 +6773,30 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 if given:
                     payload[prop] = True
             return _with_context(
-                client.request(
+                _request_federation_exposure_change(
+                    client,
                     f"/api/federation/aliases/{alias}/provision",
-                    method="POST",
+                    alias=args.alias,
+                    action="provision",
                     payload=payload,
                 ),
                 context,
             )
-        # observe and retire both take an empty body.
+        # Both take an empty body, but only retire changes what is served.
+        if args.action == "retire":
+            return _with_context(
+                _request_federation_exposure_change(
+                    client,
+                    f"/api/federation/aliases/{alias}/retire",
+                    alias=args.alias,
+                    action="retire",
+                    payload={},
+                ),
+                context,
+            )
         return _with_context(
             client.request(
-                f"/api/federation/aliases/{alias}/{args.action}",
+                f"/api/federation/aliases/{alias}/observe",
                 method="POST",
                 payload={},
             ),
