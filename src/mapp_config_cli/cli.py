@@ -1961,6 +1961,7 @@ def _request_federation_exposure_change(
     *,
     alias: str,
     action: str,
+    expected_status: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     """POST a provision or retire, distinguishing refusal from lost outcome.
@@ -1970,9 +1971,13 @@ def _request_federation_exposure_change(
     timeout, a dropped connection, a 5xx -- may have committed before the
     response was lost, so the alias has to be inspected rather than the request
     resent. Same discrimination as _request_derived_mutation.
+
+    A 2xx is only believed if it says what committed. client.request accepts
+    any JSON object, so an empty or mismatched body would otherwise exit 0 and
+    report success for a change to served data that nothing established.
     """
     try:
-        return client.request(path, method="POST", payload=payload)
+        result = client.request(path, method="POST", payload=payload)
     except KeyboardInterrupt as exc:
         raise _federation_exposure_indeterminate(
             alias, action, interrupted=True
@@ -1987,6 +1992,16 @@ def _request_federation_exposure_change(
         raise _federation_exposure_indeterminate(
             alias, action, cause=exc
         ) from exc
+    state = result.get("alias") if isinstance(result, dict) else None
+    if (
+        not isinstance(state, dict)
+        or state.get("alias") != alias
+        or state.get("status") != expected_status
+    ):
+        raise _federation_exposure_indeterminate(
+            alias, action, response=result if isinstance(result, dict) else None
+        )
+    return result
 
 
 def _federation_exposure_indeterminate(
@@ -1994,6 +2009,7 @@ def _federation_exposure_indeterminate(
     action: str,
     *,
     cause: CliError | None = None,
+    response: dict[str, Any] | None = None,
     interrupted: bool = False,
 ) -> CliError:
     details: dict[str, Any] = {
@@ -2018,6 +2034,8 @@ def _federation_exposure_indeterminate(
             "httpStatus": cause.http_status,
             "details": cause.safe_details,
         }
+    if response is not None:
+        details["response"] = response
     if interrupted:
         details["interrupted"] = True
     return CliError(
@@ -6781,6 +6799,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     f"/api/federation/aliases/{alias}/provision",
                     alias=args.alias,
                     action="provision",
+                    expected_status="active",
                     payload=exposure,
                 ),
                 context,
@@ -6793,6 +6812,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     f"/api/federation/aliases/{alias}/retire",
                     alias=args.alias,
                     action="retire",
+                    expected_status="retired",
                     payload={},
                 ),
                 context,

@@ -5497,6 +5497,54 @@ class CliTests(unittest.TestCase):
                 reconciliation["commands"],
             )
 
+    def test_federation_success_must_say_what_committed(self):
+        # A 200 that does not establish the alias and its new state is not
+        # evidence the change happened, and these two change served data.
+        cases = (
+            ("provision", {}),
+            ("provision", {"alias": {"alias": "leeds_ext"}}),
+            ("provision", {"alias": {"alias": "other", "status": "active"}}),
+            ("retire", {"alias": {"alias": "leeds_ext", "status": "active"}}),
+        )
+        for action, body in cases:
+            with self.subTest(action=action, body=body):
+                routes = standard_routes()
+                routes[
+                    ("POST", f"/api/federation/aliases/leeds_ext/{action}")
+                ] = (200, body)
+                arguments = ["federation", action, "leeds_ext", "--confirm"]
+                if action == "provision":
+                    arguments[3:3] = ["--expected-observation-id", "88"]
+                with tempfile.TemporaryDirectory() as directory, JsonServer(
+                    routes
+                ) as server:
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(arguments, store)
+
+                self.assertEqual(EXIT_CONNECTIVITY, code)
+                self.assertEqual("", stdout)
+                failure = json.loads(stderr)
+                self.assertEqual(
+                    "federation.exposure_indeterminate", failure["code"]
+                )
+
+    def test_federation_retire_accepts_the_retired_state(self):
+        routes = standard_routes()
+        routes[("POST", "/api/federation/aliases/leeds_ext/retire")] = (
+            200,
+            {"alias": {"alias": "leeds_ext", "status": "retired"}},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["federation", "retire", "leeds_ext", "--confirm"], store
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertIn("retired", stdout)
+
     def test_federation_refusal_stays_a_refusal(self):
         # A 4xx is the server declining. Reporting that as indeterminate would
         # send the operator inspecting an alias that never changed.

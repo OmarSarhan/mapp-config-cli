@@ -99,7 +99,10 @@ lost outcome rather than a failure. A 4xx is the server declining and is
 reported as such. Anything else — a timeout, a dropped connection, a 5xx —
 exits `5` with `federation.exposure_indeterminate` and
 `reconciliation.automaticRetry: false`, because the change may have committed
-before the response was lost. Run `config-cli federation show <alias>` to see
+before the response was lost. A `2xx` is believed only if it says what
+committed: the response must carry the requested alias with its new state
+(`active` after provision, `retired` after retire), and an empty or mismatched
+success body is reported as indeterminate too rather than as success. Run `config-cli federation show <alias>` to see
 whether it took effect; do not resend. `observe` records an observation
 without changing exposure, so it is an ordinary request.
 | `workspace get`, `layers list\|get\|style-elements\|filters`, `catalog list`, `icons list`, `sql capabilities` | Corresponding authenticated GET routes | Command-advertised reads; layer commands require the `layers effective` compatibility marker | `inspect` |
