@@ -5451,9 +5451,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         # An acknowledgement nobody gave must be absent, not false: the route
         # rejects unknown properties and a false one reads as a decision.
+        # These are the platform's wire names, verified against a running
+        # deployment: the route answers federation.invalid_request with
+        # "Unknown provision properties" for the snake_case spellings.
         self.assertEqual(captured, {
             "expectedObservationId": 88,
-            "acknowledge_physical_rebind": True,
+            "physicalRebindAcknowledged": True,
         })
 
     def test_federation_exposure_loss_is_indeterminate_not_failed(self):
