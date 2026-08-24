@@ -1,7 +1,12 @@
 name: CI
 
 on:
+  # Scoped to main: an unscoped push trigger ran this a second time for
+  # every commit on a pull-request branch, which pull_request already
+  # covers. Windows minutes bill at twice the Linux rate, so the
+  # duplicate was the more expensive of the two.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
