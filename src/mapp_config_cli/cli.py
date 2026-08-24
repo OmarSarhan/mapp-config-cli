@@ -6783,13 +6783,17 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             exposure: dict[str, Any] = {
                 "expectedObservationId": args.expected_observation_id,
             }
+            # Wire names, which are camelCase and differ from both the CLI
+            # flags and the snake_case keyword arguments of the platform's
+            # FederationAliasStore.provision(). The route rejects unknown
+            # properties, so the snake_case spellings fail outright.
             for given, prop in (
                 (
                     args.acknowledge_row_level_security,
-                    "acknowledge_row_level_security",
+                    "rowLevelSecurityAcknowledged",
                 ),
-                (args.acknowledge_schema_change, "acknowledge_schema_change"),
-                (args.acknowledge_physical_rebind, "acknowledge_physical_rebind"),
+                (args.acknowledge_schema_change, "schemaChangeAcknowledged"),
+                (args.acknowledge_physical_rebind, "physicalRebindAcknowledged"),
             ):
                 if given:
                     exposure[prop] = True
