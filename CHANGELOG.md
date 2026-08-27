@@ -10,6 +10,15 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Corrected the federation availability guidance in
+  `docs/agent-workflow.md`, which told agents federation is unavailable under
+  `MAPP_DATABASE_MODE=external`. An external deployment can now federate when
+  its operator has provisioned a host role and opted in, so the mode no longer
+  answers the question. Agents are directed to read `host.federationReady` from
+  `federation list`, which is probed live from the database catalog, and a test
+  pins that the CLI passes the whole `host` object through -- a summary alone
+  cannot tell an operator which grant is missing.
+
 - Added backend-aligned operator guidance for XYZ layer-group colours through
   a verified deployed `groupClassList`, including first-member precedence,
   consistent member values, and candidate drawer evidence.

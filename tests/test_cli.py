@@ -5390,6 +5390,53 @@ class CliTests(unittest.TestCase):
         self.assertEqual(shown[0], 0, shown[2])
         self.assertIn("leeds_ext", shown[1])
 
+    def test_federation_list_passes_the_host_capability_through(self):
+        """docs/agent-workflow.md tells an agent to read host.federationReady
+        from `federation list` rather than infer support from the deployment
+        mode. That instruction is only followable if the CLI does not drop the
+        object on its way out, which nothing else here would notice.
+        """
+        routes = standard_routes()
+        routes[("GET", "/api/federation/aliases")] = (
+            200,
+            {
+                "aliases": [],
+                "host": {
+                    "fdwInstalled": True,
+                    "canUseFdw": False,
+                    "canCreateSchemas": True,
+                    "registrySchemaPresent": False,
+                    "canUseRegistrySchema": False,
+                    "database": "maps",
+                    "role": "mapp_federation",
+                    "federationReady": False,
+                },
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            listed = self.invoke(["federation", "list"], store)
+
+        self.assertEqual(listed[0], 0, listed[2])
+        payload = json.loads(listed[1])
+        # The whole object, not just the summary: an agent that only learns
+        # "not ready" cannot tell the operator which grant is missing.
+        self.assertEqual(
+            {
+                "fdwInstalled": True,
+                "canUseFdw": False,
+                "canCreateSchemas": True,
+                "registrySchemaPresent": False,
+                "canUseRegistrySchema": False,
+                "database": "maps",
+                "role": "mapp_federation",
+                "federationReady": False,
+            },
+            payload["host"],
+        )
+
     def test_federation_register_sends_the_documented_payload(self):
         captured = {}
 
