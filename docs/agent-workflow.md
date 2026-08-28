@@ -883,16 +883,16 @@ semantic proposal approval boundary.
 Use `federation` when the data an operator wants lives in a PostgreSQL server
 MAPP does not own. The platform reaches it over `postgres_fdw`, exposing only
 an explicit relation allowlist as foreign tables in a `source_<alias>` schema.
-It is available wherever the deployment has a federation provisioner: always
-in `bundled` and `federated` modes, and in `external` only when that host's
-operator provisioned the role and opted in. The routes answer
-`federation.not_configured` otherwise, which is a property of the deployment
-and will not change by retrying or by requesting more scopes -- report it to
-the operator rather than working around it.
+It is available in every deployment: MAPP packages the database that acts as
+the federation host, and every spatial source is external by definition. The
+routes answer `federation.not_configured` only if the service was started from
+a Compose model that omits the provisioner credential, which is a property of
+the deployment and will not change by retrying or by requesting more scopes --
+report it to the operator rather than working around it.
 
-Do not infer the answer from `MAPP_DATABASE_MODE`. Read `host.federationReady`
-from `federation list`: it is probed live from the database catalog and is the
-only reliable statement of whether this deployment can attach a source.
+Read `host.federationReady` from `federation list` rather than assuming: it is
+probed live from the database catalog, and when it is false it names which
+grant is missing.
 
 The scopes are elevated and absent from the default device credential, so
 request them explicitly and only the ones needed. `federation:provision` is
