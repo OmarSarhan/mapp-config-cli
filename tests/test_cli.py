@@ -5398,6 +5398,11 @@ class CliTests(unittest.TestCase):
             deleted = self.invoke(
                 ["federation", "group-delete", "leeds", "--confirm"], store
             )
+            defined_body = next(
+                request["body"] for request in server.requests
+                if request["method"] == "POST"
+                and request["path"] == "/api/federation/groups"
+            )
 
         for label, result in (
             ("groups", listed), ("group-define", defined),
@@ -5407,6 +5412,10 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(0, result[0], result[2])
         self.assertIn("leeds", listed[1])
         self.assertIn("census", deleted[1])
+        self.assertEqual(
+            {"name": "leeds", "description": "Leeds showcase sources."},
+            defined_body,
+        )
 
     def test_federation_set_groups_replaces_the_whole_set(self):
         routes = standard_routes()
@@ -5422,8 +5431,18 @@ class CliTests(unittest.TestCase):
             cleared = self.invoke(
                 ["federation", "set-groups", "census"], store
             )
+            sent = [
+                request for request in server.requests
+                if request["path"].endswith("/groups")
+            ]
 
         self.assertEqual(0, cleared[0], cleared[2])
+        # Assert the outgoing body, not just the exit code. Omitting the key
+        # or sending null would read as "leave the labels alone" to a route
+        # whose contract is "replace the whole set", so an exit-code-only
+        # assertion passes on precisely the wrong request.
+        self.assertEqual(1, len(sent), sent)
+        self.assertEqual({"groups": []}, sent[0]["body"])
 
     def test_an_unhandled_federation_action_never_probes_the_source(self):
         """The observe request used to be an unconditional fall-through.
