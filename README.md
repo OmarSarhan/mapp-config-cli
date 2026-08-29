@@ -1,53 +1,24 @@
 # MAPP Config CLI
 
-`config-cli` is the standalone, JSON-first command-line client for a remote
-MAPP configuration service. It lets a human or an automation agent inspect an
-XYZ workspace and its semantic catalog, create revision-bound configuration
-proposals, and apply an approved proposal without needing shell or filesystem
-access to the server.
+`config-cli` is the command-line client for a remote MAPP platform. It runs on
+your machine, or an automation agent's, and reaches the platform only over its
+authenticated HTTP API — no shell access, no filesystem access, no database
+credential.
 
-This repository contains only the client. The XYZ application, PostgreSQL
-database, configuration dashboard, validation rules, browser runner, and
-deployment configuration belong in the separate
-[MAPP Platform](https://github.com/OmarSarhan/mapp-platform) repository.
+With it you can inspect a live XYZ workspace and its semantic catalogue,
+attach and manage federated PostgreSQL sources, and change what the map shows
+through reviewable proposals rather than direct edits.
 
-This directory is repository-ready source, not proof of a
-history-preserving Git split. Before publishing it, repeat the extraction from
-the canonical clone, retain relevant history and tags, and scan the complete
-history for credentials and generated state.
+This repository contains only the client. The server half — XYZ, PostgreSQL,
+the configuration dashboard and API, the semantic service, browser validation
+and deployment — is the separate
+[MAPP Platform](https://github.com/OmarSarhan/mapp-platform) repository. That
+separation is the trust boundary the safety model below depends on.
 
-## Safety model
-
-The supported mutation workflow is deliberately narrow:
-
-1. Inspect the selected remote instance and its current workspace revision.
-2. Check the smallest possible operation set against that exact revision, then
-   create the proposal from the returned fingerprint.
-3. Present the proposal ID, explanation, focused diff, warnings, and available
-   evidence to the approver.
-4. Apply only after a separate, explicit approval.
-5. Verify XYZ health and visually test each affected layer.
-
-There are no direct workspace-save commands. A proposal cannot be silently
-rebased if the remote workspace changes. Applying a proposal requires both its
-ID and `--confirm`.
-
-Top-level visual commands render the current live workspace and provide
-baseline evidence. Proposal-bound `preview-plan`, `preview-test`, and
-`preview-screenshot` commands render an integrity-checked pending candidate in
-an isolated runtime; they never apply it or change the live workspace.
-Each candidate preview is scoped to one layer and one map view. Large or mixed
-proposals therefore require a diff-derived coverage checklist and separate
-readable previews for every changed visual layer and distinct geographic view;
-one zoomed-out screenshot must not be presented as complete evidence.
-
-The CLI preserves structured partial outcomes. A failed visual check can still
-include its plan, report, and authenticated artifact paths. An apply request
-can also report that the proposal committed before XYZ reload confirmation
-timed out; inspect proposal, workspace, and reload state before retrying.
-
-See [Agent workflow](docs/agent-workflow.md) for the complete operational
-procedure.
+**New to MAPP?** Stand the platform up first: its
+[guide](https://github.com/OmarSarhan/mapp-platform/blob/main/docs/guide.md)
+gets you a running map with real data in about twenty minutes, and this client
+is far easier to understand once there is something to point it at.
 
 ## Installation
 
@@ -195,17 +166,59 @@ For an explicitly approved standalone XYZ reload, use
 operator/recovery action, not an extra step after a successful proposal apply,
 which already requests and waits for the associated reload.
 
+## Safety model
+
+The supported mutation workflow is deliberately narrow:
+
+1. Inspect the selected remote instance and its current workspace revision.
+2. Check the smallest possible operation set against that exact revision, then
+   create the proposal from the returned fingerprint.
+3. Present the proposal ID, explanation, focused diff, warnings, and available
+   evidence to the approver.
+4. Apply only after a separate, explicit approval.
+5. Verify XYZ health and visually test each affected layer.
+
+There are no direct workspace-save commands. A proposal cannot be silently
+rebased if the remote workspace changes. Applying a proposal requires both its
+ID and `--confirm`.
+
+Top-level visual commands render the current live workspace and provide
+baseline evidence. Proposal-bound `preview-plan`, `preview-test`, and
+`preview-screenshot` commands render an integrity-checked pending candidate in
+an isolated runtime; they never apply it or change the live workspace.
+Each candidate preview is scoped to one layer and one map view. Large or mixed
+proposals therefore require a diff-derived coverage checklist and separate
+readable previews for every changed visual layer and distinct geographic view;
+one zoomed-out screenshot must not be presented as complete evidence.
+
+The CLI preserves structured partial outcomes. A failed visual check can still
+include its plan, report, and authenticated artifact paths. An apply request
+can also report that the proposal committed before XYZ reload confirmation
+timed out; inspect proposal, workspace, and reload state before retrying.
+
+See [Agent workflow](docs/agent-workflow.md) for the complete operational
+procedure.
+
 ## Documentation
 
-- [Installation](docs/installation.md)
-- [Command reference](docs/commands.md)
-- [Advanced workspace setup](docs/commands.md#advanced-workspace-setup)
-- [Agent workflow](docs/agent-workflow.md)
-- [Security](docs/security.md)
-- [Compatibility](docs/compatibility.md)
-- [Contributing](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
-- [Changelog](CHANGELOG.md)
+Roughly in the order they become useful:
+
+| Document | Read it when |
+| --- | --- |
+| [Installation](docs/installation.md) | Setting the client up, or pinning a version |
+| [Command reference](docs/commands.md) | Looking up any command, its route and its scope |
+| [Advanced workspace setup](docs/commands.md#advanced-workspace-setup) | Working with locales, layers and styles in earnest |
+| [Agent workflow](docs/agent-workflow.md) | Driving the client from an automation agent |
+| [Security](docs/security.md) | Deciding what a credential may do, and where it lives |
+| [Compatibility](docs/compatibility.md) | Pairing a client version with a platform version |
+
+For what the platform itself is doing behind these commands, the
+[platform guide](https://github.com/OmarSarhan/mapp-platform/blob/main/docs/guide.md)
+is the counterpart to this reference: federation, semantics and derived layers
+explained once, in order.
+
+Also here: [Contributing](CONTRIBUTING.md), [Security policy](SECURITY.md),
+[Changelog](CHANGELOG.md).
 
 The live server remains authoritative for workspace structure and
 XYZ-version-specific behavior. Use `config-cli schema`, `config-cli rules`,
