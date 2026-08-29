@@ -5368,6 +5368,76 @@ class CliTests(unittest.TestCase):
         self.assertTrue(payload["truncated"])
         self.assertEqual("0-4", payload["values"][0]["value"])
 
+    def test_federation_group_commands_reach_their_routes(self):
+        """The three alias-less group actions must dispatch before args.alias.
+
+        The federation handler reads args.alias immediately after the list
+        branch, so an action carrying a name -- or nothing at all -- placed
+        after that line dies with AttributeError instead of running.
+        """
+        routes = standard_routes()
+        routes[("GET", "/api/federation/groups")] = (
+            200, {"groups": [{"name": "leeds", "memberCount": 2}]},
+        )
+        routes[("POST", "/api/federation/groups")] = (
+            201, {"group": {"name": "leeds", "memberCount": 0}},
+        )
+        routes[("POST", "/api/federation/groups/leeds/delete")] = (
+            200, {"group": {"name": "leeds", "detachedAliases": ["census"]}},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            listed = self.invoke(["federation", "groups"], store)
+            defined = self.invoke(
+                ["federation", "group-define", "leeds",
+                 "--description", "Leeds showcase sources."],
+                store,
+            )
+            deleted = self.invoke(
+                ["federation", "group-delete", "leeds", "--confirm"], store
+            )
+
+        for label, result in (
+            ("groups", listed), ("group-define", defined),
+            ("group-delete", deleted),
+        ):
+            with self.subTest(action=label):
+                self.assertEqual(0, result[0], result[2])
+        self.assertIn("leeds", listed[1])
+        self.assertIn("census", deleted[1])
+
+    def test_federation_set_groups_replaces_the_whole_set(self):
+        routes = standard_routes()
+        routes[("POST", "/api/federation/aliases/census/groups")] = (
+            200, {"alias": {"alias": "census", "groups": []}},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(
+            routes
+        ) as server:
+            store = self.configured_store(directory, server.endpoint)
+            # No --group at all is how a source's labels are cleared, so it
+            # must send an empty list rather than refuse or omit the key.
+            cleared = self.invoke(
+                ["federation", "set-groups", "census"], store
+            )
+
+        self.assertEqual(0, cleared[0], cleared[2])
+
+    def test_an_unhandled_federation_action_never_probes_the_source(self):
+        """The observe request used to be an unconditional fall-through.
+
+        Any action reaching the end of that handler opened a live credentialed
+        connection to a third-party database. It is now explicit, so a
+        mis-dispatched action fails loudly instead.
+        """
+        from mapp_config_cli import cli
+
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        self.assertIn('if args.action == "observe":', source)
+        self.assertIn("unhandled federation action", source)
+
     def test_federation_list_and_show_read_the_alias_registry(self):
         routes = standard_routes()
         routes[("GET", "/api/federation/aliases")] = (

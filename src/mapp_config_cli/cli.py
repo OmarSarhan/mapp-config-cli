@@ -434,6 +434,41 @@ def parser() -> JsonArgumentParser:
     )
     federation_retire.add_argument("alias", type=nonempty)
     federation_retire.add_argument("--confirm", action="store_true", required=True)
+    # Group labels. A group records which sources are meant to be used
+    # together. It grants nothing, revokes nothing, and changes no privilege,
+    # so none of these takes --confirm except the delete, which is only
+    # confirmed because it silently detaches the label from every source.
+    federation_actions.add_parser(
+        "groups",
+        help="List defined group labels and how many sources carry each.",
+    )
+    federation_group_define = federation_actions.add_parser(
+        "group-define",
+        help="Define a group label. Grants nothing.",
+    )
+    federation_group_define.add_argument("name", type=nonempty)
+    federation_group_define.add_argument("--description", type=nonempty)
+    federation_group_delete = federation_actions.add_parser(
+        "group-delete",
+        help="Delete a group label and detach it from every source.",
+    )
+    federation_group_delete.add_argument("name", type=nonempty)
+    federation_group_delete.add_argument(
+        "--confirm", action="store_true", required=True
+    )
+    federation_set_groups = federation_actions.add_parser(
+        "set-groups",
+        help="Replace a source's whole set of group labels.",
+    )
+    federation_set_groups.add_argument("alias", type=nonempty)
+    federation_set_groups.add_argument(
+        "--group",
+        action="append",
+        default=[],
+        type=nonempty,
+        metavar="NAME",
+        help="Group label; repeat per group. Omit entirely to clear them all.",
+    )
     plugins_command = commands.add_parser(
         "plugins",
         help="Inspect the server-audited pinned XYZ plugin system.",
@@ -6748,7 +6783,48 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
             return _with_context(
                 client.request("/api/federation/aliases"), context
             )
+        # Group actions that take no alias, before args.alias is read: three
+        # of the four carry a name or nothing at all, and reaching for
+        # args.alias here would be an AttributeError.
+        if args.action == "groups":
+            return _with_context(
+                client.request("/api/federation/groups"), context
+            )
+        if args.action == "group-define":
+            definition: dict[str, Any] = {"name": args.name}
+            if args.description:
+                definition["description"] = args.description
+            return _with_context(
+                client.request(
+                    "/api/federation/groups",
+                    method="POST",
+                    payload=definition,
+                ),
+                context,
+            )
+        if args.action == "group-delete":
+            group_name = quote_segment(args.name)
+            return _with_context(
+                client.request(
+                    f"/api/federation/groups/{group_name}/delete",
+                    method="POST",
+                    payload={},
+                ),
+                context,
+            )
         alias = quote_segment(args.alias)
+        if args.action == "set-groups":
+            # Replaces the whole set, so an omitted --group clears it. Not
+            # routed through _request_federation_exposure_change: that guards
+            # actions which change what is served, and this changes a label.
+            return _with_context(
+                client.request(
+                    f"/api/federation/aliases/{alias}/groups",
+                    method="POST",
+                    payload={"groups": args.group},
+                ),
+                context,
+            )
         if args.action == "show":
             return _with_context(
                 client.request(f"/api/federation/aliases/{alias}"), context
@@ -6821,14 +6897,20 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 ),
                 context,
             )
-        return _with_context(
-            client.request(
-                f"/api/federation/aliases/{alias}/observe",
-                method="POST",
-                payload={},
-            ),
-            context,
-        )
+        # Explicit rather than a fall-through. An unrecognised action landing
+        # here would open a live credentialed connection to a third-party
+        # database, which is the one thing in this command group that must
+        # never happen by accident.
+        if args.action == "observe":
+            return _with_context(
+                client.request(
+                    f"/api/federation/aliases/{alias}/observe",
+                    method="POST",
+                    payload={},
+                ),
+                context,
+            )
+        raise AssertionError(f"unhandled federation action {args.action!r}")
 
     if args.command == "workspace":
         result = client.request("/api/workspace")
