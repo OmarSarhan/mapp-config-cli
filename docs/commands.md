@@ -93,6 +93,8 @@ named-command gate.
 | `federation list\|show` | `/api/federation/aliases` | Command-advertised read of the federated source registry, retired aliases included | `federation:observe` |
 | `federation register` | `POST /api/federation/aliases` | Records intent; exposes nothing | `federation:register` |
 | `federation observe\|provision\|retire` | `POST /api/federation/aliases/{alias}/{action}` | Live probe, exposure, and withdrawal; `provision` and `retire` require `--confirm` | `federation:provision` |
+| `federation groups` | `GET /api/federation/groups` | Command-advertised read of the defined group labels and their member counts | `federation:observe` |
+| `federation group-define\|group-delete\|set-groups` | `POST /api/federation/groups`, `.../groups/{name}/delete`, `.../aliases/{alias}/groups` | Group labels are metadata: they grant nothing, revoke nothing, and change no privilege. `set-groups` replaces the whole set, so omitting `--group` clears it; `group-delete` requires `--confirm` because it detaches the label from every source | `federation:register` |
 | `workspace get`, `layers list\|get\|style-elements\|filters`, `catalog list`, `icons list`, `sql capabilities` | Corresponding authenticated GET routes | Command-advertised reads; layer commands require the `layers effective` compatibility marker | `inspect` |
 | `layers values`, `layers statistics` | `/api/layers/{key}/values`, `/api/layers/{key}/statistics` | `layers.values`, `layers.statistics`; statistics also requires the exact `layers statistics` command | `derive` + `semantic:inspect` |
 | `validate` | `/api/validate` | Command-advertised non-saving validation | Legacy `full` or administrator session |
