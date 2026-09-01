@@ -94,6 +94,43 @@ def map_extent_scope(locale: str = "Leeds") -> dict:
     }
 
 
+def background_jobs_response() -> dict:
+    executing_id = "a" * 32
+    waiting_id = "b" * 32
+    return {
+        "backgroundJobs": {
+            "observedAt": "2026-09-01T12:00:00+00:00",
+            "activeJobs": 2,
+            "maxActiveJobs": 2,
+            "executingJobs": 1,
+            "waitingJobs": 1,
+            "activeOperations": [
+                {
+                    "id": executing_id,
+                    "kind": "derived-layer.refresh",
+                    "status": "running",
+                    "stage": "database-transaction",
+                    "created": "2026-09-01T11:58:00+00:00",
+                    "updated": "2026-09-01T11:59:00+00:00",
+                    "target": {"name": "active_layer", "action": "refresh"},
+                    "statusUrl": f"/api/operations/{executing_id}",
+                },
+                {
+                    "id": waiting_id,
+                    "kind": "derived-layer.create",
+                    "status": "running",
+                    "stage": "waiting-for-worker",
+                    "created": "2026-09-01T11:59:30+00:00",
+                    "updated": "2026-09-01T11:59:30+00:00",
+                    "target": {"name": "waiting_layer", "action": "create"},
+                    "statusUrl": f"/api/operations/{waiting_id}",
+                    "queuePosition": 1,
+                },
+            ],
+        }
+    }
+
+
 def layer_statistics_response(*, bins_requested: int = 2) -> dict:
     return {
         "revision": "rev-1",
@@ -1323,6 +1360,113 @@ class CliTests(unittest.TestCase):
             query_guard(),
             json.loads(stdout)["queryGuard"],
         )
+
+    def test_derived_layer_jobs_preserve_validated_active_summaries(self):
+        response = background_jobs_response()
+        response["meta"] = {"requestId": "request-jobs"}
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/background-jobs")] = (
+            200,
+            response,
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "jobs"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(response["backgroundJobs"], payload["backgroundJobs"])
+        self.assertEqual("request-jobs", payload["meta"]["requestId"])
+
+    def test_derived_layer_jobs_allow_a_transient_missing_summary(self):
+        response = background_jobs_response()
+        response["backgroundJobs"]["activeOperations"] = response[
+            "backgroundJobs"
+        ]["activeOperations"][:1]
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/background-jobs")] = (
+            200,
+            response,
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "jobs"],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            1,
+            len(json.loads(stdout)["backgroundJobs"]["activeOperations"]),
+        )
+
+    def test_derived_layer_jobs_reject_malformed_or_unsanitized_summaries(self):
+        cases = {}
+
+        wrong_counts = background_jobs_response()
+        wrong_counts["backgroundJobs"]["waitingJobs"] = 0
+        cases["count-invariant"] = wrong_counts
+
+        unknown_job_field = background_jobs_response()
+        unknown_job_field["backgroundJobs"]["futureCapacity"] = 1
+        cases["closed-job-envelope"] = unknown_job_field
+
+        leaked_summary_field = background_jobs_response()
+        leaked_summary_field["backgroundJobs"]["activeOperations"][0][
+            "actor"
+        ] = "private-actor"
+        cases["closed-summary"] = leaked_summary_field
+
+        leaked_target_field = background_jobs_response()
+        leaked_target_field["backgroundJobs"]["activeOperations"][0][
+            "target"
+        ]["query"] = "SELECT private_value"
+        cases["closed-target"] = leaked_target_field
+
+        bad_status_url = background_jobs_response()
+        bad_status_url["backgroundJobs"]["activeOperations"][1][
+            "statusUrl"
+        ] = "/api/operations/different"
+        cases["operation-binding"] = bad_status_url
+
+        missing_queue_position = background_jobs_response()
+        missing_queue_position["backgroundJobs"]["activeOperations"][1].pop(
+            "queuePosition"
+        )
+        cases["queue-position"] = missing_queue_position
+
+        blank_timestamp = background_jobs_response()
+        blank_timestamp["backgroundJobs"]["activeOperations"][0][
+            "updated"
+        ] = " "
+        cases["blank-timestamp"] = blank_timestamp
+
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            results = []
+            for label, response in cases.items():
+                with self.subTest(label=label):
+                    routes[("GET", "/api/derived-layers/background-jobs")] = (
+                        200,
+                        response,
+                    )
+                    results.append(self.invoke(
+                        ["derived-layers", "jobs"],
+                        store,
+                    ))
+
+        for code, stdout, stderr in results:
+            self.assertEqual(EXIT_CONNECTIVITY, code)
+            self.assertEqual("", stdout)
+            self.assertEqual(
+                "derived_layer.invalid_response",
+                json.loads(stderr)["code"],
+            )
 
     def test_derived_layer_capabilities_surface_h3_readiness_diagnostics(self):
         readiness = h3_readiness_failure()
@@ -4055,6 +4199,7 @@ class CliTests(unittest.TestCase):
                     "--input", "missing.json",
                 ],
             ),
+            ("derived-layers jobs", ["derived-layers", "jobs"]),
             ("xyz reload", ["reload-xyz", "--confirm"]),
         ):
             with self.subTest(command=command):

@@ -125,6 +125,7 @@ def standard_routes(
                     "catalog list",
                     "icons list",
                     "derived-layers capabilities",
+                    "derived-layers jobs",
                     "derived-layers list",
                     "derived-layers show",
                     "derived-layers map-extent",

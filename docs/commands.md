@@ -100,7 +100,7 @@ named-command gate.
 | `validate` | `/api/validate` | Command-advertised non-saving validation | Legacy `full` or administrator session |
 | `set`, `unset`, `amend` | `/api/mutate` with `save: false` | Command-advertised dry run | Legacy `full` or administrator session |
 | `sql test` | `/api/sql/test` | Command-advertised bounded probe | Legacy `full` or administrator session |
-| `derived-layers capabilities\|list\|show\|map-extent` | `/api/derived-layers/*` GET routes | `derived-layers.map-extent` for the preview | `inspect` |
+| `derived-layers capabilities\|jobs\|list\|show\|map-extent` | `/api/derived-layers/*` GET routes | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the preview | `inspect` |
 | `derived-layers plan-area-weighted-h3` | `/api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3`; exact command required | `derive` + `semantic:inspect`; read-only plan |
 | `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also need `semantic:inspect` |
 | `proposals check\|create` | Workspace proposal routes | `proposals.check`, `proposals.create` | `propose` |
@@ -769,6 +769,7 @@ materialized view in its fixed `derived_layers` schema:
 
 ```sh
 config-cli derived-layers capabilities
+config-cli derived-layers jobs
 config-cli derived-layers list
 config-cli derived-layers show paths_h3_r9
 config-cli derived-layers map-extent

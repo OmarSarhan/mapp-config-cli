@@ -570,6 +570,10 @@ def parser() -> JsonArgumentParser:
     )
     derived_actions = derived.add_subparsers(dest="action", required=True)
     derived_actions.add_parser("capabilities")
+    derived_actions.add_parser(
+        "jobs",
+        help="Inspect admitted derived-layer background jobs and queue stages.",
+    )
     derived_actions.add_parser("list")
     derived_show = derived_actions.add_parser("show")
     derived_show.add_argument("name")
@@ -4131,6 +4135,156 @@ def _derived_capabilities(
         _query_guard(data["queryGuard"], data=data, label=label)
     if "queryPlanning" in data:
         _query_planning(data["queryPlanning"], data=data, label=label)
+    return data
+
+
+_DERIVED_BACKGROUND_JOB_KEYS = {
+    "observedAt",
+    "activeJobs",
+    "maxActiveJobs",
+    "executingJobs",
+    "waitingJobs",
+    "activeOperations",
+}
+_DERIVED_BACKGROUND_OPERATION_KEYS = {
+    "id",
+    "kind",
+    "status",
+    "stage",
+    "created",
+    "updated",
+    "target",
+    "statusUrl",
+}
+_DERIVED_BACKGROUND_KINDS = {
+    "derived-layer.create",
+    "derived-layer.replace",
+    "derived-layer.refresh",
+}
+_DERIVED_BACKGROUND_STAGES = {
+    "waiting-for-worker",
+    "database-transaction",
+    "result-reporting",
+}
+
+
+def _derived_background_jobs(data: dict[str, Any]) -> dict[str, Any]:
+    jobs = data.get("backgroundJobs")
+    if not isinstance(jobs, dict) or set(jobs) != _DERIVED_BACKGROUND_JOB_KEYS:
+        raise _invalid_response(
+            "Derived-layer background jobs",
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    observed_at = jobs["observedAt"]
+    active_jobs = jobs["activeJobs"]
+    max_active_jobs = jobs["maxActiveJobs"]
+    executing_jobs = jobs["executingJobs"]
+    waiting_jobs = jobs["waitingJobs"]
+    operations = jobs["activeOperations"]
+    if (
+        not isinstance(observed_at, str)
+        or not observed_at
+        or observed_at != observed_at.strip()
+        or len(observed_at) > 128
+        or not _nonnegative_integer(active_jobs)
+        or not _nonnegative_integer(max_active_jobs)
+        or max_active_jobs == 0
+        or not _nonnegative_integer(executing_jobs)
+        or not _nonnegative_integer(waiting_jobs)
+        or active_jobs > max_active_jobs
+        or executing_jobs > 1
+        or active_jobs != executing_jobs + waiting_jobs
+        or not isinstance(operations, list)
+        or len(operations) > active_jobs
+    ):
+        raise _invalid_response(
+            "Derived-layer background jobs",
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+
+    operation_ids: set[str] = set()
+    observed_executing = 0
+    queue_positions: list[int] = []
+    for operation in operations:
+        if not isinstance(operation, dict):
+            raise _invalid_response(
+                "Derived-layer background jobs",
+                data,
+                error_code="derived_layer.invalid_response",
+            )
+        keys = set(operation)
+        if (
+            keys != _DERIVED_BACKGROUND_OPERATION_KEYS
+            and keys != _DERIVED_BACKGROUND_OPERATION_KEYS | {"queuePosition"}
+        ):
+            raise _invalid_response(
+                "Derived-layer background jobs",
+                data,
+                error_code="derived_layer.invalid_response",
+            )
+        operation_id = operation["id"]
+        kind = operation["kind"]
+        stage = operation["stage"]
+        target = operation["target"]
+        action = kind.removeprefix("derived-layer.") if isinstance(kind, str) else None
+        if (
+            not isinstance(operation_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None
+            or operation_id in operation_ids
+            or kind not in _DERIVED_BACKGROUND_KINDS
+            or operation["status"] not in {"running", "cancelling"}
+            or stage not in _DERIVED_BACKGROUND_STAGES
+            or not isinstance(operation["created"], str)
+            or not operation["created"]
+            or operation["created"] != operation["created"].strip()
+            or len(operation["created"]) > 128
+            or not isinstance(operation["updated"], str)
+            or not operation["updated"]
+            or operation["updated"] != operation["updated"].strip()
+            or len(operation["updated"]) > 128
+            or not isinstance(target, dict)
+            or set(target) != {"name", "action"}
+            or not isinstance(target.get("name"), str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,62}", target["name"]) is None
+            or target.get("action") != action
+            or operation["statusUrl"] != f"/api/operations/{operation_id}"
+        ):
+            raise _invalid_response(
+                "Derived-layer background jobs",
+                data,
+                error_code="derived_layer.invalid_response",
+            )
+        operation_ids.add(operation_id)
+        if stage == "waiting-for-worker":
+            queue_position = operation.get("queuePosition")
+            if not _nonnegative_integer(queue_position) or queue_position == 0:
+                raise _invalid_response(
+                    "Derived-layer background jobs",
+                    data,
+                    error_code="derived_layer.invalid_response",
+                )
+            queue_positions.append(cast(int, queue_position))
+        else:
+            if "queuePosition" in operation:
+                raise _invalid_response(
+                    "Derived-layer background jobs",
+                    data,
+                    error_code="derived_layer.invalid_response",
+                )
+            observed_executing += 1
+    if (
+        observed_executing > executing_jobs
+        or len(queue_positions) > waiting_jobs
+        or len(set(queue_positions)) != len(queue_positions)
+        or any(position > waiting_jobs for position in queue_positions)
+    ):
+        raise _invalid_response(
+            "Derived-layer background jobs",
+            data,
+            error_code="derived_layer.invalid_response",
+        )
     return data
 
 
@@ -7810,6 +7964,10 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
         if args.action == "capabilities":
             result = _derived_capabilities(
                 client.request(f"{base}/capabilities")
+            )
+        elif args.action == "jobs":
+            result = _derived_background_jobs(
+                client.request(f"{base}/background-jobs")
             )
         elif args.action == "list":
             result = client.request(base)
