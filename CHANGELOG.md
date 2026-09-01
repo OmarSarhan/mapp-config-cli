@@ -44,6 +44,11 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Strict `derived-layers jobs` discovery for the bounded background queue,
+  detached create/replace/refresh submission with validated operation binding,
+  and opt-in `operations wait --progress` status/stage transitions. Detached
+  and interrupted waits retain their durable operation IDs and never retry a
+  mutation automatically.
 - Read-only `derived-layers plan-area-weighted-h3` support with replayable
   reviewed create requests, semantic/source resolution, bounded spatial-scope
   evidence, preflight probes, and a separate confirmed create boundary.

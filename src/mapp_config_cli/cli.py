@@ -661,6 +661,14 @@ def parser() -> JsonArgumentParser:
             default=1,
             help="Operation polling interval in seconds (default: 1).",
         )
+        background_action.add_argument(
+            "--detach",
+            action="store_true",
+            help=(
+                "Return the accepted durable operation without polling; "
+                "requires --background."
+            ),
+        )
     derived_drop = derived_actions.add_parser("drop")
     derived_drop.add_argument("name")
     derived_drop.add_argument("--confirm", action="store_true", required=True)
@@ -1077,6 +1085,11 @@ def parser() -> JsonArgumentParser:
     operation_wait.add_argument("id")
     operation_wait.add_argument("--wait-timeout", type=float, default=120)
     operation_wait.add_argument("--interval", type=float, default=1)
+    operation_wait.add_argument(
+        "--progress",
+        action="store_true",
+        help="Write status or stage changes to stderr while waiting.",
+    )
     operation_cancel = operation_actions.add_parser("cancel")
     operation_cancel.add_argument("id")
     operation_cancel.add_argument("--confirm", action="store_true", required=True)
@@ -1909,6 +1922,32 @@ def _operation_reconciliation(operation_id: str) -> dict[str, Any]:
     }
 
 
+def _emit_operation_progress(
+    operation: dict[str, Any],
+    stream: TextIO,
+    previous: tuple[str, str | None] | None,
+) -> tuple[str, str | None]:
+    """Emit only a safely encoded status/stage transition."""
+    status = operation["status"]
+    stage_value = operation.get("stage")
+    stage = stage_value if isinstance(stage_value, str) and stage_value else None
+    current = (status, stage)
+    if current == previous:
+        return current
+    progress = {"status": status}
+    if stage is not None:
+        progress["stage"] = stage
+    encoded = json.dumps(
+        {"operationProgress": progress},
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    print(sanitize_terminal_text(encoded), file=stream, flush=True)
+    return current
+
+
 def _background_poll_error(
     operation_id: str,
     status: Any,
@@ -2349,6 +2388,35 @@ def _request_derived_mutation(
                 cause=exc,
             ) from exc
         raise
+
+
+def _accepted_derived_background_operation(
+    submitted: dict[str, Any],
+    *,
+    name: str,
+    action: str,
+) -> dict[str, Any]:
+    """Validate that a detached mutation returned its bound durable handle."""
+    operation = submitted.get("operation")
+    operation_id = operation.get("id") if isinstance(operation, dict) else None
+    target = operation.get("target") if isinstance(operation, dict) else None
+    if (
+        not isinstance(operation, dict)
+        or not isinstance(operation_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None
+        or operation.get("kind") != f"derived-layer.{action}"
+        or operation.get("status") != "running"
+        or not isinstance(target, dict)
+        or target.get("name") != name
+        or target.get("action") != action
+        or submitted.get("statusUrl") != f"/api/operations/{operation_id}"
+    ):
+        raise _invalid_response(
+            "Detached derived-layer operation",
+            submitted,
+            error_code="operation.invalid_response",
+        )
+    return operation
 
 
 def _complete_background_operation(
@@ -6564,6 +6632,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 payload={"confirmed": True},
             )
         last_status: Any = "unknown"
+        progress_state: tuple[str, str | None] | None = None
         while True:
             if operation_response is None:
                 try:
@@ -6586,6 +6655,24 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     error_code="operation.invalid_response",
                 )
             last_status = operation["status"]
+            if (
+                args.action != "show"
+                and operation["status"] not in {
+                    "running", "cancelling", "succeeded", "failed",
+                    "cancelled", "indeterminate",
+                }
+            ):
+                raise _invalid_response(
+                    "Operation",
+                    operation_response,
+                    error_code="operation.invalid_response",
+                )
+            if args.action == "wait" and args.progress:
+                progress_state = _emit_operation_progress(
+                    operation,
+                    getattr(args, "prompt_stream", sys.stderr),
+                    progress_state,
+                )
             if args.action == "show" or operation["status"] in {
                 "succeeded", "failed", "cancelled", "indeterminate",
             }:
@@ -6627,12 +6714,6 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                         error_code="operation.cancel_not_applied",
                     )
                 return _with_context(operation_response, context)
-            if operation["status"] not in {"running", "cancelling"}:
-                raise _invalid_response(
-                    "Operation",
-                    operation_response,
-                    error_code="operation.invalid_response",
-                )
             if time.monotonic() >= deadline:
                 message = (
                     "Cancellation was requested, but the operation did not reach "
@@ -8097,6 +8178,22 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 action=args.action,
                 payload=payload,
             )
+            if args.background and args.detach:
+                submitted = result
+                try:
+                    _accepted_derived_background_operation(
+                        submitted,
+                        name=mutation_name,
+                        action=args.action,
+                    )
+                except CliError as exc:
+                    raise _derived_mutation_indeterminate(
+                        mutation_name,
+                        args.action,
+                        response=submitted,
+                        cause=exc,
+                    ) from exc
+                return _with_context(submitted, context)
             background_operation_id = None
             if args.background:
                 submitted = result
@@ -8155,6 +8252,22 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 action=args.action,
                 payload={"confirmed": True, **({"background": True} if background else {})},
             )
+            if background and args.detach:
+                submitted = result
+                try:
+                    _accepted_derived_background_operation(
+                        submitted,
+                        name=args.name,
+                        action=args.action,
+                    )
+                except CliError as exc:
+                    raise _derived_mutation_indeterminate(
+                        args.name,
+                        args.action,
+                        response=submitted,
+                        cause=exc,
+                    ) from exc
+                return _with_context(submitted, context)
             background_operation_id = None
             if background:
                 submitted = result
@@ -8750,6 +8863,17 @@ def run(args, store: ConfigStore | None = None) -> dict[str, Any]:
     store = store or ConfigStore()
     if args.command == "layers" and args.action == "statistics":
         _validate_layer_statistics_arguments(args)
+    if (
+        args.command == "derived-layers"
+        and args.action in {"create", "replace", "refresh"}
+        and args.detach
+        and not args.background
+    ):
+        raise CliError(
+            "--detach requires --background.",
+            EXIT_USAGE,
+            error_code="usage.detach_requires_background",
+        )
     if (
         args.command == "derived-layers"
         and args.action == "plan-area-weighted-h3"

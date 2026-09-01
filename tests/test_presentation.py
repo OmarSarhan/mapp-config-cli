@@ -93,6 +93,22 @@ class CompletionTests(unittest.TestCase):
                 3,
             ),
         )
+        self.assertIn(
+            "--detach",
+            self.bash_completions(
+                ["config-cli", "derived-layers", "create", "--d"],
+                3,
+            ),
+        )
+
+    def test_bash_completes_operation_wait_progress(self):
+        self.assertIn(
+            "--progress",
+            self.bash_completions(
+                ["config-cli", "operations", "wait", "op", "--p"],
+                4,
+            ),
+        )
 
     def test_fish_nested_conditions_and_required_values_are_explicit(self):
         script = generate_completion(parser(), "fish")

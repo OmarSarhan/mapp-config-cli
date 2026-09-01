@@ -324,7 +324,7 @@ Inspect or wait for a durable operation:
 
 ```sh
 config-cli operations show OPERATION_ID
-config-cli operations wait OPERATION_ID --wait-timeout 120 --interval 1
+config-cli operations wait OPERATION_ID --progress --wait-timeout 120 --interval 1
 config-cli operations cancel OPERATION_ID --confirm --wait-timeout 120 --interval 1
 ```
 
@@ -340,7 +340,11 @@ so reconcile the operation, managed-layer registry, and catalog before
 retrying. Wait and cancel default to a 120-second wait timeout and a one-second
 polling interval. A lost poll or local wait timeout returns
 `indeterminate: true`, `failurePhase: "operation-polling"`, the operation ID,
-and reconciliation commands with automatic retry disabled.
+and reconciliation commands with automatic retry disabled. `--progress` writes
+only safely encoded status/stage transitions to stderr; the single final JSON
+result on stdout is unchanged. A `waiting-for-worker` stage means the durable
+job is admitted and waiting without holding a database connection. It is not a
+reason to submit the mutation again.
 
 ### `completion`
 
@@ -1026,6 +1030,23 @@ For a refresh already known to be slow, opt into durable background execution:
 config-cli derived-layers refresh paths_h3_r9 --confirm --background
 ```
 
+Inspect all admitted work and submit without occupying the terminal when more
+than one reviewed job must be managed:
+
+```sh
+config-cli derived-layers jobs
+config-cli derived-layers refresh paths_h3_r9 \
+  --confirm --background --detach
+config-cli operations wait OPERATION_ID \
+  --progress --wait-timeout 1860 --interval 1
+```
+
+`derived-layers jobs` reports bounded, sanitized active-operation summaries,
+including whether each job is executing or waiting for the worker. `--detach`
+requires `--background` and returns only after the server supplies a validated,
+target-bound durable operation ID and status URL; it never changes the reviewed
+request or retries it. Retain that ID for `operations show|wait|cancel`.
+
 Atomically replace a definition or convert its kind:
 
 ```sh
@@ -1103,6 +1124,9 @@ for ordinary views and jobs expected to finish promptly. For a known slow
 materialized job, add `--background`; the CLI then requests a durable server
 operation and polls it automatically. Background mode accepts
 `--wait-timeout` (default 1860 seconds) and `--interval` (default one second).
+Add `--detach` to return the accepted operation immediately and manage it with
+`derived-layers jobs` and `operations wait`; detached acceptance is not proof
+that the database mutation has completed.
 Reaching the local wait timeout does not cancel database work; continue with
 the operation ID from the structured error using
 `config-cli operations wait OPERATION_ID`. This error uses

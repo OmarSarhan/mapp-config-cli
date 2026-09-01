@@ -2341,6 +2341,110 @@ class CliTests(unittest.TestCase):
         self.assertEqual("slow_places", derived_layer["name"])
         self.assertEqual(resolved_scope, derived_layer["spatialScope"])
 
+    def test_derived_create_can_detach_from_a_valid_bound_operation(self):
+        operation_id = "d" * 32
+
+        def create(request):
+            self.assertTrue(request["body"]["background"])
+            return 202, {
+                "operation": {
+                    "id": operation_id,
+                    "kind": "derived-layer.create",
+                    "status": "running",
+                    "target": {"name": "slow_places", "action": "create"},
+                },
+                "statusUrl": f"/api/operations/{operation_id}",
+            }
+
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers")] = create
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            query_file = Path(directory) / "query.sql"
+            query_file.write_text(
+                "SELECT id, geom FROM etl.places", encoding="utf-8"
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke([
+                "derived-layers", "create", "slow_places",
+                "--kind", "materialized",
+                "--query-file", str(query_file),
+                "--source", "etl.places",
+                "--id-column", "id",
+                "--geometry-column", "geom",
+                "--background",
+                "--detach",
+                "--confirm",
+            ], store)
+            operation_polls = [
+                request for request in server.requests
+                if request["path"].startswith("/api/operations/")
+            ]
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("", stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(operation_id, payload["operation"]["id"])
+        self.assertEqual(
+            f"/api/operations/{operation_id}", payload["statusUrl"]
+        )
+        self.assertEqual([], operation_polls)
+
+    def test_derived_refresh_detach_rejects_an_unbound_operation_as_indeterminate(self):
+        operation_id = "e" * 32
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
+            202,
+            {
+                "operation": {
+                    "id": operation_id,
+                    "kind": "derived-layer.refresh",
+                    "status": "running",
+                    "target": {"name": "other_layer", "action": "refresh"},
+                },
+                "statusUrl": f"/api/operations/{operation_id}",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers", "refresh", "slow_places",
+                    "--confirm", "--background", "--detach",
+                ],
+                store,
+            )
+            mutation_requests = [
+                request for request in server.requests
+                if request["method"] == "POST"
+            ]
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        failure = json.loads(stderr)
+        self.assertEqual("derived_layer.mutation_indeterminate", failure["code"])
+        self.assertEqual("request-response", failure["details"]["failurePhase"])
+        self.assertFalse(
+            failure["details"]["reconciliation"]["automaticRetry"]
+        )
+        self.assertEqual(1, len(mutation_requests))
+
+    def test_derived_detach_requires_background_before_any_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers", "refresh", "slow_places",
+                    "--confirm", "--detach",
+                ],
+                ConfigStore(Path(directory) / "config"),
+            )
+
+        self.assertEqual(EXIT_USAGE, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(
+            "usage.detach_requires_background",
+            json.loads(stderr)["code"],
+        )
+
     def test_derived_mutations_reject_wrong_names_after_sync_and_background_success(self):
         routes = standard_routes()
         routes[("POST", "/api/derived-layers/requested/refresh")] = (
@@ -7329,6 +7433,68 @@ class CliTests(unittest.TestCase):
             "succeeded",
             json.loads(operation_out)["operation"]["status"],
         )
+
+    def test_operation_wait_progress_emits_only_status_and_stage_changes(self):
+        operation_id = "f" * 32
+        responses = iter((
+            {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "status": "running",
+                "stage": "waiting-for-worker",
+                "target": {"name": "private_layer"},
+                "diagnostics": {"private": "must-not-be-printed"},
+            },
+            {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "status": "running",
+                "stage": "waiting-for-worker",
+            },
+            {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "status": "running",
+                "stage": "database-transaction",
+            },
+            {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "status": "succeeded",
+                "stage": "result-reporting",
+                "result": {"derivedLayer": {"name": "private_layer"}},
+            },
+        ))
+
+        def operation_status(_request):
+            return 200, {"operation": next(responses)}
+
+        routes = standard_routes()
+        routes[("GET", f"/api/operations/{operation_id}")] = operation_status
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch("mapp_config_cli.cli.time.sleep", return_value=None):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "operations", "wait", operation_id,
+                        "--progress", "--interval", "0.001",
+                    ],
+                    store,
+                )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("succeeded", json.loads(stdout)["operation"]["status"])
+        progress = [json.loads(line)["operationProgress"] for line in stderr.splitlines()]
+        self.assertEqual(
+            [
+                {"stage": "waiting-for-worker", "status": "running"},
+                {"stage": "database-transaction", "status": "running"},
+                {"stage": "result-reporting", "status": "succeeded"},
+            ],
+            progress,
+        )
+        self.assertNotIn("private_layer", stderr)
+        self.assertNotIn("must-not-be-printed", stderr)
 
     def test_capability_discovery_rejects_target_identity_and_version_drift(self):
         valid_action = {

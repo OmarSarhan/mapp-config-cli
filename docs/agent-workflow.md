@@ -754,6 +754,16 @@ classification. Inspect `derived-layers list`, `derived-layers show`, and
 `catalog list` before retrying an ambiguous mutation; never resubmit it
 automatically.
 
+When several reviewed background mutations must be managed, inspect
+`derived-layers jobs`, then submit each with `--background --detach`. Preserve
+every returned operation ID and follow it with
+`operations wait OPERATION_ID --progress --wait-timeout 1860`. The
+`waiting-for-worker` stage is admitted durable work, not a failed request; do
+not submit it again. `--progress` reports only status/stage transitions on
+stderr and leaves the final JSON result on stdout unchanged. A local wait
+timeout or interruption does not cancel the operation and never authorizes an
+automatic mutation retry.
+
 `derived_layer.database_contention` is different from an ambiguous timeout.
 When it has `stateUnchanged: true`, `retryable: true`, and
 `contentionScope: "derived-mutation"` or `"postgresql-lock"`, wait for the

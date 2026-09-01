@@ -528,6 +528,13 @@ fail derived-output validation. Resolution changes can alter feature counts and
 useful preview zooms by orders of magnitude, so materialize and visually test
 the requested resolution rather than treating it as a label-only change.
 
+For several reviewed slow mutations, inspect `derived-layers jobs`, submit
+each with `--background --detach`, retain every returned operation ID, and use
+`operations wait OPERATION_ID --progress --wait-timeout 1860`. A
+`waiting-for-worker` stage is already admitted durable work; do not submit it
+again. A local timeout or interruption does not cancel it or authorize an
+automatic retry.
+
 A durable background operation can report a terminal serialization or result-
 reporting failure after its database transaction committed. Audit
 `operations show`, `derived-layers list|show`, and `catalog list` before acting
