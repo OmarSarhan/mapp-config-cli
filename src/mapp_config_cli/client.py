@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import http.client
 import json
 import math
+import os
 import re
 import socket
 import ssl
@@ -36,6 +38,88 @@ VERSION_PATTERN = re.compile(
 SERVER_ERROR_CODE_PATTERN = re.compile(
     r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+"
 )
+DEVCONTAINER_HOST_SETUP_COMMAND = (
+    "sudo sh .devcontainer/configure-platform-host.sh"
+)
+DEVCONTAINER_HOST_SETUP_REMEDIATION_ID = "devcontainer.configure_platform_host"
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes"})
+
+
+def _devcontainer_host_remediation(endpoint: str) -> dict[str, Any] | None:
+    if (
+        os.environ.get("REMOTE_CONTAINERS", "").strip().lower()
+        not in _TRUE_ENV_VALUES
+    ):
+        return None
+    platform_url = os.environ.get("MAPP_PLATFORM_URL", "").strip()
+    if not platform_url:
+        return None
+    try:
+        target = urllib.parse.urlsplit(endpoint)
+        configured = urllib.parse.urlsplit(platform_url)
+        target_port = target.port or (443 if target.scheme == "https" else 80)
+        configured_port = configured.port or (
+            443 if configured.scheme == "https" else 80
+        )
+    except ValueError:
+        return None
+    if (
+        (target.hostname or "").lower() != "config.localhost"
+        or (configured.hostname or "").lower() != "config.localhost"
+        or target.scheme.lower() != configured.scheme.lower()
+        or target_port != configured_port
+    ):
+        return None
+    return {
+        "endpoint": endpoint,
+        "environment": "devcontainer",
+        "remediation": {
+            "id": DEVCONTAINER_HOST_SETUP_REMEDIATION_ID,
+            "message": (
+                "Start the local MAPP platform, run the host-routing helper "
+                "from the trusted mapp-config-cli source root before continuing."
+            ),
+            "command": DEVCONTAINER_HOST_SETUP_COMMAND,
+        },
+    }
+
+
+def _connection_error(
+    endpoint: str,
+    exc: BaseException,
+) -> CliError:
+    unreachable = isinstance(
+        exc,
+        (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError),
+    )
+    details = _devcontainer_host_remediation(endpoint)
+    message_prefix = (
+        "Unable to reach configuration endpoint"
+        if unreachable
+        else "Configuration request failed"
+    )
+    message = f"{message_prefix}: {exc}"
+    if details is not None:
+        message += (
+            " The CLI is running in its dev container; start the local MAPP "
+            "platform, then run `"
+            + DEVCONTAINER_HOST_SETUP_COMMAND
+            + "` from the trusted mapp-config-cli source root before continuing."
+        )
+    return CliError(
+        message,
+        EXIT_CONNECTIVITY,
+        details=details,
+        error_code="api.unreachable" if unreachable else "api.transport_error",
+    )
+
+
+def _close_http_error(error: urllib.error.HTTPError) -> None:
+    try:
+        error.close()
+    except (OSError, http.client.HTTPException):
+        # Cleanup must not replace the authoritative HTTP or body-read error.
+        pass
 
 
 def normalize_endpoint(endpoint: str, *, allow_http: bool = False) -> str:
@@ -393,22 +477,14 @@ class ApiClient:
                     http_status=exc.code,
                     error_code=_server_error_code(details) or "api.http_error",
                 ) from exc
+            except (OSError, http.client.HTTPException) as read_exc:
+                raise _connection_error(self.endpoint, read_exc) from read_exc
             finally:
-                exc.close()
+                _close_http_error(exc)
         except CliError:
             raise
-        except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
-            raise CliError(
-                f"Unable to reach configuration endpoint: {exc}",
-                EXIT_CONNECTIVITY,
-                error_code="api.unreachable",
-            ) from exc
-        except OSError as exc:
-            raise CliError(
-                f"Configuration request failed: {exc}",
-                EXIT_CONNECTIVITY,
-                error_code="api.transport_error",
-            ) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            raise _connection_error(self.endpoint, exc) from exc
 
     def request_bytes(
         self,
@@ -476,22 +552,14 @@ class ApiClient:
                     http_status=exc.code,
                     error_code=_server_error_code(details) or "api.http_error",
                 ) from exc
+            except (OSError, http.client.HTTPException) as read_exc:
+                raise _connection_error(self.endpoint, read_exc) from read_exc
             finally:
-                exc.close()
+                _close_http_error(exc)
         except CliError:
             raise
-        except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
-            raise CliError(
-                f"Unable to reach configuration endpoint: {exc}",
-                EXIT_CONNECTIVITY,
-                error_code="api.unreachable",
-            ) from exc
-        except OSError as exc:
-            raise CliError(
-                f"Configuration request failed: {exc}",
-                EXIT_CONNECTIVITY,
-                error_code="api.transport_error",
-            ) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            raise _connection_error(self.endpoint, exc) from exc
 
 
 @dataclass(frozen=True)

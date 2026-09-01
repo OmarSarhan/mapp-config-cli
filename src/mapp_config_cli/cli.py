@@ -17,6 +17,8 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NoReturn, Sequence, TextIO, cast
 
 from .client import (
+    DEVCONTAINER_HOST_SETUP_COMMAND,
+    DEVCONTAINER_HOST_SETUP_REMEDIATION_ID,
     MAX_RESPONSE_BYTES,
     SUPPORTED_API_MAJOR,
     SUPPORTED_CONTRACT_MAJOR,
@@ -8732,6 +8734,52 @@ def _is_native_windows() -> bool:
     return os.name == "nt"
 
 
+def _devcontainer_remediation(details: Any) -> dict[str, Any] | None:
+    pending = [details]
+    for _ in range(32):
+        if not pending:
+            return None
+        current = pending.pop()
+        if not isinstance(current, dict):
+            continue
+        remediation = current.get("remediation")
+        if (
+            isinstance(remediation, dict)
+            and remediation.get("id") == DEVCONTAINER_HOST_SETUP_REMEDIATION_ID
+            and remediation.get("command") == DEVCONTAINER_HOST_SETUP_COMMAND
+        ):
+            return remediation
+        cause = current.get("cause")
+        if isinstance(cause, dict) and "details" in cause:
+            pending.append(cause["details"])
+        if "diagnostic" in current:
+            pending.append(current["diagnostic"])
+        artifact_errors = current.get("artifactDownloadErrors")
+        if isinstance(artifact_errors, list):
+            pending.extend(
+                error["details"]
+                for error in artifact_errors[:MAX_VISUAL_ARTIFACTS]
+                if isinstance(error, dict) and "details" in error
+            )
+    return None
+
+
+def _cli_error_payload(error: CliError) -> dict[str, Any]:
+    payload = error.payload()
+    remediation = _devcontainer_remediation(error.safe_details)
+    if remediation is None or DEVCONTAINER_HOST_SETUP_COMMAND in error.message:
+        return payload
+    payload["error"] = (
+        error.message
+        + " Before continuing, restore dev-container access to the backend by "
+        "running `"
+        + DEVCONTAINER_HOST_SETUP_COMMAND
+        + "` from the trusted mapp-config-cli source root. Follow any retry or "
+        "reconciliation guidance in this error."
+    )
+    return payload
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -8809,7 +8857,7 @@ def main(
         emit(error.payload(), stderr)
         return error.exit_code
     except CliError as exc:
-        emit(exc.payload(), stderr)
+        emit(_cli_error_payload(exc), stderr)
         return exc.exit_code
     except (json.JSONDecodeError, UnicodeError, OSError, ValueError) as exc:
         error = CliError(

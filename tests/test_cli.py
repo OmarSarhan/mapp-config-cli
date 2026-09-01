@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -6531,6 +6532,186 @@ class CliTests(unittest.TestCase):
         self.assertEqual(selected.instance_id, "instance-1")
         self.assertEqual(token, "init-token")
         self.assertTrue(json.loads(stdout)["compatible"])
+
+    def test_device_auth_unreachable_in_devcontainer_prompts_for_host_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.configured_store(
+                directory,
+                "http://config.localhost:3000",
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "REMOTE_CONTAINERS": "true",
+                        "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                    },
+                ),
+                patch(
+                    "mapp_config_cli.client.urllib.request.OpenerDirector.open",
+                    side_effect=urllib.error.URLError("synthetic unreachable"),
+                ),
+            ):
+                code, stdout, stderr = self.invoke(
+                    ["auth", "device", "--no-browser"],
+                    store,
+                )
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["code"], "api.unreachable")
+        self.assertIn(
+            "sudo sh .devcontainer/configure-platform-host.sh",
+            payload["error"],
+        )
+        self.assertEqual(
+            payload["details"]["remediation"]["command"],
+            "sudo sh .devcontainer/configure-platform-host.sh",
+        )
+        self.assertEqual(
+            payload["details"]["remediation"]["id"],
+            "devcontainer.configure_platform_host",
+        )
+
+    def test_workspace_get_prompts_for_matching_devcontainer_unreachable(self):
+        cases = (
+            ("matching-devcontainer-origin", "http://config.localhost:3000", True),
+            ("container-loopback", "http://localhost:3000", False),
+        )
+        for label, endpoint, expect_prompt in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                store = self.configured_store(directory, endpoint)
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "REMOTE_CONTAINERS": "true",
+                            "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                        },
+                    ),
+                    patch(
+                        "mapp_config_cli.client.urllib.request.OpenerDirector.open",
+                        side_effect=urllib.error.URLError("synthetic unreachable"),
+                    ),
+                ):
+                    code, stdout, stderr = self.invoke(["workspace", "get"], store)
+
+            self.assertEqual(code, EXIT_CONNECTIVITY)
+            self.assertEqual(stdout, "")
+            payload = json.loads(stderr)
+            self.assertEqual(payload["code"], "api.unreachable")
+            if expect_prompt:
+                self.assertIn(
+                    "sudo sh .devcontainer/configure-platform-host.sh",
+                    payload["error"],
+                )
+                self.assertEqual(
+                    payload["details"]["remediation"]["id"],
+                    "devcontainer.configure_platform_host",
+                )
+            else:
+                self.assertNotIn("configure-platform-host.sh", stderr)
+                self.assertNotIn("details", payload)
+
+    def test_workspace_get_http_error_is_not_rewritten_as_host_remediation(self):
+        response = {"error": "Synthetic service failure.", "code": "service.unavailable"}
+        http_error = urllib.error.HTTPError(
+            "http://config.localhost:3000/api/public/identity",
+            503,
+            "Service Unavailable",
+            {},
+            io.BytesIO(json.dumps(response).encode("utf-8")),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.configured_store(
+                directory,
+                "http://config.localhost:3000",
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "REMOTE_CONTAINERS": "true",
+                        "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                    },
+                ),
+                patch(
+                    "mapp_config_cli.client.urllib.request.OpenerDirector.open",
+                    side_effect=http_error,
+                ),
+            ):
+                code, stdout, stderr = self.invoke(["workspace", "get"], store)
+
+        self.assertEqual(code, EXIT_CONNECTIVITY)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["error"], "Synthetic service failure.")
+        self.assertEqual(payload["code"], "service.unavailable")
+        self.assertEqual(payload["httpStatus"], 503)
+        self.assertEqual(payload["details"], response)
+        self.assertNotIn("configure-platform-host.sh", stderr)
+
+    def test_embedded_backend_connection_failure_keeps_prompt_visible(self):
+        connection_details = {
+            "endpoint": "http://config.localhost:3000",
+            "environment": "devcontainer",
+            "remediation": {
+                "id": "devcontainer.configure_platform_host",
+                "message": "Restore dev-container backend routing.",
+                "command": "sudo sh .devcontainer/configure-platform-host.sh",
+            },
+        }
+        cases = (
+            (
+                "indeterminate-mutation",
+                {
+                    "cause": {
+                        "code": "api.transport_error",
+                        "details": connection_details,
+                    },
+                },
+            ),
+            (
+                "failed-artifact-download",
+                {
+                    "artifactDownloadErrors": [
+                        {
+                            "artifact": "afterPage",
+                            "code": "api.transport_error",
+                            "details": connection_details,
+                        },
+                    ],
+                },
+            ),
+        )
+        for label, details in cases:
+            wrapped = CliError(
+                "Backend result is indeterminate. Do not retry.",
+                EXIT_CONNECTIVITY,
+                details=details,
+                error_code="operation.indeterminate",
+            )
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+                patch("mapp_config_cli.cli.run", side_effect=wrapped),
+            ):
+                code, stdout, stderr = self.invoke(
+                    ["describe"],
+                    ConfigStore(Path(directory) / "config"),
+                )
+
+            self.assertEqual(code, EXIT_CONNECTIVITY)
+            self.assertEqual(stdout, "")
+            payload = json.loads(stderr)
+            self.assertEqual(payload["code"], "operation.indeterminate")
+            self.assertIn("Do not retry", payload["error"])
+            self.assertIn(
+                "sudo sh .devcontainer/configure-platform-host.sh",
+                payload["error"],
+            )
+            self.assertIn("reconciliation guidance", payload["error"])
 
     def test_setup_collects_details_without_leaking_token(self):
         routes = standard_routes()

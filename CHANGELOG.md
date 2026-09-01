@@ -10,6 +10,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Backend connection failures from any command in the devcontainer now prompt
+  the operator to start the configured `config.localhost` platform and rerun
+  `.devcontainer/configure-platform-host.sh` from the trusted CLI source root.
+  The prompt covers unreachable, reset, and incomplete-response transport
+  failures while unrelated endpoints and authoritative HTTP errors remain
+  unchanged.
 - Corrected the federation availability guidance in
   `docs/agent-workflow.md`, which told agents federation is unavailable under
   `MAPP_DATABASE_MODE=external`. An external deployment can now federate when

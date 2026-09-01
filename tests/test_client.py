@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import http.client
+import os
 import threading
 import unittest
 import urllib.error
@@ -131,6 +133,210 @@ class TransportTests(unittest.TestCase):
             "http://config.localhost:3000/api/public/identity",
         )
         self.assertIsNone(request.get_header("Host"))
+
+    def test_devcontainer_backend_failures_prompt_for_host_helper(self):
+        expected_details = {
+            "endpoint": "http://config.localhost:3000",
+            "environment": "devcontainer",
+            "remediation": {
+                "id": "devcontainer.configure_platform_host",
+                "message": (
+                    "Start the local MAPP platform, run the host-routing helper "
+                    "from the trusted mapp-config-cli source root before continuing."
+                ),
+                "command": "sudo sh .devcontainer/configure-platform-host.sh",
+            },
+        }
+        failures = (
+            (
+                "unreachable",
+                lambda: urllib.error.URLError("synthetic unreachable"),
+                "api.unreachable",
+            ),
+            (
+                "connection-reset",
+                lambda: ConnectionResetError("synthetic reset"),
+                "api.transport_error",
+            ),
+            (
+                "incomplete-response",
+                lambda: http.client.IncompleteRead(b"partial", 10),
+                "api.transport_error",
+            ),
+        )
+        for method in ("request", "request_bytes"):
+            for label, failure, expected_code in failures:
+                with self.subTest(method=method, failure=label), patch.dict(
+                    os.environ,
+                    {
+                        "REMOTE_CONTAINERS": "true",
+                        "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                    },
+                ):
+                    client = ApiClient("http://config.localhost:3000", "token")
+                    with patch.object(
+                        client.opener,
+                        "open",
+                        side_effect=failure(),
+                    ), self.assertRaises(CliError) as raised:
+                        getattr(client, method)("/api/test")
+
+                error = raised.exception
+                self.assertEqual(error.exit_code, EXIT_CONNECTIVITY)
+                self.assertEqual(error.error_code, expected_code)
+                self.assertIn(
+                    "sudo sh .devcontainer/configure-platform-host.sh",
+                    error.message,
+                )
+                self.assertEqual(error.safe_details, expected_details)
+
+    def test_devcontainer_http_error_body_failure_prompts_for_host_helper(self):
+        class BrokenBody:
+            def read(self, _size):
+                raise ConnectionResetError("synthetic response reset")
+
+            def close(self):
+                return None
+
+        for method in ("request", "request_bytes"):
+            error = urllib.error.HTTPError(
+                "http://config.localhost:3000/api/test",
+                503,
+                "Service Unavailable",
+                {},
+                BrokenBody(),
+            )
+            with self.subTest(method=method), patch.dict(
+                os.environ,
+                {
+                    "REMOTE_CONTAINERS": "true",
+                    "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                },
+            ):
+                client = ApiClient("http://config.localhost:3000", "token")
+                with patch.object(
+                    client.opener,
+                    "open",
+                    side_effect=error,
+                ), self.assertRaises(CliError) as raised:
+                    getattr(client, method)("/api/test")
+
+            self.assertEqual(raised.exception.exit_code, EXIT_CONNECTIVITY)
+            self.assertEqual(raised.exception.error_code, "api.transport_error")
+            self.assertIn(
+                "sudo sh .devcontainer/configure-platform-host.sh",
+                raised.exception.message,
+            )
+            self.assertEqual(
+                raised.exception.safe_details["remediation"]["id"],
+                "devcontainer.configure_platform_host",
+            )
+
+    def test_http_error_cleanup_failure_preserves_the_server_error(self):
+        class BrokenCloseBody:
+            def read(self, _size):
+                return b'{"error":"Service failed.","code":"service.unavailable"}'
+
+            def close(self):
+                raise ConnectionResetError("synthetic close reset")
+
+        for method in ("request", "request_bytes"):
+            error = urllib.error.HTTPError(
+                "http://config.localhost:3000/api/test",
+                503,
+                "Service Unavailable",
+                {},
+                BrokenCloseBody(),
+            )
+            with self.subTest(method=method), patch.dict(
+                os.environ,
+                {
+                    "REMOTE_CONTAINERS": "true",
+                    "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                },
+            ):
+                client = ApiClient("http://config.localhost:3000", "token")
+                with patch.object(
+                    client.opener,
+                    "open",
+                    side_effect=error,
+                ), self.assertRaises(CliError) as raised:
+                    getattr(client, method)("/api/test")
+
+            self.assertEqual(raised.exception.exit_code, EXIT_CONNECTIVITY)
+            self.assertEqual(raised.exception.error_code, "service.unavailable")
+            self.assertEqual(raised.exception.http_status, 503)
+            self.assertNotIn(
+                "configure-platform-host.sh",
+                raised.exception.message,
+            )
+
+    def test_unreachable_hint_is_limited_to_the_configured_devcontainer_origin(self):
+        cases = (
+            (
+                "outside-devcontainer",
+                "http://config.localhost:3000",
+                {"REMOTE_CONTAINERS": "", "MAPP_PLATFORM_URL": ""},
+            ),
+            (
+                "container-loopback",
+                "http://localhost:3000",
+                {
+                    "REMOTE_CONTAINERS": "true",
+                    "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                },
+            ),
+            (
+                "different-localhost-alias",
+                "http://other.localhost:3000",
+                {
+                    "REMOTE_CONTAINERS": "true",
+                    "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                },
+            ),
+            (
+                "different-configured-port",
+                "http://config.localhost:4000",
+                {
+                    "REMOTE_CONTAINERS": "true",
+                    "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                },
+            ),
+            (
+                "different-configured-scheme",
+                "https://config.localhost:3000",
+                {
+                    "REMOTE_CONTAINERS": "true",
+                    "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                },
+            ),
+            (
+                "remote-endpoint",
+                "https://config.example.com",
+                {
+                    "REMOTE_CONTAINERS": "true",
+                    "MAPP_PLATFORM_URL": "http://config.localhost:3000",
+                },
+            ),
+        )
+        for label, endpoint, environment in cases:
+            with self.subTest(label=label), patch.dict(
+                os.environ,
+                environment,
+            ):
+                client = ApiClient(endpoint, "token")
+                with patch.object(
+                    client.opener,
+                    "open",
+                    side_effect=urllib.error.URLError("synthetic unreachable"),
+                ), self.assertRaises(CliError) as raised:
+                    client.request("/api/test")
+
+            self.assertIsNone(raised.exception.safe_details)
+            self.assertNotIn(
+                "configure-platform-host.sh",
+                raised.exception.message,
+            )
 
     def test_request_id_header_is_preserved_as_response_metadata(self):
         routes = {

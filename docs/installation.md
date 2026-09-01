@@ -117,7 +117,9 @@ The hook probes the native Docker gateway and `host.docker.internal` against
 the port in `MAPP_PLATFORM_URL`, then writes the reachable IPv4 address to
 `/etc/hosts`.
 
-If setup reports `api.unreachable`, start the platform and rerun:
+If any command reports `api.unreachable` or `api.transport_error`, the CLI
+includes this repair command in its error when the failing endpoint matches the
+configured `config.localhost` origin. Start the platform and rerun:
 
 ```sh
 sudo sh .devcontainer/configure-platform-host.sh
