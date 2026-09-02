@@ -10,6 +10,12 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Durable derived-layer following no longer expires at a fixed 1,860-second
+  queue deadline. Implicit background following and `operations wait` now run
+  to terminal state by default, emit derived stage transitions without
+  corrupting stdout JSON, and retry only idempotent status GETs through a
+  bounded transient connectivity/408/429/5xx outage with capped backoff. The
+  mutation POST is never repeated.
 - Backend connection failures from any command in the devcontainer now prompt
   the operator to start the configured `config.localhost` platform and rerun
   `.devcontainer/configure-platform-host.sh` from the trusted CLI source root.

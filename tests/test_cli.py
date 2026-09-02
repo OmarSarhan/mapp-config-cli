@@ -66,6 +66,22 @@ SAFE_DEFAULT_DEVICE_SCOPES = (
 WORKSPACE_CANDIDATE_HASH = "c" * 64
 
 
+def final_json_document(value: str) -> dict:
+    decoder = json.JSONDecoder()
+    offset = 0
+    documents = []
+    while offset < len(value):
+        while offset < len(value) and value[offset].isspace():
+            offset += 1
+        if offset >= len(value):
+            break
+        document, offset = decoder.raw_decode(value, offset)
+        documents.append(document)
+    if not documents or not isinstance(documents[-1], dict):
+        raise AssertionError("Expected at least one JSON object document.")
+    return documents[-1]
+
+
 def map_extent_scope(locale: str = "Leeds") -> dict:
     return {
         "type": "workspace-map-extent",
@@ -128,6 +144,25 @@ def background_jobs_response() -> dict:
                 },
             ],
         }
+    }
+
+
+def accepted_derived_background_response(
+    operation_id: str,
+    *,
+    name: str,
+    action: str,
+    stage: str = "waiting-for-worker",
+) -> dict:
+    return {
+        "operation": {
+            "id": operation_id,
+            "kind": f"derived-layer.{action}",
+            "status": "running",
+            "stage": stage,
+            "target": {"name": name, "action": action},
+        },
+        "statusUrl": f"/api/operations/{operation_id}",
     }
 
 
@@ -2288,6 +2323,7 @@ class CliTests(unittest.TestCase):
 
     def test_derived_create_waits_for_background_operation(self):
         polls = {"count": 0}
+        operation_id = "1" * 32
         resolved_scope = map_extent_scope()
 
         def create(request):
@@ -2295,17 +2331,18 @@ class CliTests(unittest.TestCase):
             self.assertEqual(request["body"]["spatialScope"], {
                 "type": "workspace-map-extent",
             })
-            return 202, {"operation": {
-                "id": "derived-op-1",
-                "kind": "derived-layer.create",
-                "status": "running",
-            }}
+            return 202, accepted_derived_background_response(
+                operation_id,
+                name="slow_places",
+                action="create",
+            )
 
         def status(_request):
             polls["count"] += 1
             return 200, {"operation": {
-                "id": "derived-op-1",
+                "id": operation_id,
                 "kind": "derived-layer.create",
+                "target": {"name": "slow_places", "action": "create"},
                 "status": "succeeded",
                 "result": {"derivedLayer": {
                     "name": "slow_places",
@@ -2316,7 +2353,7 @@ class CliTests(unittest.TestCase):
 
         routes = standard_routes()
         routes[("POST", "/api/derived-layers")] = create
-        routes[("GET", "/api/operations/derived-op-1")] = status
+        routes[("GET", f"/api/operations/{operation_id}")] = status
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
             query_file = Path(directory) / "query.sql"
             query_file.write_text(
@@ -2340,6 +2377,87 @@ class CliTests(unittest.TestCase):
         derived_layer = json.loads(stdout)["derivedLayer"]
         self.assertEqual("slow_places", derived_layer["name"])
         self.assertEqual(resolved_scope, derived_layer["spatialScope"])
+
+    def test_derived_background_follow_reports_queue_and_execution_stages(self):
+        operation_id = "c" * 32
+        responses = iter((
+            {
+                "id": operation_id,
+                "kind": "derived-layer.refresh",
+                "target": {"name": "slow_places", "action": "refresh"},
+                "status": "running",
+                "stage": "database-transaction",
+            },
+            {
+                "id": operation_id,
+                "kind": "derived-layer.refresh",
+                "target": {"name": "slow_places", "action": "refresh"},
+                "status": "succeeded",
+                "stage": "result-reporting",
+                "result": {"derivedLayer": {"name": "slow_places"}},
+            },
+        ))
+
+        def status(_request):
+            return 200, {"operation": next(responses)}
+
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
+            202,
+            accepted_derived_background_response(
+                operation_id,
+                name="slow_places",
+                action="refresh",
+            ),
+        )
+        routes[("GET", f"/api/operations/{operation_id}")] = status
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch("mapp_config_cli.cli.time.sleep", return_value=None):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "derived-layers",
+                        "refresh",
+                        "slow_places",
+                        "--confirm",
+                        "--background",
+                        "--interval",
+                        "0.001",
+                    ],
+                    store,
+                )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("slow_places", json.loads(stdout)["derivedLayer"]["name"])
+        progress = [
+            json.loads(line)["operationProgress"]
+            for line in stderr.splitlines()
+        ]
+        self.assertEqual(
+            [
+                {"stage": "waiting-for-worker", "status": "running"},
+                {"stage": "database-transaction", "status": "running"},
+                {"stage": "result-reporting", "status": "succeeded"},
+            ],
+            progress,
+        )
+
+    def test_operation_follow_defaults_have_no_fixed_queue_deadline(self):
+        derived_args = parser().parse_args(
+            [
+                "derived-layers",
+                "refresh",
+                "slow_places",
+                "--confirm",
+                "--background",
+            ]
+        )
+        operation_args = parser().parse_args(
+            ["operations", "wait", "a" * 32]
+        )
+
+        self.assertIsNone(derived_args.wait_timeout)
+        self.assertIsNone(operation_args.wait_timeout)
 
     def test_derived_create_can_detach_from_a_valid_bound_operation(self):
         operation_id = "d" * 32
@@ -2446,6 +2564,7 @@ class CliTests(unittest.TestCase):
         )
 
     def test_derived_mutations_reject_wrong_names_after_sync_and_background_success(self):
+        operation_id = "2" * 32
         routes = standard_routes()
         routes[("POST", "/api/derived-layers/requested/refresh")] = (
             200,
@@ -2453,17 +2572,18 @@ class CliTests(unittest.TestCase):
         )
         routes[("POST", "/api/derived-layers/background/refresh")] = (
             202,
-            {"operation": {
-                "id": "derived-op-wrong-name",
-                "kind": "derived-layer.refresh",
-                "status": "running",
-            }},
+            accepted_derived_background_response(
+                operation_id,
+                name="background",
+                action="refresh",
+            ),
         )
-        routes[("GET", "/api/operations/derived-op-wrong-name")] = (
+        routes[("GET", f"/api/operations/{operation_id}")] = (
             200,
             {"operation": {
-                "id": "derived-op-wrong-name",
+                "id": operation_id,
                 "kind": "derived-layer.refresh",
+                "target": {"name": "background", "action": "refresh"},
                 "status": "succeeded",
                 "result": {"derivedLayer": {"name": "substituted"}},
             }},
@@ -2490,7 +2610,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(background[0], EXIT_CONNECTIVITY)
         self.assertEqual(background[1], "")
-        background_error = json.loads(background[2])
+        background_error = final_json_document(background[2])
         self.assertEqual(background_error["code"], "operation.poll_failed")
         self.assertEqual(
             background_error["details"]["cause"]["code"],
@@ -2498,7 +2618,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(
             background_error["details"]["operationId"],
-            "derived-op-wrong-name",
+            operation_id,
         )
 
     def test_derived_create_adds_generic_nested_loop_guidance(self):
@@ -2524,7 +2644,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(EXIT_CONFLICT, code)
         self.assertEqual("", stdout)
-        payload = json.loads(stderr)
+        payload = final_json_document(stderr)
         self.assertEqual("derived_layer.query_too_expensive", payload["code"])
         details = payload["details"]
         self.assertEqual(
@@ -2554,7 +2674,7 @@ class CliTests(unittest.TestCase):
             step["id"]: step["message"] for step in guidance["steps"]
         }
         self.assertIn(
-            "exact prepared transform expression",
+            "access-path evidence proves is indexed",
             messages["keep-high-cardinality-inputs-indexable"],
         )
         self.assertIn(
@@ -2609,6 +2729,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(server_error, details)
 
     def test_derived_create_surfaces_structured_background_guidance(self):
+        operation_id = "3" * 32
         reason = {
             "code": "custom_routine",
             "message": "The query calls an unapproved database routine.",
@@ -2634,9 +2755,18 @@ class CliTests(unittest.TestCase):
         routes = standard_routes()
         routes[("POST", "/api/derived-layers")] = (
             202,
+            accepted_derived_background_response(
+                operation_id,
+                name="unsafe_places",
+                action="create",
+            ),
+        )
+        routes[("GET", f"/api/operations/{operation_id}")] = (
+            200,
             {"operation": {
-                "id": "derived-op-policy",
+                "id": operation_id,
                 "kind": "derived-layer.create",
+                "target": {"name": "unsafe_places", "action": "create"},
                 "status": "failed",
                 "error": operation_error,
             }},
@@ -2656,12 +2786,13 @@ class CliTests(unittest.TestCase):
                 "--id-column", "id",
                 "--geometry-column", "geom",
                 "--background",
+                "--interval", "0.001",
                 "--confirm",
             ], store)
 
         self.assertEqual(EXIT_VALIDATION, code)
         self.assertEqual("", stdout)
-        payload = json.loads(stderr)
+        payload = final_json_document(stderr)
         self.assertEqual("derived_layer.query_not_allowed", payload["code"])
         self.assertEqual(operation_error["userMessage"], payload["error"])
         preserved = payload["details"]["operation"]["error"]
@@ -2669,13 +2800,23 @@ class CliTests(unittest.TestCase):
         self.assertEqual([reason], preserved["reasons"])
 
     def test_derived_create_adds_guidance_to_background_pair_work_error(self):
+        operation_id = "4" * 32
         operation_error = nested_loop_pair_work_error()
         routes = standard_routes()
         routes[("POST", "/api/derived-layers")] = (
             202,
+            accepted_derived_background_response(
+                operation_id,
+                name="bounded_places",
+                action="create",
+            ),
+        )
+        routes[("GET", f"/api/operations/{operation_id}")] = (
+            200,
             {"operation": {
-                "id": "derived-op-pair-work",
+                "id": operation_id,
                 "kind": "derived-layer.create",
+                "target": {"name": "bounded_places", "action": "create"},
                 "status": "failed",
                 "error": operation_error,
             }},
@@ -2695,12 +2836,13 @@ class CliTests(unittest.TestCase):
                 "--id-column", "id",
                 "--geometry-column", "geom",
                 "--background",
+                "--interval", "0.001",
                 "--confirm",
             ], store)
 
         self.assertEqual(EXIT_CONFLICT, code)
         self.assertEqual("", stdout)
-        payload = json.loads(stderr)
+        payload = final_json_document(stderr)
         self.assertEqual("derived_layer.query_too_expensive", payload["code"])
         self.assertEqual(
             operation_error,
@@ -2747,20 +2889,33 @@ class CliTests(unittest.TestCase):
                 )
                 self.assertEqual(mutation_requests, [])
 
-    def test_background_poll_failure_retains_reconciliation_identity(self):
+    def test_background_poll_retries_safe_get_without_resubmitting_mutation(self):
+        operation_id = "5" * 32
+        polls = {"count": 0}
+
+        def status(_request):
+            polls["count"] += 1
+            if polls["count"] == 1:
+                return 503, {"error": "Polling is temporarily unavailable."}
+            return 200, {"operation": {
+                "id": operation_id,
+                "kind": "derived-layer.refresh",
+                "target": {"name": "slow_places", "action": "refresh"},
+                "status": "succeeded",
+                "stage": "result-reporting",
+                "result": {"derivedLayer": {"name": "slow_places"}},
+            }}
+
         routes = standard_routes()
         routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
             202,
-            {"operation": {
-                "id": "derived-op-poll",
-                "kind": "derived-layer.refresh",
-                "status": "running",
-            }},
+            accepted_derived_background_response(
+                operation_id,
+                name="slow_places",
+                action="refresh",
+            ),
         )
-        routes[("GET", "/api/operations/derived-op-poll")] = (
-            503,
-            {"error": "Polling is temporarily unavailable."},
-        )
+        routes[("GET", f"/api/operations/{operation_id}")] = status
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
             store = self.configured_store(directory, server.endpoint)
             with patch("mapp_config_cli.cli.time.sleep", return_value=None):
@@ -2771,34 +2926,131 @@ class CliTests(unittest.TestCase):
                     ],
                     store,
                 )
+            mutation_requests = [
+                request
+                for request in server.requests
+                if (
+                    request["method"] == "POST"
+                    and request["path"]
+                    == "/api/derived-layers/slow_places/refresh"
+                )
+            ]
 
-        self.assertEqual(code, EXIT_CONNECTIVITY)
-        self.assertEqual(stdout, "")
-        payload = json.loads(stderr)
-        self.assertEqual(payload["code"], "operation.poll_failed")
-        self.assertEqual(payload["details"]["operationId"], "derived-op-poll")
-        self.assertTrue(payload["details"]["indeterminate"])
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("slow_places", json.loads(stdout)["derivedLayer"]["name"])
+        self.assertEqual(2, polls["count"])
+        self.assertEqual(1, len(mutation_requests))
+        progress = [
+            json.loads(line)["operationProgress"]
+            for line in stderr.splitlines()
+        ]
         self.assertEqual(
-            payload["details"]["failurePhase"],
-            "operation-polling",
-        )
-        reconciliation = payload["details"]["reconciliation"]
-        self.assertTrue(reconciliation["required"])
-        self.assertFalse(reconciliation["automaticRetry"])
-        self.assertEqual(
-            reconciliation["commands"][0]["arguments"],
-            ["derived-op-poll"],
+            [
+                {"stage": "waiting-for-worker", "status": "running"},
+                {"stage": "result-reporting", "status": "succeeded"},
+            ],
+            progress,
         )
 
-    def test_background_wait_timeout_is_operation_polling_ambiguity(self):
+    def test_background_poll_does_not_retry_authorization_failure(self):
+        operation_id = "6" * 32
+        polls = {"count": 0}
+
+        def status(_request):
+            polls["count"] += 1
+            return 403, {"error": "Operation status is not authorized."}
+
         routes = standard_routes()
         routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
             202,
-            {"operation": {
-                "id": "derived-op-timeout",
-                "kind": "derived-layer.refresh",
-                "status": "running",
-            }},
+            accepted_derived_background_response(
+                operation_id,
+                name="slow_places",
+                action="refresh",
+            ),
+        )
+        routes[("GET", f"/api/operations/{operation_id}")] = status
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch("mapp_config_cli.cli.time.sleep", return_value=None):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "derived-layers",
+                        "refresh",
+                        "slow_places",
+                        "--confirm",
+                        "--background",
+                        "--interval",
+                        "0.001",
+                    ],
+                    store,
+                )
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(1, polls["count"])
+        failure = final_json_document(stderr)
+        self.assertEqual("operation.poll_failed", failure["code"])
+        self.assertEqual(403, failure["details"]["cause"]["httpStatus"])
+
+    def test_background_poll_transient_retry_window_is_bounded(self):
+        operation_id = "7" * 32
+        polls = {"count": 0}
+
+        def status(_request):
+            polls["count"] += 1
+            return 503, {"error": "Operation status is temporarily unavailable."}
+
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
+            202,
+            accepted_derived_background_response(
+                operation_id,
+                name="slow_places",
+                action="refresh",
+            ),
+        )
+        routes[("GET", f"/api/operations/{operation_id}")] = status
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with (
+                patch("mapp_config_cli.cli.time.sleep", return_value=None),
+                patch(
+                    "mapp_config_cli.cli.time.monotonic",
+                    side_effect=[0.0, 31.0],
+                ),
+            ):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "derived-layers",
+                        "refresh",
+                        "slow_places",
+                        "--confirm",
+                        "--background",
+                        "--interval",
+                        "0.001",
+                    ],
+                    store,
+                )
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(2, polls["count"])
+        self.assertEqual(
+            "operation.poll_failed",
+            final_json_document(stderr)["code"],
+        )
+
+    def test_background_wait_timeout_is_operation_polling_ambiguity(self):
+        operation_id = "8" * 32
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
+            202,
+            accepted_derived_background_response(
+                operation_id,
+                name="slow_places",
+                action="refresh",
+            ),
         )
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
             store = self.configured_store(directory, server.endpoint)
@@ -2816,7 +3068,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(EXIT_CONNECTIVITY, code)
         self.assertEqual("", stdout)
-        payload = json.loads(stderr)
+        payload = final_json_document(stderr)
         self.assertEqual("operation.wait_timeout", payload["code"])
         self.assertTrue(payload["details"]["indeterminate"])
         self.assertEqual(
@@ -2828,14 +3080,15 @@ class CliTests(unittest.TestCase):
         )
 
     def test_background_poll_interruption_retains_reconciliation_identity(self):
+        operation_id = "9" * 32
         routes = standard_routes()
         routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
             202,
-            {"operation": {
-                "id": "derived-op-interrupted",
-                "kind": "derived-layer.refresh",
-                "status": "running",
-            }},
+            accepted_derived_background_response(
+                operation_id,
+                name="slow_places",
+                action="refresh",
+            ),
         )
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
             store = self.configured_store(directory, server.endpoint)
@@ -2853,18 +3106,37 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, EXIT_INTERRUPTED)
         self.assertEqual(stdout, "")
-        payload = json.loads(stderr)
+        payload = final_json_document(stderr)
         self.assertEqual(payload["code"], "operation.poll_interrupted")
         self.assertEqual(
             payload["details"]["operationId"],
-            "derived-op-interrupted",
+            operation_id,
         )
         self.assertTrue(payload["details"]["reconciliation"]["required"])
 
     def test_background_malformed_poll_retains_reconciliation_identity(self):
-        operation_id = "derived-op-malformed"
+        operation_id = "a" * 32
         poll_responses = (
             {"operation": {"id": "different-operation", "status": "running"}},
+            {
+                "operation": {
+                    "id": operation_id,
+                    "kind": "derived-layer.replace",
+                    "target": {
+                        "name": "slow_places",
+                        "action": "replace",
+                    },
+                    "status": "running",
+                }
+            },
+            {
+                "operation": {
+                    "id": operation_id,
+                    "kind": "derived-layer.refresh",
+                    "target": {"name": "other", "action": "refresh"},
+                    "status": "running",
+                }
+            },
             {
                 "operation": {
                     "id": operation_id,
@@ -2887,11 +3159,11 @@ class CliTests(unittest.TestCase):
                 routes = standard_routes()
                 routes[("POST", "/api/derived-layers/slow_places/refresh")] = (
                     202,
-                    {"operation": {
-                        "id": operation_id,
-                        "kind": "derived-layer.refresh",
-                        "status": "running",
-                    }},
+                    accepted_derived_background_response(
+                        operation_id,
+                        name="slow_places",
+                        action="refresh",
+                    ),
                 )
                 routes[("GET", f"/api/operations/{operation_id}")] = (
                     200,
@@ -2918,10 +3190,16 @@ class CliTests(unittest.TestCase):
                         for request in server.requests
                         if request["method"] == "POST"
                     ]
+                    poll_requests = [
+                        request
+                        for request in server.requests
+                        if request["path"]
+                        == f"/api/operations/{operation_id}"
+                    ]
 
                 self.assertEqual(code, EXIT_CONNECTIVITY)
                 self.assertEqual(stdout, "")
-                payload = json.loads(stderr)
+                payload = final_json_document(stderr)
                 self.assertEqual(payload["code"], "operation.poll_failed")
                 self.assertEqual(payload["details"]["operationId"], operation_id)
                 self.assertIn(
@@ -2939,18 +3217,41 @@ class CliTests(unittest.TestCase):
                     [operation_id],
                 )
                 self.assertEqual(len(mutation_requests), 1)
+                self.assertEqual(len(poll_requests), 1)
 
     def test_background_malformed_initial_operation_prohibits_resubmission(self):
         route = ("POST", "/api/derived-layers/slow_places/refresh")
-        malformed_operations = (
-            {"status": "running"},
-            {"id": "", "status": "running"},
-            {"id": 7, "status": "running"},
+        operation_id = "b" * 32
+        malformed_submissions = (
+            {"operation": {"status": "running"}},
+            {"operation": {"id": "", "status": "running"}},
+            {"operation": {"id": 7, "status": "running"}},
+            {
+                "operation": {
+                    "id": operation_id,
+                    "kind": "derived-layer.refresh",
+                    "status": "running",
+                    "target": {"name": "other", "action": "refresh"},
+                },
+                "statusUrl": f"/api/operations/{operation_id}",
+            },
+            {
+                "operation": {
+                    "id": operation_id,
+                    "kind": "derived-layer.refresh",
+                    "status": "running",
+                    "target": {
+                        "name": "slow_places",
+                        "action": "refresh",
+                    },
+                },
+                "statusUrl": "/api/operations/substituted",
+            },
         )
-        for operation in malformed_operations:
-            with self.subTest(operation=operation):
+        for submitted in malformed_submissions:
+            with self.subTest(submitted=submitted):
                 routes = standard_routes()
-                routes[route] = (202, {"operation": operation})
+                routes[route] = (202, submitted)
                 with (
                     tempfile.TemporaryDirectory() as directory,
                     JsonServer(routes) as server,
@@ -2967,6 +3268,12 @@ class CliTests(unittest.TestCase):
                         request
                         for request in server.requests
                         if (request["method"], request["path"]) == route
+                    ]
+                    poll_requests = [
+                        request
+                        for request in server.requests
+                        if request["method"] == "GET"
+                        and request["path"].startswith("/api/operations/")
                     ]
 
                 self.assertEqual(code, EXIT_CONNECTIVITY)
@@ -2989,6 +3296,7 @@ class CliTests(unittest.TestCase):
                     failure["details"]["reconciliation"]["automaticRetry"]
                 )
                 self.assertEqual(len(mutation_requests), 1)
+                self.assertEqual(poll_requests, [])
 
     def test_derived_mutation_ambiguous_http_status_is_indeterminate(self):
         route = ("POST", "/api/derived-layers/slow_places/refresh")
@@ -4294,6 +4602,13 @@ class CliTests(unittest.TestCase):
                     "--alias", "MAPP",
                     "--schema", "leeds",
                     "--relation", "areas",
+                ],
+            ),
+            (
+                "derived-layers plan",
+                [
+                    "derived-layers", "plan",
+                    "--input", "missing.json",
                 ],
             ),
             (
@@ -7407,6 +7722,7 @@ class CliTests(unittest.TestCase):
                 "operation": {
                     "id": "op-1",
                     "kind": "visual.test",
+                    "target": {},
                     "status": "succeeded",
                     "result": {"visual": {"passed": True}},
                 },
@@ -7434,32 +7750,78 @@ class CliTests(unittest.TestCase):
             json.loads(operation_out)["operation"]["status"],
         )
 
+    def test_explicit_operation_commands_reject_cross_wired_operation_ids(self):
+        cases = (
+            ("show", ["operations", "show", "op-requested"], "GET"),
+            ("wait", ["operations", "wait", "op-requested"], "GET"),
+            (
+                "cancel",
+                ["operations", "cancel", "op-requested", "--confirm"],
+                "POST",
+            ),
+        )
+        for action, arguments, method in cases:
+            with self.subTest(action=action):
+                routes = standard_routes()
+                path = (
+                    "/api/operations/op-requested/cancel"
+                    if action == "cancel"
+                    else "/api/operations/op-requested"
+                )
+                routes[(method, path)] = (
+                    202 if action == "cancel" else 200,
+                    {"operation": {
+                        "id": "op-substituted",
+                        "kind": "derived-layer.refresh",
+                        "status": (
+                            "cancelling" if action == "cancel" else "succeeded"
+                        ),
+                        "result": {"derivedLayer": {"name": "other"}},
+                    }},
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(arguments, store)
+
+                self.assertEqual(EXIT_CONNECTIVITY, code)
+                self.assertEqual("", stdout)
+                self.assertEqual(
+                    "operation.invalid_response",
+                    json.loads(stderr)["code"],
+                )
+
     def test_operation_wait_progress_emits_only_status_and_stage_changes(self):
         operation_id = "f" * 32
         responses = iter((
             {
                 "id": operation_id,
                 "kind": "derived-layer.create",
+                "target": {"name": "private_layer"},
                 "status": "running",
                 "stage": "waiting-for-worker",
-                "target": {"name": "private_layer"},
                 "diagnostics": {"private": "must-not-be-printed"},
             },
             {
                 "id": operation_id,
                 "kind": "derived-layer.create",
+                "target": {"name": "private_layer"},
                 "status": "running",
                 "stage": "waiting-for-worker",
             },
             {
                 "id": operation_id,
                 "kind": "derived-layer.create",
+                "target": {"name": "private_layer"},
                 "status": "running",
                 "stage": "database-transaction",
             },
             {
                 "id": operation_id,
                 "kind": "derived-layer.create",
+                "target": {"name": "private_layer"},
                 "status": "succeeded",
                 "stage": "result-reporting",
                 "result": {"derivedLayer": {"name": "private_layer"}},
@@ -7495,6 +7857,74 @@ class CliTests(unittest.TestCase):
         )
         self.assertNotIn("private_layer", stderr)
         self.assertNotIn("must-not-be-printed", stderr)
+
+    def test_explicit_operation_follow_rejects_kind_or_target_drift(self):
+        cases = (
+            ("wait", "kind"),
+            ("cancel", "target"),
+        )
+        for action, drift in cases:
+            with self.subTest(action=action, drift=drift):
+                operation_id = f"op-{action}-binding"
+                initial = {
+                    "id": operation_id,
+                    "kind": "derived-layer.create",
+                    "target": {"name": "bound", "action": "create"},
+                    "status": (
+                        "running" if action == "wait" else "cancelling"
+                    ),
+                }
+                changed = {
+                    **initial,
+                    "status": "succeeded" if action == "wait" else "cancelled",
+                }
+                if drift == "kind":
+                    changed["kind"] = "derived-layer.replace"
+                else:
+                    changed["target"] = {
+                        "name": "other",
+                        "action": "create",
+                    }
+                routes = standard_routes()
+                if action == "wait":
+                    responses = iter((initial, changed))
+                    routes[("GET", f"/api/operations/{operation_id}")] = (
+                        lambda _request: (200, {"operation": next(responses)})
+                    )
+                    arguments = [
+                        "operations", "wait", operation_id,
+                        "--interval", "0.001",
+                    ]
+                else:
+                    routes[(
+                        "POST",
+                        f"/api/operations/{operation_id}/cancel",
+                    )] = (202, {"operation": initial})
+                    routes[("GET", f"/api/operations/{operation_id}")] = (
+                        200,
+                        {"operation": changed},
+                    )
+                    arguments = [
+                        "operations", "cancel", operation_id,
+                        "--confirm", "--interval", "0.001",
+                    ]
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    with patch(
+                        "mapp_config_cli.cli.time.sleep",
+                        return_value=None,
+                    ):
+                        code, stdout, stderr = self.invoke(arguments, store)
+
+                self.assertEqual(EXIT_CONNECTIVITY, code)
+                self.assertEqual("", stdout)
+                self.assertEqual(
+                    "operation.invalid_response",
+                    json.loads(stderr)["code"],
+                )
 
     def test_capability_discovery_rejects_target_identity_and_version_drift(self):
         valid_action = {
@@ -7591,6 +8021,7 @@ class CliTests(unittest.TestCase):
                 "operation": {
                     "id": "op-failed",
                     "kind": "visual.test",
+                    "target": {},
                     "status": "failed",
                     "error": {"code": "visual.failed", "message": "No canvas."},
                 }
@@ -7616,6 +8047,7 @@ class CliTests(unittest.TestCase):
             {"operation": {
                 "id": "op-cancel",
                 "kind": "derived-layer.create",
+                "target": {"name": "layer", "action": "create"},
                 "status": "cancelling",
             }},
         )
@@ -7624,6 +8056,7 @@ class CliTests(unittest.TestCase):
             {"operation": {
                 "id": "op-cancel",
                 "kind": "derived-layer.create",
+                "target": {"name": "layer", "action": "create"},
                 "status": "cancelled",
                 "error": {
                     "code": "derived_layer.cancelled",
@@ -7649,6 +8082,60 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual({"confirmed": True}, cancel_request["body"])
 
+    def test_operation_cancel_interruption_retains_reconciliation_identity(self):
+        routes = standard_routes()
+        routes[("POST", "/api/operations/op-cancel/cancel")] = (
+            202,
+            {"operation": {
+                "id": "op-cancel",
+                "kind": "derived-layer.create",
+                "target": {"name": "layer", "action": "create"},
+                "status": "cancelling",
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch(
+                "mapp_config_cli.cli.time.sleep",
+                side_effect=KeyboardInterrupt,
+            ):
+                code, stdout, stderr = self.invoke(
+                    ["operations", "cancel", "op-cancel", "--confirm"],
+                    store,
+                )
+
+        self.assertEqual(EXIT_INTERRUPTED, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("operation.poll_interrupted", payload["code"])
+        self.assertEqual("op-cancel", payload["details"]["operationId"])
+        self.assertTrue(payload["details"]["reconciliation"]["required"])
+
+    def test_operation_cancel_post_interruption_retains_reconciliation_identity(self):
+        original_request = ApiClient.request
+
+        def interrupt_cancel(client, path, *args, **kwargs):
+            if path == "/api/operations/op-cancel/cancel":
+                raise KeyboardInterrupt
+            return original_request(client, path, *args, **kwargs)
+
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch.object(ApiClient, "request", new=interrupt_cancel):
+                code, stdout, stderr = self.invoke(
+                    ["operations", "cancel", "op-cancel", "--confirm"],
+                    store,
+                )
+
+        self.assertEqual(EXIT_INTERRUPTED, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("operation.poll_interrupted", payload["code"])
+        self.assertEqual("op-cancel", payload["details"]["operationId"])
+        self.assertEqual("unknown", payload["details"]["status"])
+        self.assertTrue(payload["details"]["reconciliation"]["required"])
+
     def test_operation_wait_reports_cancelled_as_conflict(self):
         routes = standard_routes()
         routes[("GET", "/api/operations/op-cancelled")] = (
@@ -7656,6 +8143,7 @@ class CliTests(unittest.TestCase):
             {"operation": {
                 "id": "op-cancelled",
                 "kind": "derived-layer.refresh",
+                "target": {},
                 "status": "cancelled",
                 "error": {
                     "code": "derived_layer.cancelled",
@@ -7682,10 +8170,17 @@ class CliTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
             store = self.configured_store(directory, server.endpoint)
-            code, stdout, stderr = self.invoke(
-                ["operations", "wait", "op-lost"],
-                store,
-            )
+            with (
+                patch("mapp_config_cli.cli.time.sleep", return_value=None),
+                patch(
+                    "mapp_config_cli.cli.time.monotonic",
+                    side_effect=[0.0, 31.0],
+                ),
+            ):
+                code, stdout, stderr = self.invoke(
+                    ["operations", "wait", "op-lost"],
+                    store,
+                )
 
         self.assertEqual(EXIT_CONNECTIVITY, code)
         self.assertEqual("", stdout)
@@ -7701,6 +8196,42 @@ class CliTests(unittest.TestCase):
             payload["details"]["reconciliation"]["automaticRetry"],
         )
 
+    def test_operation_wait_interruption_retains_reconciliation_identity(self):
+        routes = standard_routes()
+        routes[("GET", "/api/operations/op-interrupted")] = (
+            200,
+            {"operation": {
+                "id": "op-interrupted",
+                "kind": "derived-layer.refresh",
+                "target": {},
+                "status": "running",
+                "stage": "waiting-for-worker",
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch(
+                "mapp_config_cli.cli.time.sleep",
+                side_effect=KeyboardInterrupt,
+            ):
+                code, stdout, stderr = self.invoke(
+                    ["operations", "wait", "op-interrupted"],
+                    store,
+                )
+
+        self.assertEqual(EXIT_INTERRUPTED, code)
+        self.assertEqual("", stdout)
+        payload = json.loads(stderr)
+        self.assertEqual("operation.poll_interrupted", payload["code"])
+        self.assertEqual(
+            "op-interrupted",
+            payload["details"]["operationId"],
+        )
+        self.assertTrue(payload["details"]["reconciliation"]["required"])
+        self.assertFalse(
+            payload["details"]["reconciliation"]["automaticRetry"],
+        )
+
     def test_operation_wait_timeout_is_operation_polling_ambiguity(self):
         routes = standard_routes()
         routes[("GET", "/api/operations/op-running")] = (
@@ -7708,6 +8239,7 @@ class CliTests(unittest.TestCase):
             {"operation": {
                 "id": "op-running",
                 "kind": "derived-layer.refresh",
+                "target": {},
                 "status": "running",
             }},
         )
@@ -7753,6 +8285,7 @@ class CliTests(unittest.TestCase):
             {"operation": {
                 "id": "op-derived-show",
                 "kind": "derived-layer.refresh",
+                "target": {},
                 "status": "failed",
                 "error": operation_error,
             }},
@@ -7797,6 +8330,7 @@ class CliTests(unittest.TestCase):
             {"operation": {
                 "id": "op-derived-failed",
                 "kind": "derived-layer.refresh",
+                "target": {},
                 "status": "failed",
                 "error": operation_error,
             }},
@@ -7846,6 +8380,7 @@ class CliTests(unittest.TestCase):
             {"operation": {
                 "id": "op-derived-uncertain",
                 "kind": "derived-layer.create",
+                "target": {},
                 "status": "indeterminate",
                 "error": operation_error,
             }},
@@ -7892,6 +8427,7 @@ class CliTests(unittest.TestCase):
             {"operation": {
                 "id": "op-derived-database",
                 "kind": "derived-layer.create",
+                "target": {},
                 "status": "failed",
                 "error": operation_error,
             }},
@@ -7944,6 +8480,7 @@ class CliTests(unittest.TestCase):
             {"operation": {
                 "id": "op-derived-contention",
                 "kind": "derived-layer.create",
+                "target": {},
                 "status": "failed",
                 "error": operation_error,
             }},

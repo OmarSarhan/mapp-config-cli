@@ -74,9 +74,11 @@ Agents can inspect deployed action schemas with `config-cli capabilities
 list`, correlate responses through `meta.requestId`, and inspect durable
 visual, reload, apply, and background derived-layer outcomes with `config-cli
 operations show|wait|cancel`. `derived-layers jobs` discovers admitted derived
-work; `--background --detach` returns its validated operation handle, and
-`operations wait ID --progress` follows safe status/stage transitions without
-changing the final JSON result. The server contract's exact command list and
+work. `--background` follows its durable operation without a fixed queue
+deadline, reports safe status/stage transitions on stderr, and retries only
+transient status GETs—not the mutation POST. `--background --detach` returns a
+validated operation handle, and `operations wait ID --progress` can follow it
+without changing final stdout JSON. The server contract's exact command list and
 `/api/capabilities` action schemas are complementary runtime authorities; the
 CLI fails closed when either required declaration is absent instead of calling
 a familiar route directly.

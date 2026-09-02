@@ -736,15 +736,21 @@ its EWKB result to `ST_GeomFromEWKB(...)`, not
 `ST_GeomFromWKB(..., 4326)`. The mismatch emits one warning per
 evaluated/generated cell and can flood PostgreSQL logs. Use synchronous
 derived-layer commands first for normal jobs. For a known slow materialized
-create, replace, or refresh, add
-`--background`; the CLI polls the durable operation automatically. If its
-local wait expires, continue with `operations wait OPERATION_ID`; the server
-work was not cancelled. The CLI labels this observation
+create, replace, or refresh, add `--background`; unless explicitly detached,
+the CLI follows the durable operation without a fixed queue deadline and
+prints safe status/stage transitions to stderr. Supply a positive
+`--wait-timeout` only when the local caller needs a deadline. During following,
+the CLI retries only the idempotent status GET across a bounded transient
+connectivity, HTTP 408/429, or HTTP 5xx outage; it never repeats the mutation
+POST. If polling stops, continue with `operations wait OPERATION_ID`; the
+server work was not cancelled. The CLI labels this observation
 `failurePhase: "operation-polling"`. To stop a background derived create,
 replace, or refresh, run
 `operations cancel OPERATION_ID --confirm`. The command waits for server status
-`cancelled`, which is recorded only after PostgreSQL rolls back; `cancelling`
-alone is not proof that the database work stopped. If a synchronous request
+`cancelled`, which proves safe cancellation; `cancelling` alone is not proof
+that the database work stopped. Inspect the terminal `failurePhase`: preflight
+means no database transaction started, while `database-transaction` with
+`rolledBack: true` proves PostgreSQL rolled back. If a synchronous request
 times out or
 returns an unclassified or malformed HTTP `5xx`, the CLI uses
 `failurePhase: "request-response"`: it cannot infer whether the server reached
@@ -757,12 +763,20 @@ automatically.
 When several reviewed background mutations must be managed, inspect
 `derived-layers jobs`, then submit each with `--background --detach`. Preserve
 every returned operation ID and follow it with
-`operations wait OPERATION_ID --progress --wait-timeout 1860`. The
+`operations wait OPERATION_ID`; it also waits without a fixed deadline unless
+an explicit positive `--wait-timeout` is supplied. The
 `waiting-for-worker` stage is admitted durable work, not a failed request; do
-not submit it again. `--progress` reports only status/stage transitions on
-stderr and leaves the final JSON result on stdout unchanged. A local wait
-timeout or interruption does not cancel the operation and never authorizes an
-automatic mutation retry.
+not submit it again. Add `--progress` for explicit wait status/stage
+transitions; implicit derived background following enables those transitions
+by default. Progress stays on stderr and final JSON stays on stdout. A local
+timeout, prolonged polling outage, or interruption does not cancel the
+operation and never authorizes an automatic mutation retry.
+Create and replace can report `source-revalidation`, which rechecks semantic
+source readiness after the queue wait. Only a fingerprinted create can then
+report `plan-revalidation`, which reruns the reviewed database plan binding.
+Refresh advances from the queue directly to `database-transaction`. The
+revalidation stages make no database change; `database-transaction` is the
+mutation boundary.
 
 `derived_layer.database_contention` is different from an ambiguous timeout.
 When it has `stateUnchanged: true`, `retryable: true`, and

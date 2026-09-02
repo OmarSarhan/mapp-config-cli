@@ -90,6 +90,8 @@ MAX_VISUAL_ARTIFACT_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_LAYER_STATISTICS_BINS = 50
 MAX_LAYER_STATISTICS_CUTS = 20
 _LOCAL_READ_CHUNK_BYTES = 64 * 1024
+_OPERATION_POLL_RETRY_WINDOW_SECONDS = 30.0
+_OPERATION_POLL_MAX_BACKOFF_SECONDS = 5.0
 
 
 def _posix_fchmod(descriptor: int, mode: int) -> None:
@@ -652,8 +654,11 @@ def parser() -> JsonArgumentParser:
         background_action.add_argument(
             "--wait-timeout",
             type=finite_float,
-            default=1860,
-            help="Local seconds to wait for background completion (default: 1860).",
+            default=None,
+            help=(
+                "Optional positive local completion deadline in seconds; "
+                "by default the CLI follows admitted work until it finishes."
+            ),
         )
         background_action.add_argument(
             "--interval",
@@ -1083,7 +1088,15 @@ def parser() -> JsonArgumentParser:
     operation_show.add_argument("id")
     operation_wait = operation_actions.add_parser("wait")
     operation_wait.add_argument("id")
-    operation_wait.add_argument("--wait-timeout", type=float, default=120)
+    operation_wait.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Optional positive local completion deadline in seconds; "
+            "by default wait until the durable operation finishes."
+        ),
+    )
     operation_wait.add_argument("--interval", type=float, default=1)
     operation_wait.add_argument(
         "--progress",
@@ -1891,15 +1904,26 @@ def _terminal_operation_error(
     )
 
 
-def _validate_background_wait(wait_timeout: float, interval: float) -> None:
+def _validate_background_wait(
+    wait_timeout: float | None,
+    interval: float,
+) -> None:
     if (
-        not math.isfinite(wait_timeout)
-        or wait_timeout <= 0
+        (
+            wait_timeout is not None
+            and (
+                not math.isfinite(wait_timeout)
+                or wait_timeout <= 0
+            )
+        )
         or not math.isfinite(interval)
         or interval <= 0
     ):
         raise CliError(
-            "Operation wait timeout and interval must be finite and positive.",
+            (
+                "Operation wait timeout, when supplied, and interval must be "
+                "finite and positive."
+            ),
             EXIT_USAGE,
             error_code="operation.invalid_wait",
         )
@@ -1984,6 +2008,62 @@ def _background_poll_error(
             else "operation.poll_failed"
         ),
     )
+
+
+def _retryable_operation_poll_error(error: CliError) -> bool:
+    """Classify only transient failures from an idempotent operation GET."""
+    if error.error_code in {"api.transport_error", "api.unreachable"}:
+        return True
+    status = error.http_status
+    return status in {408, 429} or (
+        isinstance(status, int) and 500 <= status <= 599
+    )
+
+
+def _poll_operation_status(
+    client: ApiClient,
+    operation_id: str,
+    *,
+    last_status: Any,
+    interval: float,
+    deadline: float | None,
+) -> dict[str, Any]:
+    """Retry only the safe status GET during a bounded transient outage."""
+    retry_started: float | None = None
+    retry_number = 0
+    path = f"/api/operations/{quote_segment(operation_id)}"
+    while True:
+        try:
+            return client.request(path)
+        except CliError as exc:
+            if not _retryable_operation_poll_error(exc):
+                raise _background_poll_error(
+                    operation_id,
+                    last_status,
+                    cause=exc,
+                ) from exc
+
+            now = time.monotonic()
+            if retry_started is None:
+                retry_started = now
+            retry_deadline = retry_started + _OPERATION_POLL_RETRY_WINDOW_SECONDS
+            if deadline is not None:
+                retry_deadline = min(retry_deadline, deadline)
+            if now >= retry_deadline:
+                raise _background_poll_error(
+                    operation_id,
+                    last_status,
+                    cause=exc,
+                ) from exc
+
+            base_delay = max(interval, 0.05)
+            delay = min(
+                base_delay * (2 ** min(retry_number, 16)),
+                _OPERATION_POLL_MAX_BACKOFF_SECONDS,
+                retry_deadline - now,
+            )
+            retry_number += 1
+            time.sleep(delay)
 
 
 def _derived_mutation_indeterminate(
@@ -2396,7 +2476,7 @@ def _accepted_derived_background_operation(
     name: str,
     action: str,
 ) -> dict[str, Any]:
-    """Validate that a detached mutation returned its bound durable handle."""
+    """Validate that a background mutation returned its bound durable handle."""
     operation = submitted.get("operation")
     operation_id = operation.get("id") if isinstance(operation, dict) else None
     target = operation.get("target") if isinstance(operation, dict) else None
@@ -2412,7 +2492,7 @@ def _accepted_derived_background_operation(
         or submitted.get("statusUrl") != f"/api/operations/{operation_id}"
     ):
         raise _invalid_response(
-            "Detached derived-layer operation",
+            "Accepted derived-layer background operation",
             submitted,
             error_code="operation.invalid_response",
         )
@@ -2423,8 +2503,10 @@ def _complete_background_operation(
     client: ApiClient,
     submitted: dict[str, Any],
     *,
-    wait_timeout: float,
+    wait_timeout: float | None,
     interval: float,
+    progress_stream: TextIO | None = None,
+    expected_operation: dict[str, Any] | None = None,
     failed_exit_code: int = EXIT_VALIDATION,
     failed_message: str = "Derived-layer background operation failed.",
     indeterminate_message: str = (
@@ -2448,12 +2530,37 @@ def _complete_background_operation(
             submitted,
             error_code="operation.invalid_response",
         )
-    deadline = time.monotonic() + wait_timeout
+    expected_kind = (
+        expected_operation.get("kind")
+        if isinstance(expected_operation, dict)
+        else None
+    )
+    expected_target = (
+        expected_operation.get("target")
+        if isinstance(expected_operation, dict)
+        else None
+    )
+    deadline = (
+        time.monotonic() + wait_timeout
+        if wait_timeout is not None
+        else None
+    )
     last_status: Any = operation.get("status")
+    progress_state: tuple[str, str | None] | None = None
     try:
         while True:
             status = operation.get("status")
             last_status = status
+            if (
+                progress_stream is not None
+                and isinstance(operation.get("stage"), str)
+                and bool(operation["stage"])
+            ):
+                progress_state = _emit_operation_progress(
+                    operation,
+                    progress_stream,
+                    progress_state,
+                )
             if status in {"succeeded", "failed", "cancelled", "indeterminate"}:
                 if status == "succeeded":
                     result = operation.get("result")
@@ -2494,8 +2601,12 @@ def _complete_background_operation(
                     status,
                     cause=invalid,
                 ) from invalid
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = (
+                deadline - time.monotonic()
+                if deadline is not None
+                else None
+            )
+            if remaining is not None and remaining <= 0:
                 detached = _background_poll_error(operation_id, status)
                 raise CliError(
                     wait_message,
@@ -2503,21 +2614,32 @@ def _complete_background_operation(
                     details=detached.safe_details,
                     error_code="operation.wait_timeout",
                 )
-            time.sleep(min(interval, remaining))
-            try:
-                polled = client.request(
-                    f"/api/operations/{quote_segment(operation_id)}"
-                )
-            except CliError as exc:
-                raise _background_poll_error(
-                    operation_id,
-                    status,
-                    cause=exc,
-                ) from exc
+            time.sleep(
+                min(interval, remaining)
+                if remaining is not None
+                else interval
+            )
+            polled = _poll_operation_status(
+                client,
+                operation_id,
+                last_status=status,
+                interval=interval,
+                deadline=deadline,
+            )
             operation = polled.get("operation")
             if (
                 not isinstance(operation, dict)
                 or operation.get("id") != operation_id
+                or (
+                    expected_operation is not None
+                    and (
+                        operation.get("kind") != expected_kind
+                        or not _canonical_json_equal(
+                            operation.get("target"),
+                            expected_target,
+                        )
+                    )
+                )
             ):
                 invalid = _invalid_response(
                     "Background operation",
@@ -4231,6 +4353,8 @@ _DERIVED_BACKGROUND_KINDS = {
 }
 _DERIVED_BACKGROUND_STAGES = {
     "waiting-for-worker",
+    "source-revalidation",
+    "plan-revalidation",
     "database-transaction",
     "result-reporting",
 }
@@ -4238,7 +4362,11 @@ _DERIVED_BACKGROUND_STAGES = {
 
 def _derived_background_jobs(data: dict[str, Any]) -> dict[str, Any]:
     jobs = data.get("backgroundJobs")
-    if not isinstance(jobs, dict) or set(jobs) != _DERIVED_BACKGROUND_JOB_KEYS:
+    if (
+        not _has_exact_response_keys(data, {"backgroundJobs"})
+        or not isinstance(jobs, dict)
+        or set(jobs) != _DERIVED_BACKGROUND_JOB_KEYS
+    ):
         raise _invalid_response(
             "Derived-layer background jobs",
             data,
@@ -4257,7 +4385,7 @@ def _derived_background_jobs(data: dict[str, Any]) -> dict[str, Any]:
         or len(observed_at) > 128
         or not _nonnegative_integer(active_jobs)
         or not _nonnegative_integer(max_active_jobs)
-        or max_active_jobs == 0
+        or not 1 <= max_active_jobs <= 4
         or not _nonnegative_integer(executing_jobs)
         or not _nonnegative_integer(waiting_jobs)
         or active_jobs > max_active_jobs
@@ -4304,6 +4432,11 @@ def _derived_background_jobs(data: dict[str, Any]) -> dict[str, Any]:
             or kind not in _DERIVED_BACKGROUND_KINDS
             or operation["status"] not in {"running", "cancelling"}
             or stage not in _DERIVED_BACKGROUND_STAGES
+            or (
+                stage == "source-revalidation"
+                and action not in {"create", "replace"}
+            )
+            or (stage == "plan-revalidation" and action != "create")
             or not isinstance(operation["created"], str)
             or not operation["created"]
             or operation["created"] != operation["created"].strip()
@@ -6623,37 +6756,81 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
     if args.command == "operations":
         if args.action in {"wait", "cancel"}:
             _validate_background_wait(args.wait_timeout, args.interval)
-            deadline = time.monotonic() + args.wait_timeout
+            deadline = (
+                time.monotonic() + args.wait_timeout
+                if args.wait_timeout is not None
+                else None
+            )
         operation_response: dict[str, Any] | None = None
         if args.action == "cancel":
-            operation_response = client.request(
-                f"/api/operations/{quote_segment(args.id)}/cancel",
-                method="POST",
-                payload={"confirmed": True},
-            )
+            try:
+                operation_response = client.request(
+                    f"/api/operations/{quote_segment(args.id)}/cancel",
+                    method="POST",
+                    payload={"confirmed": True},
+                )
+            except KeyboardInterrupt as exc:
+                raise _background_poll_error(
+                    args.id,
+                    "unknown",
+                    interrupted=True,
+                ) from exc
         last_status: Any = "unknown"
         progress_state: tuple[str, str | None] | None = None
+        operation_binding: tuple[str, dict[str, Any]] | None = None
         while True:
             if operation_response is None:
-                try:
-                    operation_response = client.request(
-                        f"/api/operations/{quote_segment(args.id)}"
-                    )
-                except CliError as exc:
-                    if args.action in {"wait", "cancel"}:
+                if args.action in {"wait", "cancel"}:
+                    try:
+                        operation_response = _poll_operation_status(
+                            client,
+                            args.id,
+                            last_status=last_status,
+                            interval=args.interval,
+                            deadline=deadline,
+                        )
+                    except KeyboardInterrupt as exc:
                         raise _background_poll_error(
                             args.id,
                             last_status,
-                            cause=exc,
+                            interrupted=True,
                         ) from exc
-                    raise
+                else:
+                    operation_response = client.request(
+                        f"/api/operations/{quote_segment(args.id)}"
+                    )
             operation = operation_response.get("operation")
-            if not isinstance(operation, dict) or not isinstance(operation.get("status"), str):
+            operation_kind = (
+                operation.get("kind") if isinstance(operation, dict) else None
+            )
+            operation_target = (
+                operation.get("target") if isinstance(operation, dict) else None
+            )
+            if (
+                not isinstance(operation, dict)
+                or operation.get("id") != args.id
+                or not isinstance(operation.get("status"), str)
+                or not isinstance(operation_kind, str)
+                or not operation_kind.strip()
+                or not isinstance(operation_target, dict)
+                or (
+                    operation_binding is not None
+                    and (
+                        operation_kind != operation_binding[0]
+                        or not _canonical_json_equal(
+                            operation_target,
+                            operation_binding[1],
+                        )
+                    )
+                )
+            ):
                 raise _invalid_response(
                     "Operation",
                     operation_response,
                     error_code="operation.invalid_response",
                 )
+            if operation_binding is None:
+                operation_binding = (operation_kind, operation_target)
             last_status = operation["status"]
             if (
                 args.action != "show"
@@ -6714,7 +6891,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                         error_code="operation.cancel_not_applied",
                     )
                 return _with_context(operation_response, context)
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 message = (
                     "Cancellation was requested, but the operation did not reach "
                     "a terminal state before the local wait timeout."
@@ -6733,7 +6910,23 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     },
                     error_code="operation.wait_timeout",
                 )
-            time.sleep(args.interval)
+            remaining = (
+                deadline - time.monotonic()
+                if deadline is not None
+                else None
+            )
+            try:
+                time.sleep(
+                    min(args.interval, max(0.0, remaining))
+                    if remaining is not None
+                    else args.interval
+                )
+            except KeyboardInterrupt as exc:
+                raise _background_poll_error(
+                    args.id,
+                    last_status,
+                    interrupted=True,
+                ) from exc
             operation_response = None
 
     if args.command == "doctor":
@@ -8178,10 +8371,11 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 action=args.action,
                 payload=payload,
             )
-            if args.background and args.detach:
+            accepted_operation: dict[str, Any] | None = None
+            if args.background:
                 submitted = result
                 try:
-                    _accepted_derived_background_operation(
+                    accepted_operation = _accepted_derived_background_operation(
                         submitted,
                         name=mutation_name,
                         action=args.action,
@@ -8193,6 +8387,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                         response=submitted,
                         cause=exc,
                     ) from exc
+            if args.background and args.detach:
                 return _with_context(submitted, context)
             background_operation_id = None
             if args.background:
@@ -8203,6 +8398,12 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                         submitted,
                         wait_timeout=args.wait_timeout,
                         interval=args.interval,
+                        expected_operation=accepted_operation,
+                        progress_stream=getattr(
+                            args,
+                            "prompt_stream",
+                            sys.stderr,
+                        ),
                     )
                 except CliError as exc:
                     if exc.error_code != "operation.invalid_response":
@@ -8252,10 +8453,11 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 action=args.action,
                 payload={"confirmed": True, **({"background": True} if background else {})},
             )
-            if background and args.detach:
+            accepted_operation = None
+            if background:
                 submitted = result
                 try:
-                    _accepted_derived_background_operation(
+                    accepted_operation = _accepted_derived_background_operation(
                         submitted,
                         name=args.name,
                         action=args.action,
@@ -8267,6 +8469,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                         response=submitted,
                         cause=exc,
                     ) from exc
+            if background and args.detach:
                 return _with_context(submitted, context)
             background_operation_id = None
             if background:
@@ -8277,6 +8480,12 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                         submitted,
                         wait_timeout=args.wait_timeout,
                         interval=args.interval,
+                        expected_operation=accepted_operation,
+                        progress_stream=getattr(
+                            args,
+                            "prompt_stream",
+                            sys.stderr,
+                        ),
                     )
                 except CliError as exc:
                     if exc.error_code != "operation.invalid_response":

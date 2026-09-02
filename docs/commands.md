@@ -324,7 +324,7 @@ Inspect or wait for a durable operation:
 
 ```sh
 config-cli operations show OPERATION_ID
-config-cli operations wait OPERATION_ID --progress --wait-timeout 120 --interval 1
+config-cli operations wait OPERATION_ID --progress --interval 1
 config-cli operations cancel OPERATION_ID --confirm --wait-timeout 120 --interval 1
 ```
 
@@ -332,19 +332,30 @@ Terminal states are `succeeded`, `failed`, `cancelled`, and `indeterminate`.
 Never blindly retry an indeterminate apply or reload. Background derived-layer
 create, replace, and refresh jobs are durable operations and require `derive`
 to inspect or cancel. Cancellation first reports nonterminal `cancelling`; the
-CLI returns success only after the server reports `cancelled`, proving the
-database transaction rolled back. If commit already won the race, cancellation
-fails and the original terminal result remains authoritative. A late
+CLI returns success only after the server reports `cancelled`, proving safe
+cancellation. In the terminal evidence, preflight means a transaction never
+started; `database-transaction` plus `rolledBack: true` proves rollback. If
+commit already won the race, cancellation fails and the original terminal
+result remains authoritative. A late
 derived-layer reporting failure may follow a committed database transaction,
 so reconcile the operation, managed-layer registry, and catalog before
-retrying. Wait and cancel default to a 120-second wait timeout and a one-second
-polling interval. A lost poll or local wait timeout returns
+retrying. Wait has no fixed completion deadline by default; use a positive
+`--wait-timeout` when the caller needs one. Cancel retains its 120-second
+default, and both use a one-second polling interval. Wait retries only safe
+status GETs during a bounded transient connection/408/429/5xx outage. A
+prolonged lost poll or local wait timeout returns
 `indeterminate: true`, `failurePhase: "operation-polling"`, the operation ID,
 and reconciliation commands with automatic retry disabled. `--progress` writes
 only safely encoded status/stage transitions to stderr; the single final JSON
 result on stdout is unchanged. A `waiting-for-worker` stage means the durable
 job is admitted and waiting without holding a database connection. It is not a
 reason to submit the mutation again.
+Create and replace can report `source-revalidation`, which rechecks semantic
+source readiness after the queue wait. Only a fingerprinted create can report
+`plan-revalidation`, which reruns the reviewed database plan binding. Refresh
+advances from the queue directly to `database-transaction`. The revalidation
+stages make no database change; `database-transaction` is the mutation
+boundary.
 
 ### `completion`
 
@@ -1038,7 +1049,7 @@ config-cli derived-layers jobs
 config-cli derived-layers refresh paths_h3_r9 \
   --confirm --background --detach
 config-cli operations wait OPERATION_ID \
-  --progress --wait-timeout 1860 --interval 1
+  --progress --interval 1
 ```
 
 `derived-layers jobs` reports bounded, sanitized active-operation summaries,
@@ -1121,16 +1132,22 @@ server-provided phase and unchanged or indeterminate state.
 
 Create, replace, and refresh are synchronous by default; use that path first
 for ordinary views and jobs expected to finish promptly. For a known slow
-materialized job, add `--background`; the CLI then requests a durable server
-operation and polls it automatically. Background mode accepts
-`--wait-timeout` (default 1860 seconds) and `--interval` (default one second).
-Add `--detach` to return the accepted operation immediately and manage it with
-`derived-layers jobs` and `operations wait`; detached acceptance is not proof
-that the database mutation has completed.
-Reaching the local wait timeout does not cancel database work; continue with
-the operation ID from the structured error using
-`config-cli operations wait OPERATION_ID`. This error uses
-`failurePhase: "operation-polling"` and disables automatic retry.
+materialized job, add `--background`; the CLI requests a durable server
+operation, follows it to a terminal state by default, and writes sanitized
+status/stage transitions to stderr without changing final stdout JSON. Neither
+implicit following nor `operations wait` has a fixed completion deadline;
+supply a positive `--wait-timeout` when automation needs one. `--interval`
+defaults to one second.
+
+Following retries only the idempotent operation-status GET for a bounded
+transient connectivity, HTTP 408/429, or HTTP 5xx outage, using capped backoff.
+It never repeats the create, replace, or refresh POST. Add `--detach` to return
+the accepted operation immediately and manage it with `derived-layers jobs`
+and `operations wait`; detached acceptance is not proof that the database
+mutation completed. A supplied local deadline, prolonged polling outage, or
+interruption does not cancel database work. Continue with the retained
+operation ID. Such errors use `failurePhase: "operation-polling"` and disable
+automatic mutation retry.
 
 When a durable query or size guard rejects the work, the server stores the same
 structured envelope under `operation.error`. The CLI uses its safe
