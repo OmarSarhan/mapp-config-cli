@@ -50,6 +50,13 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Strict optional version-1 durable-operation progress evidence. `operations
+  show` preserves safe phase, activity, wait/blocker, and PostgreSQL index-build
+  measurements, while `operations wait --progress` and implicit background
+  following emit only validated changes and suppress timestamp/elapsed-only
+  churn. Generic SQL activity is not misreported as a percentage, and query
+  text, backend process IDs, actors, and arbitrary diagnostics remain excluded
+  from progress stderr.
 - Capability-gated `derived-layers plan --input REQUEST.json` support for
   non-mutating, replayable generic definition planning, with strict validation
   of resolved scope, plan binding, PostgreSQL probes, bounded access-path and

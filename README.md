@@ -75,13 +75,19 @@ list`, correlate responses through `meta.requestId`, and inspect durable
 visual, reload, apply, and background derived-layer outcomes with `config-cli
 operations show|wait|cancel`. `derived-layers jobs` discovers admitted derived
 work. `--background` follows its durable operation without a fixed queue
-deadline, reports safe status/stage transitions on stderr, and retries only
+deadline, reports safe operation transitions on stderr, and retries only
 transient status GETs—not the mutation POST. `--background --detach` returns a
 validated operation handle, and `operations wait ID --progress` can follow it
-without changing final stdout JSON. The server contract's exact command list and
-`/api/capabilities` action schemas are complementary runtime authorities; the
-CLI fails closed when either required declaration is absent instead of calling
-a familiar route directly.
+without changing final stdout JSON. When the server supplies versioned
+`operation.progress` evidence, `operations show` preserves its observed phase,
+activity condition, safe PostgreSQL wait/blocker evidence, and any measured
+index-build counters. Progress following emits changes to those safe fields but
+does not print query text, backend process IDs, actors, or arbitrary diagnostics.
+`active` proves only that PostgreSQL reported active execution at that
+observation; it is not a percentage or proof that result rows advanced. The
+server contract's exact command list and `/api/capabilities` action schemas are
+complementary runtime authorities; the CLI fails closed when either required
+declaration is absent instead of calling a familiar route directly.
 Global `--input`, `--extract`, and `--out` options support JSON file/stdin
 workflows without fragile shell quoting.
 

@@ -347,10 +347,27 @@ status GETs during a bounded transient connection/408/429/5xx outage. A
 prolonged lost poll or local wait timeout returns
 `indeterminate: true`, `failurePhase: "operation-polling"`, the operation ID,
 and reconciliation commands with automatic retry disabled. `--progress` writes
-only safely encoded status/stage transitions to stderr; the single final JSON
-result on stdout is unchanged. A `waiting-for-worker` stage means the durable
-job is admitted and waiting without holding a database connection. It is not a
-reason to submit the mutation again.
+only safely encoded status, stage, or validated backend-activity transitions to
+stderr; the single final JSON result on stdout is unchanged. Repeated
+observations that change only timestamps or elapsed seconds are deduplicated.
+
+Newer servers can add an optional version-1 `operation.progress` object to the
+status response. `operations show` preserves its observation time, safe phase,
+activity condition, statement timing, PostgreSQL wait type/event, blocker
+count, and any `create-index` progress counters. Older servers can omit the
+object. The CLI validates it when present and never copies query text, backend
+process IDs, actors, or arbitrary diagnostics into progress stderr. The
+conditions are `queued`, `starting`, `active`, `waiting`, `blocked`, `idle`,
+`not-observed`, and `unavailable`. `active` means PostgreSQL reported an active,
+non-waiting statement at that observation; it does not prove that result rows
+advanced and is not a percentage. `blocked` is direct blocker evidence, while
+`not-observed` or `unavailable` means the server cannot currently classify the
+database session. Generic materialization has no trustworthy percentage;
+bounded counters appear only for PostgreSQL index phases that expose them.
+
+A `waiting-for-worker` stage means the durable job is admitted and waiting
+without holding a database connection. It is not a reason to submit the
+mutation again.
 Create and replace can report `source-revalidation`, which rechecks semantic
 source readiness after the queue wait. Only a fingerprinted create can report
 `plan-revalidation`, which reruns the reviewed database plan binding. Refresh
@@ -369,6 +386,15 @@ config-cli completion fish
 ```
 
 ## Server-authoritative guidance
+
+### Layer-list order and drawing order
+
+`locale.layer_order` controls the order in which XYZ presents configured layers
+in its navigation drawer. It does not change their cartographic stacking order.
+Use each layer's `zIndex` to control what draws above or below another layer;
+higher values draw later and therefore appear above lower values. A navigation
+reorder should normally be a focused `layer_order` proposal that preserves all
+layer definitions and `zIndex` values.
 
 ### `schema`
 
@@ -866,15 +892,18 @@ to an indexed source column before aggregation; and do not wrap an indexed
 geometry in `ST_Transform`, a cast, or another function unless the evidence
 shows that exact expression is indexed. Use indexed native geometry or
 EPSG:3857 to select coarse candidates when the plan proves that path. For
-globally scoped distance and area work, prefer EPSG:4326 geography or explicit
-geodesic calculations when suitable. EPSG:4326 geometry itself uses angular
-units, and EPSG:3857 distances and areas are distorted. Use a profiled local
-projected CRS only when its area of use, units, distortion, and index evidence
-fit the request; transform narrowed candidates rather than hardcoding a
-regional CRS. Return final geometry in EPSG:3857 for XYZ. WGS84 geography
-supports worldwide and dateline-crossing metric work, but EPSG:3857 output is
-limited to the Web-Mercator latitude domain and cannot represent the polar
-caps.
+area-weighted spatial measures, first make that indexed coarse candidate match,
+then calculate the exact intersection and source areas only for the narrowed
+pairs. This avoids a costly all-pairs intersection while preserving the
+area-share calculation. For globally scoped distance and area work, prefer
+EPSG:4326 geography or explicit geodesic calculations when suitable.
+EPSG:4326 geometry itself uses angular units, and EPSG:3857 distances and areas
+are distorted. Use a profiled local projected CRS only when its area of use,
+units, distortion, and index evidence fit the request; transform narrowed
+candidates rather than hardcoding a regional CRS. Return final geometry in
+EPSG:3857 for XYZ. WGS84 geography supports worldwide and dateline-crossing
+metric work, but EPSG:3857 output is limited to the Web-Mercator latitude
+domain and cannot represent the polar caps.
 
 A successful plan is evidence, not approval. After approval, write the exact
 returned `derivedLayerPlan.createRequest` to a private file and submit it:
@@ -1238,10 +1267,10 @@ Create, replace, and refresh are synchronous by default; use that path first
 for ordinary views and jobs expected to finish promptly. For a known slow
 materialized job, add `--background`; the CLI requests a durable server
 operation, follows it to a terminal state by default, and writes sanitized
-status/stage transitions to stderr without changing final stdout JSON. Neither
-implicit following nor `operations wait` has a fixed completion deadline;
-supply a positive `--wait-timeout` when automation needs one. `--interval`
-defaults to one second.
+status, stage, and validated backend-activity transitions to stderr without
+changing final stdout JSON. Neither implicit following nor `operations wait`
+has a fixed completion deadline; supply a positive `--wait-timeout` when
+automation needs one. `--interval` defaults to one second.
 
 Following retries only the idempotent operation-status GET for a bounded
 transient connectivity, HTTP 408/429, or HTTP 5xx outage, using capped backoff.

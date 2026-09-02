@@ -166,6 +166,23 @@ def accepted_derived_background_response(
     }
 
 
+def operation_progress(
+    *,
+    observed_at: str = "2026-09-01T12:00:00Z",
+    phase: str = "materializing-output",
+    condition: str = "active",
+    elapsed: float = 10.0,
+) -> dict:
+    return {
+        "version": 1,
+        "observedAt": observed_at,
+        "phase": phase,
+        "condition": condition,
+        "statementStartedAt": "2026-09-01T11:59:50Z",
+        "statementElapsedSeconds": elapsed,
+    }
+
+
 def layer_statistics_response(*, bins_requested: int = 2) -> dict:
     return {
         "revision": "rev-1",
@@ -3441,6 +3458,7 @@ class CliTests(unittest.TestCase):
                 "target": {"name": "slow_places", "action": "refresh"},
                 "status": "running",
                 "stage": "database-transaction",
+                "progress": operation_progress(phase="database-transaction"),
             },
             {
                 "id": operation_id,
@@ -3490,7 +3508,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             [
                 {"stage": "waiting-for-worker", "status": "running"},
-                {"stage": "database-transaction", "status": "running"},
+                {
+                    "stage": "database-transaction",
+                    "status": "running",
+                    "progress": operation_progress(
+                        phase="database-transaction"
+                    ),
+                },
                 {"stage": "result-reporting", "status": "succeeded"},
             ],
             progress,
@@ -8804,6 +8828,130 @@ class CliTests(unittest.TestCase):
             json.loads(operation_out)["operation"]["status"],
         )
 
+    def test_operation_show_preserves_valid_progress_evidence(self):
+        operation_id = "op-progress-show"
+        progress = {
+            **operation_progress(
+                phase="indexing-output",
+                condition="blocked",
+                elapsed=75.5,
+            ),
+            "wait": {"type": "Lock", "event": "relation"},
+            "blockerCount": 2,
+            "measurement": {
+                "type": "create-index",
+                "phase": "building index: loading tuples in tree",
+                "blocks": {"done": 20, "total": 100},
+                "tuples": {"done": 400, "total": 1000},
+                "partitions": {"done": 1, "total": 4},
+                "lockers": {"done": 0, "total": 2},
+            },
+        }
+        routes = standard_routes()
+        routes[("GET", f"/api/operations/{operation_id}")] = (
+            200,
+            {"operation": {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "target": {"name": "slow_layer", "action": "create"},
+                "status": "running",
+                "stage": "database-transaction",
+                "progress": progress,
+            }},
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["operations", "show", operation_id],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("", stderr)
+        self.assertEqual(progress, json.loads(stdout)["operation"]["progress"])
+
+    def test_operation_show_rejects_malformed_progress_evidence(self):
+        operation_id = "op-progress-invalid"
+        base_progress = operation_progress()
+
+        def changed(mutator):
+            value = json.loads(json.dumps(base_progress))
+            mutator(value)
+            return value
+
+        cases = {
+            "missing-version": changed(lambda value: value.pop("version")),
+            "boolean-version": changed(
+                lambda value: value.__setitem__("version", True)
+            ),
+            "invalid-observed-at": changed(
+                lambda value: value.__setitem__(
+                    "observedAt", "2026-02-30T12:00:00Z"
+                )
+            ),
+            "unknown-phase": changed(
+                lambda value: value.__setitem__("phase", "running-query")
+            ),
+            "unknown-condition": changed(
+                lambda value: value.__setitem__("condition", "stuck")
+            ),
+            "negative-elapsed": changed(
+                lambda value: value.__setitem__("statementElapsedSeconds", -1)
+            ),
+            "unknown-progress-field": changed(
+                lambda value: value.__setitem__("query", "SELECT private")
+            ),
+            "unsanitized-wait": changed(
+                lambda value: value.__setitem__(
+                    "wait", {"type": "Lock", "event": "relation", "pid": 7}
+                )
+            ),
+            "boolean-blocker-count": changed(
+                lambda value: value.__setitem__("blockerCount", True)
+            ),
+            "invalid-measurement-counter": changed(
+                lambda value: value.__setitem__("measurement", {
+                    "type": "create-index",
+                    "phase": "building index",
+                    "blocks": {"done": 2, "total": 1},
+                })
+            ),
+        }
+
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            for label, progress in cases.items():
+                with self.subTest(label=label):
+                    routes[("GET", f"/api/operations/{operation_id}")] = (
+                        200,
+                        {"operation": {
+                            "id": operation_id,
+                            "kind": "derived-layer.create",
+                            "target": {"name": "slow_layer", "action": "create"},
+                            "status": "running",
+                            "progress": progress,
+                            "diagnostics": {
+                                "query": "SELECT must-not-be-printed",
+                                "backendPid": 7319,
+                            },
+                        }},
+                    )
+                    code, stdout, stderr = self.invoke(
+                        ["operations", "show", operation_id],
+                        store,
+                    )
+
+                    self.assertEqual(EXIT_CONNECTIVITY, code)
+                    self.assertEqual("", stdout)
+                    self.assertEqual(
+                        "operation.invalid_response",
+                        json.loads(stderr)["code"],
+                    )
+                    self.assertNotIn("slow_layer", stderr)
+                    self.assertNotIn("SELECT must-not-be-printed", stderr)
+                    self.assertNotIn("backendPid", stderr)
+
     def test_explicit_operation_commands_reject_cross_wired_operation_ids(self):
         cases = (
             ("show", ["operations", "show", "op-requested"], "GET"),
@@ -8911,6 +9059,127 @@ class CliTests(unittest.TestCase):
         )
         self.assertNotIn("private_layer", stderr)
         self.assertNotIn("must-not-be-printed", stderr)
+
+    def test_operation_wait_progress_emits_safe_activity_changes(self):
+        operation_id = "e" * 32
+        first = operation_progress(elapsed=10)
+        unchanged = operation_progress(
+            observed_at="2026-09-01T12:00:01Z",
+            elapsed=11,
+        )
+        waiting = {
+            **operation_progress(
+                observed_at="2026-09-01T12:00:02Z",
+                condition="waiting",
+                elapsed=12,
+            ),
+            "wait": {"type": "IO", "event": "DataFileRead"},
+            "blockerCount": 0,
+        }
+        indexing_one = {
+            **operation_progress(
+                observed_at="2026-09-01T12:00:03Z",
+                phase="indexing-output",
+                elapsed=13,
+            ),
+            "measurement": {
+                "type": "create-index",
+                "phase": "building index: scanning table",
+                "blocks": {"done": 1, "total": 10},
+            },
+        }
+        indexing_two = json.loads(json.dumps(indexing_one))
+        indexing_two["observedAt"] = "2026-09-01T12:00:04Z"
+        indexing_two["statementElapsedSeconds"] = 14
+        indexing_two["measurement"]["blocks"]["done"] = 2
+        responses = iter((
+            {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "target": {"name": "private_layer"},
+                "status": "running",
+                "stage": "database-transaction",
+                "progress": first,
+                "diagnostics": {
+                    "query": "SELECT private_value",
+                    "backendPid": 1234,
+                },
+            },
+            {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "target": {"name": "private_layer"},
+                "status": "running",
+                "stage": "database-transaction",
+                "progress": unchanged,
+            },
+            {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "target": {"name": "private_layer"},
+                "status": "running",
+                "stage": "database-transaction",
+                "progress": waiting,
+            },
+            {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "target": {"name": "private_layer"},
+                "status": "running",
+                "stage": "database-transaction",
+                "progress": indexing_one,
+            },
+            {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "target": {"name": "private_layer"},
+                "status": "running",
+                "stage": "database-transaction",
+                "progress": indexing_two,
+            },
+            {
+                "id": operation_id,
+                "kind": "derived-layer.create",
+                "target": {"name": "private_layer"},
+                "status": "succeeded",
+                "stage": "result-reporting",
+                "result": {"derivedLayer": {"name": "private_layer"}},
+            },
+        ))
+
+        def operation_status(_request):
+            return 200, {"operation": next(responses)}
+
+        routes = standard_routes()
+        routes[("GET", f"/api/operations/{operation_id}")] = operation_status
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            with patch("mapp_config_cli.cli.time.sleep", return_value=None):
+                code, stdout, stderr = self.invoke(
+                    [
+                        "operations", "wait", operation_id,
+                        "--progress", "--interval", "0.001",
+                    ],
+                    store,
+                )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("succeeded", json.loads(stdout)["operation"]["status"])
+        emitted = [
+            json.loads(line)["operationProgress"]
+            for line in stderr.splitlines()
+        ]
+        self.assertEqual(5, len(emitted))
+        self.assertEqual(first, emitted[0]["progress"])
+        self.assertEqual(waiting, emitted[1]["progress"])
+        self.assertEqual(indexing_one, emitted[2]["progress"])
+        self.assertEqual(indexing_two, emitted[3]["progress"])
+        self.assertEqual(
+            {"stage": "result-reporting", "status": "succeeded"},
+            emitted[4],
+        )
+        self.assertNotIn("SELECT private_value", stderr)
+        self.assertNotIn("backendPid", stderr)
 
     def test_explicit_operation_follow_rejects_kind_or_target_drift(self):
         cases = (

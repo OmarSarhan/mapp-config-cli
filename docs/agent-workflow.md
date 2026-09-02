@@ -806,7 +806,8 @@ evaluated/generated cell and can flood PostgreSQL logs. Use synchronous
 derived-layer commands first for normal jobs. For a known slow materialized
 create, replace, or refresh, add `--background`; unless explicitly detached,
 the CLI follows the durable operation without a fixed queue deadline and
-prints safe status/stage transitions to stderr. Supply a positive
+prints safe status, stage, and validated backend-activity transitions to
+stderr. Supply a positive
 `--wait-timeout` only when the local caller needs a deadline. During following,
 the CLI retries only the idempotent status GET across a bounded transient
 connectivity, HTTP 408/429, or HTTP 5xx outage; it never repeats the mutation
@@ -835,10 +836,23 @@ every returned operation ID and follow it with
 an explicit positive `--wait-timeout` is supplied. The
 `waiting-for-worker` stage is admitted durable work, not a failed request; do
 not submit it again. Add `--progress` for explicit wait status/stage
-transitions; implicit derived background following enables those transitions
-by default. Progress stays on stderr and final JSON stays on stdout. A local
-timeout, prolonged polling outage, or interruption does not cancel the
-operation and never authorizes an automatic mutation retry.
+and validated backend-activity transitions; implicit derived background
+following enables those transitions by default. Progress stays on stderr and
+final JSON stays on stdout. Repeated observations that change only timestamps
+or elapsed seconds are suppressed, while phase, condition, wait/blocker, and
+measured index-counter changes are emitted. A local timeout, prolonged polling
+outage, or interruption does not cancel the operation and never authorizes an
+automatic mutation retry.
+
+Use `operations show OPERATION_ID` for the latest complete versioned progress
+observation. `active` means PostgreSQL reported active, non-waiting execution
+at that instant; generic SQL exposes neither a trustworthy percentage nor
+proof that result rows advanced. `blocked` carries direct blocker evidence.
+`not-observed` and `unavailable` are evidence gaps, not proof that work is
+stuck. PostgreSQL can supply bounded completion counters during some
+`indexing-output` phases; report them as phase-local index progress only. Never
+copy query text, backend process IDs, actors, or arbitrary diagnostics into a
+progress report.
 Create and replace can report `source-revalidation`, which rechecks semantic
 source readiness after the queue wait. Only a fingerprinted create can then
 report `plan-revalidation`, which reruns the reviewed database plan binding.

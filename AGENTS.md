@@ -598,7 +598,8 @@ label-only change.
 
 For one reviewed slow mutation, use `--background` without `--detach`: the CLI
 follows the durable operation to a terminal state by default and writes safe
-status/stage transitions to stderr while preserving final JSON on stdout.
+status, stage, and validated backend-activity transitions to stderr while
+preserving final JSON on stdout.
 There is no fixed queue wait deadline unless `--wait-timeout SECONDS` is
 supplied. During following, the CLI may retry only the idempotent operation
 status GET across a bounded transient connectivity/HTTP 408/429/5xx outage; it
@@ -609,6 +610,14 @@ older detached operation. A `waiting-for-worker` stage is already admitted
 durable work and is not permission to submit it again. A local timeout,
 prolonged polling outage, or interruption does not cancel the operation or
 authorize an automatic mutation retry.
+When `operations show` or progress following returns versioned
+`operation.progress` evidence, use its phase, condition, wait event, blocker
+count, and measured index counters without overstating them. `active` is one
+PostgreSQL activity observation, not proof that rows advanced or a completion
+percentage. Treat `blocked` as direct blocker evidence and `not-observed` or
+`unavailable` as an evidence gap. Generic materialization has no trustworthy
+percentage. Never expose query text, backend process IDs, actors, or arbitrary
+operation diagnostics while reporting progress.
 For create and replace, `source-revalidation` rechecks semantic source
 readiness after the queue wait. Only a fingerprinted create can then report
 `plan-revalidation`, which reruns its reviewed database plan binding. Refresh

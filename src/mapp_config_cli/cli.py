@@ -13,6 +13,7 @@ import tempfile
 import time
 import urllib.parse
 import webbrowser
+from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NoReturn, Sequence, TextIO, cast
 
@@ -92,6 +93,41 @@ MAX_LAYER_STATISTICS_CUTS = 20
 _LOCAL_READ_CHUNK_BYTES = 64 * 1024
 _OPERATION_POLL_RETRY_WINDOW_SECONDS = 30.0
 _OPERATION_POLL_MAX_BACKOFF_SECONDS = 5.0
+_OPERATION_PROGRESS_PHASES = frozenset({
+    "waiting-for-worker",
+    "source-revalidation",
+    "plan-revalidation",
+    "acquiring-mutation-lock",
+    "database-transaction",
+    "query-preflight",
+    "definition-create",
+    "materializing-output",
+    "indexing-output",
+    "output-validation",
+    "registry-update",
+    "transaction-commit",
+    "result-reporting",
+})
+_OPERATION_PROGRESS_CONDITIONS = frozenset({
+    "queued",
+    "starting",
+    "active",
+    "waiting",
+    "blocked",
+    "idle",
+    "not-observed",
+    "unavailable",
+})
+_OPERATION_PROGRESS_COUNTERS = frozenset({
+    "blocks",
+    "tuples",
+    "partitions",
+    "lockers",
+})
+_RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 
 def _posix_fchmod(descriptor: int, mode: int) -> None:
@@ -1114,7 +1150,10 @@ def parser() -> JsonArgumentParser:
     operation_wait.add_argument(
         "--progress",
         action="store_true",
-        help="Write status or stage changes to stderr while waiting.",
+        help=(
+            "Write status, stage, or safe backend activity changes to stderr "
+            "while waiting."
+        ),
     )
     operation_cancel = operation_actions.add_parser("cancel")
     operation_cancel.add_argument("id")
@@ -1960,23 +1999,143 @@ def _operation_reconciliation(operation_id: str) -> dict[str, Any]:
     }
 
 
+def _is_rfc3339(value: Any) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or _RFC3339_RE.fullmatch(value) is None
+    ):
+        return False
+    try:
+        datetime.fromisoformat(value.removesuffix("Z") + (
+            "+00:00" if value.endswith("Z") else ""
+        ))
+    except ValueError:
+        return False
+    return True
+
+
+def _operation_progress(
+    operation: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate optional, versioned operation activity evidence."""
+    if "progress" not in operation:
+        return None
+    progress = operation.get("progress")
+    if not isinstance(progress, dict):
+        raise CliError(
+            "Operation progress response is invalid.",
+            EXIT_CONNECTIVITY,
+            error_code="operation.invalid_response",
+        )
+    required = {"version", "observedAt", "phase", "condition"}
+    optional = {
+        "statementStartedAt",
+        "statementElapsedSeconds",
+        "wait",
+        "blockerCount",
+        "measurement",
+    }
+    valid = (
+        required <= set(progress) <= required | optional
+        and _nonnegative_integer(progress.get("version"))
+        and progress.get("version") == 1
+        and _is_rfc3339(progress.get("observedAt"))
+        and progress.get("phase") in _OPERATION_PROGRESS_PHASES
+        and progress.get("condition") in _OPERATION_PROGRESS_CONDITIONS
+    )
+    if valid and "statementStartedAt" in progress:
+        valid = _is_rfc3339(progress["statementStartedAt"])
+    if valid and "statementElapsedSeconds" in progress:
+        valid = _finite_nonnegative_number(progress["statementElapsedSeconds"])
+    if valid and "blockerCount" in progress:
+        valid = _nonnegative_integer(progress["blockerCount"])
+    if valid and "wait" in progress:
+        wait = progress["wait"]
+        valid = (
+            isinstance(wait, dict)
+            and set(wait) == {"type", "event"}
+            and all(
+                isinstance(wait.get(key), str)
+                and bool(wait[key])
+                and wait[key] == wait[key].strip()
+                and len(wait[key]) <= 128
+                for key in ("type", "event")
+            )
+        )
+    if valid and "measurement" in progress:
+        measurement = progress["measurement"]
+        valid = (
+            isinstance(measurement, dict)
+            and {"type", "phase"} <= set(measurement)
+            <= {"type", "phase"} | _OPERATION_PROGRESS_COUNTERS
+            and measurement.get("type") == "create-index"
+            and isinstance(measurement.get("phase"), str)
+            and bool(measurement["phase"])
+            and measurement["phase"] == measurement["phase"].strip()
+            and len(measurement["phase"]) <= 128
+        )
+        if valid:
+            for key in _OPERATION_PROGRESS_COUNTERS & set(measurement):
+                counter = measurement[key]
+                if (
+                    not isinstance(counter, dict)
+                    or set(counter) != {"done", "total"}
+                    or not _nonnegative_integer(counter.get("done"))
+                    or not _nonnegative_integer(counter.get("total"))
+                    or counter["done"] > counter["total"]
+                ):
+                    valid = False
+                    break
+    if not valid:
+        raise CliError(
+            "Operation progress response is invalid.",
+            EXIT_CONNECTIVITY,
+            error_code="operation.invalid_response",
+        )
+    return progress
+
+
 def _emit_operation_progress(
     operation: dict[str, Any],
     stream: TextIO,
-    previous: tuple[str, str | None] | None,
-) -> tuple[str, str | None]:
-    """Emit only a safely encoded status/stage transition."""
+    previous: str | None,
+) -> str:
+    """Emit only a validated, safely encoded operation transition."""
     status = operation["status"]
     stage_value = operation.get("stage")
     stage = stage_value if isinstance(stage_value, str) and stage_value else None
-    current = (status, stage)
+    evidence = _operation_progress(operation)
+    transition: dict[str, Any] = {"status": status}
+    if stage is not None:
+        transition["stage"] = stage
+    if evidence is not None:
+        transition["progress"] = {
+            key: value
+            for key, value in evidence.items()
+            if key not in {
+                "observedAt",
+                "statementStartedAt",
+                "statementElapsedSeconds",
+            }
+        }
+    current = json.dumps(
+        transition,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     if current == previous:
         return current
-    progress = {"status": status}
+    emitted = {"status": status}
     if stage is not None:
-        progress["stage"] = stage
+        emitted["stage"] = stage
+    if evidence is not None:
+        emitted["progress"] = evidence
     encoded = json.dumps(
-        {"operationProgress": progress},
+        {"operationProgress": emitted},
         ensure_ascii=True,
         allow_nan=False,
         sort_keys=True,
@@ -2510,6 +2669,7 @@ def _accepted_derived_background_operation(
             submitted,
             error_code="operation.invalid_response",
         )
+    _operation_progress(operation)
     return operation
 
 
@@ -2560,16 +2720,13 @@ def _complete_background_operation(
         else None
     )
     last_status: Any = operation.get("status")
-    progress_state: tuple[str, str | None] | None = None
+    progress_state: str | None = None
     try:
         while True:
             status = operation.get("status")
             last_status = status
-            if (
-                progress_stream is not None
-                and isinstance(operation.get("stage"), str)
-                and bool(operation["stage"])
-            ):
+            _operation_progress(operation)
+            if progress_stream is not None:
                 progress_state = _emit_operation_progress(
                     operation,
                     progress_stream,
@@ -7783,7 +7940,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                     interrupted=True,
                 ) from exc
         last_status: Any = "unknown"
-        progress_state: tuple[str, str | None] | None = None
+        progress_state: str | None = None
         operation_binding: tuple[str, dict[str, Any]] | None = None
         while True:
             if operation_response is None:
@@ -7838,6 +7995,7 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 )
             if operation_binding is None:
                 operation_binding = (operation_kind, operation_target)
+            _operation_progress(operation)
             last_status = operation["status"]
             if (
                 args.action != "show"
