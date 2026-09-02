@@ -94,6 +94,8 @@ config-cli --profile production layers get "Bus Stops"
 config-cli --profile production layers values "Bus Stops" town --limit 100
 config-cli --profile production layers statistics "Areas" percentage \
   --threshold 0.05 --break 10 --break 20
+config-cli --profile production derived-layers plan \
+  --input tmp/draft-derived-create.json
 config-cli --profile production derived-layers plan-area-weighted-h3 \
   --input tmp/population-h3-recipe.json
 config-cli --profile production semantic catalog search "bus stops"

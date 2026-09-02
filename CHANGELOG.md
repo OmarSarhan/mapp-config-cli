@@ -50,6 +50,15 @@ Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Capability-gated `derived-layers plan --input REQUEST.json` support for
+  non-mutating, replayable generic definition planning, with strict validation
+  of resolved scope, plan binding, PostgreSQL probes, bounded access-path and
+  index evidence, estimate provenance, federation groups, and actionable
+  warnings. Probe limits are bound to the fetched capability snapshot, and
+  scan/index evidence is relationally bound to declared sources. Agent
+  guidance now requires source-local indexed bounds and a
+  globally applicable candidate/metric/output CRS strategy instead of assuming
+  a regional transform expression or index.
 - Strict `derived-layers jobs` discovery for the bounded background queue,
   detached create/replace/refresh submission with validated operation binding,
   and opt-in `operations wait --progress` status/stage transitions. Detached
@@ -57,7 +66,10 @@ Versioning](https://semver.org/spec/v2.0.0.html).
   mutation automatically.
 - Read-only `derived-layers plan-area-weighted-h3` support with replayable
   reviewed create requests, semantic/source resolution, bounded spatial-scope
-  evidence, preflight probes, and a separate confirmed create boundary.
+  evidence, preflight probes, and a separate confirmed create boundary. The
+  version-2 contract uses global EPSG:4326 spheroidal geography measurement,
+  source-native candidate filtering, and antimeridian-safe MultiPolygon output
+  instead of a regional planar CRS.
 - Capability-gated `layers statistics` inspection for bounded numeric
   distributions, thresholds, and candidate breaks without returning raw rows,
   with strict request and response validation and raw-field styling guidance.

@@ -101,6 +101,7 @@ named-command gate.
 | `set`, `unset`, `amend` | `/api/mutate` with `save: false` | Command-advertised dry run | Legacy `full` or administrator session |
 | `sql test` | `/api/sql/test` | Command-advertised bounded probe | Legacy `full` or administrator session |
 | `derived-layers capabilities\|jobs\|list\|show\|map-extent` | `/api/derived-layers/*` GET routes | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the preview | `inspect` |
+| `derived-layers plan` | `POST /api/derived-layers/plan` | Exact `derived-layers plan` command plus advertised `definitionPlanning`; bounded, non-mutating preflight | `derive` + `semantic:inspect` |
 | `derived-layers plan-area-weighted-h3` | `/api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3`; exact command required | `derive` + `semantic:inspect`; read-only plan |
 | `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also need `semantic:inspect` |
 | `proposals check\|create` | Workspace proposal routes | `proposals.check`, `proposals.create` | `propose` |
@@ -810,6 +811,93 @@ writing the derived SQL. This applies to table and view relations only;
 PostgreSQL, PostGIS, and H3 functions used inside the query do not need
 semantic profiles.
 
+### Generic definition planner
+
+Put a complete create definition in a JSON object and plan that exact object
+before asking to create it:
+
+```json
+{
+  "name": "bounded_population",
+  "kind": "materialized",
+  "query": "SELECT area_id, population, geom_3857 FROM census.output_areas WHERE geom_3857 && ST_MakeEnvelope(-250000, 7000000, -50000, 7300000, 3857)",
+  "sources": ["census.output_areas"],
+  "idColumn": "area_id",
+  "geometryColumn": "geom_3857",
+  "spatialScope": {
+    "type": "workspace-map-extent",
+    "locale": "city-centre"
+  }
+}
+```
+
+```sh
+config-cli derived-layers plan --input tmp/bounded-population.json
+```
+
+The command is capability-gated and read-only. It requires
+`mutationApplied: false` and returns a versioned `derivedLayerPlan` containing
+the replayable `createRequest`, resolved map scope, query and pair-planning
+probes, an optional materialization probe, a plan fingerprint, and a bounded
+`accessPathProbe`. The latter identifies estimate provenance, local versus
+opaque foreign execution groups, planned scans and predicate pushdown,
+available indexes/expressions, correlated subplans, and actionable warnings.
+Its source, scan, warning, and index lists have advertised caps and explicit
+truncation flags. Unknown or truncated evidence is not proof of a cheap scan.
+`remote-with-local-filter` means only part of a foreign predicate was pushed
+down and still carries a residual-filter warning. `scan_evidence_unavailable`
+means PostgreSQL expanded a view/partitioned parent or otherwise exposed no
+scan that could be attributed safely; it is uncertainty, not a clean plan.
+`tuple-condition` identifies a bounded PostgreSQL TID/TID-range scan; it is not
+proof of a reusable SQL index predicate or spatial index.
+Likewise, `indexMetadata.reason: "expanded-relation"` means a view or nested
+foreign relation was expanded and the wrapper has no trustworthy physical
+index inventory; an empty wrapper inventory must not be read as “no indexes.”
+Coordinator index discovery has a 5-second aggregate budget. Remote discovery
+is sequential, permits at most eight lookups, and has a 5-second per-lookup
+and 15-second aggregate budget. `indexMetadata.reason:
+"metadata-time-budget"` means the relevant aggregate budget was exhausted, so
+that source's index state is unknown; narrow the definition instead of
+automatically replanning it.
+
+Review warnings before seeking approval. In particular, bound every large
+source on its own side of a federated join; apply constant extent predicates
+to an indexed source column before aggregation; and do not wrap an indexed
+geometry in `ST_Transform`, a cast, or another function unless the evidence
+shows that exact expression is indexed. Use indexed native geometry or
+EPSG:3857 to select coarse candidates when the plan proves that path. For
+globally scoped distance and area work, prefer EPSG:4326 geography or explicit
+geodesic calculations when suitable. EPSG:4326 geometry itself uses angular
+units, and EPSG:3857 distances and areas are distorted. Use a profiled local
+projected CRS only when its area of use, units, distortion, and index evidence
+fit the request; transform narrowed candidates rather than hardcoding a
+regional CRS. Return final geometry in EPSG:3857 for XYZ. WGS84 geography
+supports worldwide and dateline-crossing metric work, but EPSG:3857 output is
+limited to the Web-Mercator latitude domain and cannot represent the polar
+caps.
+
+A successful plan is evidence, not approval. After approval, write the exact
+returned `derivedLayerPlan.createRequest` to a private file and submit it:
+
+```sh
+config-cli derived-layers create \
+  --input tmp/reviewed-bounded-population.json \
+  --confirm
+```
+
+Do not reconstruct that object from the original draft or drop its plan
+binding. The fingerprint covers the exact definition, resolved scope, and
+reviewed database plan/access-path evidence. Create rechecks semantic profile
+readiness, but semantic asset versions and curated meaning are not
+fingerprinted. After a semantic-catalog change, reinspect and replan rather
+than assuming meaning drift will fail closed.
+
+If the reviewed evidence shows costly or federated work that remains within
+admission limits, add `--background` to that exact create command. The CLI
+follows the durable operation through queued and running stages by default;
+use `--detach` only for an intentional handoff to `operations wait`, and do not
+resubmit a queued mutation.
+
 ### Area-weighted H3 planner
 
 The supported polygon-to-H3 recipe is planned from a JSON object:
@@ -846,8 +934,14 @@ Planning is read-only: `mutationApplied` must be `false`. The server verifies
 the selected ready PostgreSQL semantic profile and fields, generates the
 area-weighted query with overlap-mode scope candidates, resolves the bounded
 workspace map scope, and runs query, pair-planning, and—only for a materialized
-kind—storage preflight. Review the returned source and measures, assumptions,
-generated SQL, canonical
+kind—storage preflight. Recipe capability and plan version `2` measure
+intersections as EPSG:4326 geography with the spheroid enabled, transforming a
+non-4326 source once after source-native candidate filtering. Output cell
+boundaries are normalized to `geometry(MultiPolygon,3857)` so antimeridian-
+split cells retain every part. The CLI rejects the older regional planar
+recipe rather than treating it as equivalent. Newer servers also return the
+generic planner's bounded `accessPathProbe`; the CLI validates it when present.
+Review the returned source and measures, assumptions, generated SQL, canonical
 `createRequest.spatialScope`, full `resolvedSpatialScope`, and every probe.
 
 The planner does not authorize or create the relation. After separate approval,
@@ -860,9 +954,11 @@ config-cli derived-layers create \
   --confirm
 ```
 
-Create re-resolves the scope and repeats semantic and database preflight. A
-workspace, catalog, or plan change can therefore reject the later mutation;
-do not alter or automatically resubmit the reviewed request.
+Create re-resolves the current scope and repeats semantic readiness plus
+database preflight. The recipe request does not bind a semantic asset version
+or curated meaning. Reinspect and replan after semantic-catalog or workspace
+changes; do not claim all meaning drift will block, alter the reviewed request,
+or automatically resubmit it.
 
 Put the query in a file so shell parsing cannot change it. Store generated SQL
 drafts in the repository-local, git-ignored `tmp/` directory rather than the
@@ -941,6 +1037,13 @@ without changing the existing `queryGuard` or `queryPlanProbe` shapes. A
 successful mutation then preserves `derivedLayer.queryPlanningProbe` alongside
 `derivedLayer.queryPlanProbe`. Both optional objects use closed versioned
 schemas; earlier servers that omit them remain compatible.
+The `definitionPlanning` version `1` capability separately advertises the
+generic plan path, its non-mutating result, access-path method, bounded evidence
+sizes, and stable warning codes. The exact `derived-layers plan` command is
+also required; the CLI will not infer support from a similar recipe planner or
+call an unadvertised route. Generic planning also requires `queryGuard`,
+`queryPlanning`, and `materializationGuard`; every returned probe method and
+limit must match the same capability response fetched before the plan POST.
 
 When the server advertises `h3Readiness`, the CLI also validates its closed
 catalog-and-execution result and its consistency with `h3Available`. A failed
@@ -991,8 +1094,9 @@ those two lists match instead of treating the failure as query cost.
 When a compute failure contains reason `nested_loop_pair_work` and a valid
 over-limit `queryPlanningProbe`, the CLI adds `details.clientGuidance` without
 altering any server field. The guidance is an authoring aid, not a SQL rewrite:
-perform the selective candidate match on a native geometry or the exact
-prepared transform expression before materializing joined rows; aggregate
+perform the selective candidate match on a native indexed geometry or an exact
+expression that current access-path evidence proves is indexed before
+materializing joined rows; aggregate
 pair-local metrics after that match; calculate compatible complete-input
 global totals together in a single one-row aggregate referenced after selective
 aggregation while preserving row-dependent window semantics; calculate
@@ -1175,11 +1279,11 @@ Lower-level H3 point functions take PostgreSQL points as
 `(longitude, latitude)`. A line workflow may traverse cells between each
 segment's endpoint cells and expand candidates by a bounded grid ring, but it
 must still filter candidates with exact `ST_Intersects` against the generating
-segment. Cast output explicitly, for example
-`ST_Transform(...,3857)::geometry(Polygon,3857)`, so geometry type and SRID are
-part of the relation contract. Resolution changes should be re-materialized
-and re-previewed: feature count, cell size, rendering cost, and useful map zoom
-can all change substantially.
+segment. Normalize cell boundaries to multipolygons and cast output to
+`geometry(MultiPolygon,3857)` so antimeridian-split cells retain every part and
+geometry type and SRID are part of the relation contract. Resolution changes
+should be re-materialized and re-previewed: feature count, cell size, rendering
+cost, and useful map zoom can all change substantially.
 
 `style.hover` displays a selected feature field; it does not format numbers or
 append units. To show `1,250 m`, expose a text field from an authorized managed

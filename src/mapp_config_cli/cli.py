@@ -584,6 +584,19 @@ def parser() -> JsonArgumentParser:
         help="Preview the server-resolved workspace map extent.",
     )
     derived_map_extent.add_argument("--locale", type=nonempty)
+    derived_plan = derived_actions.add_parser(
+        "plan",
+        help=(
+            "Preflight a complete derived-layer create request without "
+            "applying a mutation."
+        ),
+    )
+    derived_plan.add_argument(
+        "--input",
+        default=argparse.SUPPRESS,
+        metavar="FILE",
+        help="Read the complete derived-layer create request from a JSON object file.",
+    )
     derived_h3_plan = derived_actions.add_parser(
         "plan-area-weighted-h3",
         help=(
@@ -1783,8 +1796,9 @@ def _derived_client_guidance(
                 "id": "keep-high-cardinality-inputs-indexable",
                 "message": (
                     "Perform the selective candidate match on a native "
-                    "geometry or an exact prepared transform expression "
-                    "before materializing or aggregating joined rows."
+                    "indexed geometry or an exact expression that current "
+                    "access-path evidence proves is indexed before "
+                    "materializing or aggregating joined rows."
                 ),
             },
             {
@@ -4262,6 +4276,79 @@ def _query_planning(
     return value
 
 
+_ACCESS_PATH_WARNING_CODES = [
+    "correlated_subplan_risk",
+    "cross_federation_join",
+    "foreign_predicate_not_pushed_down",
+    "scan_evidence_unavailable",
+    "transformed_predicate_not_index_backed",
+    "unbounded_relation_scan",
+    "unknown_statistics",
+]
+_ACCESS_PATH_INDEX_UNAVAILABLE_REASONS = [
+    "alias-not-active",
+    "catalog-unavailable",
+    "expanded-relation",
+    "federation-not-configured",
+    "metadata-limit",
+    "metadata-time-budget",
+    "relation-not-found",
+    "relation-not-registered",
+    "remote-catalog-required",
+]
+
+
+def _definition_planning_capability(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    access_path = value.get("accessPathProbe") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "version",
+            "path",
+            "mutationApplied",
+            "accessPathProbe",
+        }
+        or value.get("version") != "1"
+        or value.get("path") != "/api/derived-layers/plan"
+        or value.get("mutationApplied") is not False
+        or not isinstance(access_path, dict)
+        or set(access_path) != {
+            "version",
+            "method",
+            "maxRelationScans",
+            "maxWarnings",
+            "indexMetadata",
+            "warningCodes",
+        }
+        or access_path.get("version") != "1"
+        or access_path.get("method") != "postgresql-explain-access-paths"
+        or access_path.get("maxRelationScans") != 64
+        or access_path.get("maxWarnings") != 64
+        or access_path.get("indexMetadata") != {
+            "maxIndexes": 32,
+            "maxKeysPerIndex": 32,
+            "maxExpressionCharacters": 256,
+            "maxRemoteCatalogLookups": 8,
+            "coordinatorCatalogTimeBudgetSeconds": 5,
+            "remoteCatalogTimeBudgetSeconds": 15,
+            "maxRemoteCatalogLookupSeconds": 5,
+            "unavailableReasons": _ACCESS_PATH_INDEX_UNAVAILABLE_REASONS,
+        }
+        or access_path.get("warningCodes") != _ACCESS_PATH_WARNING_CODES
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
+
+
 def _query_planning_probe(
     value: Any,
     *,
@@ -4325,7 +4412,59 @@ def _derived_capabilities(
         _query_guard(data["queryGuard"], data=data, label=label)
     if "queryPlanning" in data:
         _query_planning(data["queryPlanning"], data=data, label=label)
+    if "definitionPlanning" in data:
+        _definition_planning_capability(
+            data["definitionPlanning"],
+            data=data,
+            label=label,
+        )
+    if "backgroundJobs" in data:
+        _derived_background_jobs({"backgroundJobs": data["backgroundJobs"]})
     return data
+
+
+def _area_weighted_h3_recipe_capability(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str = "Area-weighted H3 recipe capability",
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "name",
+            "version",
+            "available",
+            "planPath",
+            "maxMeasures",
+            "resolution",
+            "spatialScopeType",
+            "areaModel",
+            "geodeticSrid",
+            "useSpheroid",
+            "candidateContainment",
+            "mutationAppliedByPlan",
+        }
+        or value.get("name") != "area-weighted-h3"
+        or value.get("version") != 2
+        or not isinstance(value.get("available"), bool)
+        or value.get("planPath")
+        != "/api/derived-layers/recipes/area-weighted-h3/plan"
+        or value.get("maxMeasures") != 32
+        or value.get("resolution") != {"minimum": 0, "maximum": 15}
+        or value.get("spatialScopeType") != "workspace-map-extent"
+        or value.get("areaModel") != "wgs84-spheroid"
+        or value.get("geodeticSrid") != 4326
+        or value.get("useSpheroid") is not True
+        or value.get("candidateContainment") != "overlapping"
+        or value.get("mutationAppliedByPlan") is not False
+    ):
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+    return value
 
 
 _DERIVED_BACKGROUND_JOB_KEYS = {
@@ -4827,12 +4966,858 @@ def _validate_derived_layer_response(
             data=data,
             label="Derived layer",
         )
+        if "accessPathProbe" in derived_layer:
+            sources = derived_layer.get("sources")
+            if _normalized_derived_sources(sources) is None:
+                raise _invalid_response(
+                    "Derived layer",
+                    data,
+                    error_code="derived_layer.invalid_response",
+                )
+            _access_path_probe(
+                derived_layer["accessPathProbe"],
+                data=data,
+                label="Derived layer",
+                expected_sources=sources,
+            )
+
+
+_DERIVED_PLAN_KEYS = {
+    "version",
+    "createRequest",
+    "resolvedSpatialScope",
+    "queryPlanProbe",
+    "queryPlanningProbe",
+    "accessPathProbe",
+    "planFingerprint",
+}
+_ACCESS_PATH_PROBE_KEYS = {
+    "version",
+    "method",
+    "maxRelationScans",
+    "maxWarnings",
+    "sources",
+    "sourcesTruncated",
+    "relationScans",
+    "relationScansTruncated",
+    "summary",
+    "warnings",
+    "warningsTruncated",
+}
+_ACCESS_PATH_SOURCE_KEYS = {
+    "relation",
+    "relationKind",
+    "statisticsKnown",
+    "plannerEstimateSource",
+    "executionGroup",
+    "indexMetadata",
+}
+_ACCESS_PATH_SCAN_KEYS = {
+    "relation",
+    "scanType",
+    "estimatedRows",
+    "indexBacked",
+    "predicatePushdown",
+    "statisticsKnown",
+    "executionGroup",
+}
+_ACCESS_PATH_SUMMARY_KEYS = {
+    "relationScanCount",
+    "indexBackedScanCount",
+    "sequentialScanCount",
+    "foreignScanCount",
+    "subPlanCount",
+    "executionGroupCount",
+    "transformedPredicate",
+}
+_ACCESS_PATH_RELATION_KINDS = {
+    "table",
+    "partitioned-table",
+    "view",
+    "materialized-view",
+    "foreign-table",
+    "unknown",
+}
+_ACCESS_PATH_PUSHDOWN = {
+    "index-condition",
+    "remote",
+    "remote-with-local-filter",
+    "local-filter",
+    "tuple-condition",
+    "none-visible",
+    "unknown",
+}
+_DERIVED_IDENTIFIER = re.compile(r"[a-z][a-z0-9_]{0,62}")
+_DERIVED_RELATION = re.compile(
+    r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*"
+)
+
+
+def _normalized_derived_sources(value: Any) -> list[str] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    normalized = []
+    for source in value:
+        match = (
+            _DERIVED_RELATION.fullmatch(source)
+            if isinstance(source, str)
+            else None
+        )
+        if match is None:
+            return None
+        normalized.append(f"{match.group(1)}.{match.group(2)}")
+    return sorted(set(normalized))
+
+
+def _validate_generic_derived_plan_request(
+    request: dict[str, Any],
+) -> None:
+    allowed = {
+        "name",
+        "kind",
+        "query",
+        "sources",
+        "idColumn",
+        "geometryColumn",
+        "description",
+        "spatialScope",
+    }
+    required = {"name", "query", "sources", "idColumn", "geometryColumn"}
+    missing = sorted(required - set(request))
+    unknown = sorted(set(request) - allowed)
+    invalid_identifiers = [
+        key
+        for key in ("name", "idColumn", "geometryColumn")
+        if not isinstance(request.get(key), str)
+        or _DERIVED_IDENTIFIER.fullmatch(request[key]) is None
+    ]
+    query = request.get("query")
+    sources = request.get("sources")
+    normalized_sources = _normalized_derived_sources(sources)
+    description = request.get("description")
+    spatial_scope = request.get(
+        "spatialScope",
+        {"type": "workspace-map-extent"},
+    )
+    if (
+        missing
+        or unknown
+        or invalid_identifiers
+        or request.get("kind", "view") not in {"view", "materialized"}
+        or not isinstance(query, str)
+        or not query.strip()
+        or len(query.encode("utf-8")) > 256 * 1024
+        or not isinstance(sources, list)
+        or not sources
+        or normalized_sources is None
+        or any(
+            not isinstance(source, str)
+            or not source.strip()
+            or len(source.encode("utf-8")) > 256
+            for source in sources
+        )
+        or (description is not None and not isinstance(description, str))
+        or not isinstance(spatial_scope, dict)
+        or set(spatial_scope) - {"type", "locale"}
+        or spatial_scope.get("type") != "workspace-map-extent"
+        or (
+            "locale" in spatial_scope
+            and (
+                not isinstance(spatial_scope["locale"], str)
+                or not spatial_scope["locale"]
+            )
+        )
+    ):
+        raise CliError(
+            "Derived-layer planning requires one closed create request.",
+            EXIT_USAGE,
+            details={
+                **({"missing": missing} if missing else {}),
+                **({"unknown": unknown} if unknown else {}),
+                **(
+                    {"invalidIdentifiers": invalid_identifiers}
+                    if invalid_identifiers
+                    else {}
+                ),
+            },
+            error_code="derived_layer.invalid_plan_input",
+        )
+
+
+def _bounded_access_path_text(value: Any, *, maximum: int = 1000) -> bool:
+    return (
+        isinstance(value, str)
+        and value == value.strip()
+        and 0 < len(value) <= maximum
+    )
+
+
+def _bounded_access_path_catalog_text(
+    value: Any,
+    *,
+    maximum_bytes: int = 63,
+) -> bool:
+    """Accept bounded quoted catalog names without normalizing whitespace."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value.encode("utf-8")) <= maximum_bytes
+        and all(
+            ord(character) >= 32 and ord(character) != 127
+            for character in value
+        )
+    )
+
+
+def _access_path_execution_group(value: Any) -> bool:
+    return isinstance(value, str) and (
+        value in {"local", "unknown"}
+        or re.fullmatch(r"foreign-[1-9][0-9]*", value) is not None
+    )
+
+
+def _access_path_index_metadata(value: Any) -> bool:
+    if not isinstance(value, dict) or value.get("maxIndexes") != 32:
+        return False
+    if value.get("status") == "unavailable":
+        return (
+            set(value) == {"status", "reason", "maxIndexes"}
+            and value.get("reason")
+            in _ACCESS_PATH_INDEX_UNAVAILABLE_REASONS
+        )
+
+    allowed_keys = {
+        "status",
+        "source",
+        "maxIndexes",
+        "indexes",
+        "truncated",
+    }
+    if "relationEstimatedRows" in value:
+        allowed_keys.add("relationEstimatedRows")
+    if "lastAnalyze" in value:
+        allowed_keys.add("lastAnalyze")
+    indexes = value.get("indexes")
+    if (
+        set(value) != allowed_keys
+        or value.get("status") != "available"
+        or value.get("source")
+        not in {"coordinator-catalog", "remote-catalog"}
+        or not isinstance(indexes, list)
+        or len(indexes) > 32
+        or not isinstance(value.get("truncated"), bool)
+        or (value.get("truncated") is True and len(indexes) != 32)
+        or (
+            "relationEstimatedRows" in value
+            and not _nonnegative_integer(value["relationEstimatedRows"])
+        )
+        or (
+            "lastAnalyze" in value
+            and not _bounded_access_path_text(
+                value["lastAnalyze"],
+                maximum=100,
+            )
+        )
+    ):
+        return False
+
+    for index in indexes:
+        if (
+            not isinstance(index, dict)
+            or set(index) != {
+                "method",
+                "valid",
+                "ready",
+                "unique",
+                "primary",
+                "partial",
+                "keys",
+                "operatorClasses",
+                "supportsKnn",
+            }
+            or not _bounded_access_path_catalog_text(
+                index.get("method"),
+            )
+            or any(
+                not isinstance(index.get(key), bool)
+                for key in (
+                    "valid",
+                    "ready",
+                    "unique",
+                    "primary",
+                    "partial",
+                    "supportsKnn",
+                )
+            )
+            or not isinstance(index.get("keys"), list)
+            or len(index["keys"]) > 32
+            or not isinstance(index.get("operatorClasses"), list)
+            or len(index["operatorClasses"]) > 32
+        ):
+            return False
+        for key in index["keys"]:
+            if not isinstance(key, dict):
+                return False
+            if key.get("kind") == "column":
+                if (
+                    set(key) != {"kind", "name"}
+                    or not _bounded_access_path_catalog_text(
+                        key.get("name"),
+                    )
+                ):
+                    return False
+            elif key.get("kind") == "expression":
+                if key.get("expressionAvailable") is False:
+                    if set(key) != {"kind", "expressionAvailable"}:
+                        return False
+                elif (
+                    key.get("expressionAvailable") is not True
+                    or set(key) != {
+                        "kind",
+                        "expressionAvailable",
+                        "expression",
+                        "expressionTruncated",
+                    }
+                    or not _bounded_access_path_text(
+                        key.get("expression"),
+                        maximum=256,
+                    )
+                    or not isinstance(
+                        key.get("expressionTruncated"),
+                        bool,
+                    )
+                ):
+                    return False
+            else:
+                return False
+        for operator_class in index["operatorClasses"]:
+            if (
+                not isinstance(operator_class, dict)
+                or set(operator_class) != {"name", "supportsKnn"}
+                or not _bounded_access_path_catalog_text(
+                    operator_class.get("name"),
+                )
+                or not isinstance(
+                    operator_class.get("supportsKnn"),
+                    bool,
+                )
+            ):
+                return False
+        if index["supportsKnn"] != any(
+            operator_class["supportsKnn"]
+            for operator_class in index["operatorClasses"]
+        ):
+            return False
+    return True
+
+
+def _access_path_probe(
+    value: Any,
+    *,
+    data: dict[str, Any],
+    label: str,
+    expected_sources: list[str] | None = None,
+) -> dict[str, Any]:
+    def invalid() -> NoReturn:
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+
+    if (
+        not isinstance(value, dict)
+        or set(value) != _ACCESS_PATH_PROBE_KEYS
+        or value.get("version") != "1"
+        or value.get("method") != "postgresql-explain-access-paths"
+        or value.get("maxRelationScans") != 64
+        or value.get("maxWarnings") != 64
+        or not isinstance(value.get("sourcesTruncated"), bool)
+        or not isinstance(value.get("relationScansTruncated"), bool)
+        or not isinstance(value.get("warningsTruncated"), bool)
+    ):
+        invalid()
+
+    sources = value.get("sources")
+    scans = value.get("relationScans")
+    warnings = value.get("warnings")
+    if (
+        not isinstance(sources, list)
+        or len(sources) > value["maxRelationScans"]
+        or not isinstance(scans, list)
+        or len(scans) > value["maxRelationScans"]
+        or not isinstance(warnings, list)
+        or len(warnings) > value["maxWarnings"]
+        or (
+            value["relationScansTruncated"]
+            and len(scans) != value["maxRelationScans"]
+        )
+        or (
+            value["warningsTruncated"]
+            and len(warnings) != value["maxWarnings"]
+        )
+    ):
+        invalid()
+
+    source_by_relation: dict[str, dict[str, Any]] = {}
+    for source in sources:
+        source_keys = set(source) if isinstance(source, dict) else set()
+        relation = source.get("relation") if isinstance(source, dict) else None
+        relation_kind = (
+            source.get("relationKind") if isinstance(source, dict) else None
+        )
+        execution_group = (
+            source.get("executionGroup") if isinstance(source, dict) else None
+        )
+        index_metadata = (
+            source.get("indexMetadata") if isinstance(source, dict) else None
+        )
+        normalized_relation = _normalized_derived_sources([relation])
+        if (
+            not isinstance(source, dict)
+            or (
+                source_keys != _ACCESS_PATH_SOURCE_KEYS
+                and source_keys
+                != _ACCESS_PATH_SOURCE_KEYS | {"catalogEstimatedRows"}
+            )
+            or not _bounded_access_path_text(relation, maximum=256)
+            or normalized_relation != [relation]
+            or relation in source_by_relation
+            or relation_kind not in _ACCESS_PATH_RELATION_KINDS
+            or not isinstance(source.get("statisticsKnown"), bool)
+            or source.get("plannerEstimateSource")
+            not in {"local-statistics", "remote-explain", "unknown"}
+            or source["statisticsKnown"]
+            != (source["plannerEstimateSource"] != "unknown")
+            or (
+                source.get("plannerEstimateSource") == "local-statistics"
+                and "catalogEstimatedRows" not in source
+            )
+            or (
+                "catalogEstimatedRows" in source
+                and source["statisticsKnown"] is not True
+            )
+            or not _access_path_execution_group(execution_group)
+            or (
+                relation_kind == "foreign-table"
+                and execution_group != "unknown"
+                and not str(execution_group).startswith("foreign-")
+            )
+            or (
+                relation_kind in {"table", "materialized-view"}
+                and execution_group != "local"
+            )
+            or (
+                relation_kind in {"partitioned-table", "view", "unknown"}
+                and execution_group != "unknown"
+            )
+            or (
+                source.get("plannerEstimateSource") == "remote-explain"
+                and relation_kind != "foreign-table"
+            )
+            or not _access_path_index_metadata(index_metadata)
+            or (
+                isinstance(index_metadata, dict)
+                and index_metadata.get("status") == "available"
+                and (
+                    (
+                        relation_kind == "foreign-table"
+                        and index_metadata.get("source") != "remote-catalog"
+                    )
+                    or (
+                        relation_kind in {
+                            "table",
+                            "materialized-view",
+                            "partitioned-table",
+                        }
+                        and index_metadata.get("source")
+                        != "coordinator-catalog"
+                    )
+                    or relation_kind in {"view", "unknown"}
+                )
+            )
+            or (
+                relation_kind == "view"
+                and isinstance(index_metadata, dict)
+                and (
+                    index_metadata.get("status") != "unavailable"
+                    or index_metadata.get("reason") != "expanded-relation"
+                )
+            )
+            or (
+                relation_kind == "unknown"
+                and isinstance(index_metadata, dict)
+                and index_metadata.get("status") != "unavailable"
+            )
+            or (
+                isinstance(index_metadata, dict)
+                and index_metadata.get("status") == "available"
+                and index_metadata.get("source") == "coordinator-catalog"
+                and (
+                    (
+                        "relationEstimatedRows" in index_metadata
+                    )
+                    != ("catalogEstimatedRows" in source)
+                    or (
+                        "relationEstimatedRows" in index_metadata
+                        and not _canonical_json_equal(
+                            index_metadata["relationEstimatedRows"],
+                            source.get("catalogEstimatedRows"),
+                        )
+                    )
+                )
+            )
+            or (
+                "catalogEstimatedRows" in source
+                and not _nonnegative_integer(source["catalogEstimatedRows"])
+            )
+        ):
+            invalid()
+        source_by_relation[cast(str, relation)] = source
+
+    normalized_expected_sources = (
+        _normalized_derived_sources(expected_sources)
+        if expected_sources is not None
+        else None
+    )
+    if (
+        (expected_sources is not None and normalized_expected_sources is None)
+        or (
+            normalized_expected_sources is not None
+            and (
+                [source["relation"] for source in sources]
+                != normalized_expected_sources[: value["maxRelationScans"]]
+                or value["sourcesTruncated"]
+                != (
+                    len(normalized_expected_sources)
+                    > value["maxRelationScans"]
+                )
+            )
+        )
+        or (
+            value["sourcesTruncated"]
+            and len(sources) != value["maxRelationScans"]
+        )
+    ):
+        invalid()
+
+    for scan in scans:
+        relation = scan.get("relation") if isinstance(scan, dict) else None
+        scan_type = scan.get("scanType") if isinstance(scan, dict) else None
+        source = source_by_relation.get(cast(str, relation))
+        foreign_scan = scan_type == "Foreign Scan"
+        tuple_scan = scan_type in {"Tid Scan", "Tid Range Scan"}
+        if scan_type in {
+            "Index Scan",
+            "Index Only Scan",
+            "Bitmap Index Scan",
+        }:
+            valid_index_backed = scan.get("indexBacked") is True
+        elif scan_type == "Bitmap Heap Scan":
+            valid_index_backed = isinstance(scan.get("indexBacked"), bool)
+        elif scan_type in {"Seq Scan", "Sample Scan"}:
+            valid_index_backed = scan.get("indexBacked") is False
+        else:
+            valid_index_backed = scan.get("indexBacked") is None
+        if (
+            not isinstance(scan, dict)
+            or set(scan) != _ACCESS_PATH_SCAN_KEYS
+            or not _bounded_access_path_text(scan.get("relation"), maximum=256)
+            or not _bounded_access_path_text(scan.get("scanType"), maximum=200)
+            or not _nonnegative_integer(scan.get("estimatedRows"))
+            or not (
+                scan.get("indexBacked") is None
+                or isinstance(scan.get("indexBacked"), bool)
+            )
+            or scan.get("predicatePushdown") not in _ACCESS_PATH_PUSHDOWN
+            or not isinstance(scan.get("statisticsKnown"), bool)
+            or not _access_path_execution_group(scan.get("executionGroup"))
+            or source is None
+            or scan.get("statisticsKnown") != source.get("statisticsKnown")
+            or scan.get("executionGroup") != source.get("executionGroup")
+            or foreign_scan != (source.get("relationKind") == "foreign-table")
+            or not valid_index_backed
+            or (
+                scan.get("predicatePushdown")
+                in {"remote", "remote-with-local-filter"}
+                and not foreign_scan
+            )
+            or (
+                (scan.get("predicatePushdown") == "tuple-condition")
+                != tuple_scan
+            )
+        ):
+            invalid()
+
+    summary = value.get("summary")
+    count_keys = _ACCESS_PATH_SUMMARY_KEYS - {"transformedPredicate"}
+    visible_index_backed = sum(
+        scan["indexBacked"] is True for scan in scans
+    )
+    visible_sequential = sum(
+        scan["scanType"] == "Seq Scan" for scan in scans
+    )
+    visible_foreign = sum(
+        scan["scanType"] == "Foreign Scan" for scan in scans
+    )
+    visible_execution_groups = len({
+        source["executionGroup"]
+        for source in sources
+        if source["executionGroup"] != "unknown"
+    })
+    if (
+        not isinstance(summary, dict)
+        or set(summary) != _ACCESS_PATH_SUMMARY_KEYS
+        or any(
+            not _nonnegative_integer(summary.get(key))
+            for key in count_keys
+        )
+        or not isinstance(summary.get("transformedPredicate"), bool)
+        or summary["indexBackedScanCount"] > summary["relationScanCount"]
+        or summary["sequentialScanCount"] > summary["relationScanCount"]
+        or summary["foreignScanCount"] > summary["relationScanCount"]
+        or summary["executionGroupCount"] != visible_execution_groups
+        or (
+            not value["relationScansTruncated"]
+            and (
+                summary["relationScanCount"] != len(scans)
+                or summary["indexBackedScanCount"] != visible_index_backed
+                or summary["sequentialScanCount"] != visible_sequential
+                or summary["foreignScanCount"] != visible_foreign
+            )
+        )
+        or (
+            value["relationScansTruncated"]
+            and (
+                summary["relationScanCount"] <= len(scans)
+                or summary["indexBackedScanCount"] < visible_index_backed
+                or summary["sequentialScanCount"] < visible_sequential
+                or summary["foreignScanCount"] < visible_foreign
+            )
+        )
+    ):
+        invalid()
+
+    for warning in warnings:
+        warning_keys = set(warning) if isinstance(warning, dict) else set()
+        relation_warning_codes = {
+            "unknown_statistics",
+            "scan_evidence_unavailable",
+            "unbounded_relation_scan",
+            "foreign_predicate_not_pushed_down",
+        }
+        global_warning_codes = set(_ACCESS_PATH_WARNING_CODES) - (
+            relation_warning_codes
+        )
+        if (
+            not isinstance(warning, dict)
+            or (
+                warning_keys != {"code", "message", "suggestedAction"}
+                and warning_keys
+                != {"code", "message", "suggestedAction", "relation"}
+            )
+            or warning.get("code") not in _ACCESS_PATH_WARNING_CODES
+            or (
+                warning.get("code") in relation_warning_codes
+                and "relation" not in warning
+            )
+            or (
+                warning.get("code") in global_warning_codes
+                and "relation" in warning
+            )
+            or not _bounded_access_path_text(warning.get("message"))
+            or not _bounded_access_path_text(warning.get("suggestedAction"))
+            or (
+                "relation" in warning
+                and (
+                    not _bounded_access_path_text(
+                        warning["relation"],
+                        maximum=256,
+                    )
+                    or warning["relation"] not in source_by_relation
+                )
+            )
+        ):
+            invalid()
+    return value
+
+
+def _validate_generic_derived_plan_response(
+    data: dict[str, Any],
+    *,
+    request: dict[str, Any],
+    capabilities: dict[str, Any],
+) -> None:
+    label = "Derived-layer plan"
+
+    def invalid() -> NoReturn:
+        raise _invalid_response(
+            label,
+            data,
+            error_code="derived_layer.invalid_response",
+        )
+
+    plan = data.get("derivedLayerPlan")
+    expected_plan_keys = set(_DERIVED_PLAN_KEYS)
+    if request.get("kind", "view") == "materialized":
+        expected_plan_keys.add("materializationProbe")
+    fingerprint = plan.get("planFingerprint") if isinstance(plan, dict) else None
+    expected_create_request = {
+        **request,
+        "planFingerprint": fingerprint,
+    }
+    if (
+        not _has_exact_response_keys(
+            data,
+            {"derivedLayerPlan", "mutationApplied"},
+        )
+        or data.get("mutationApplied") is not False
+        or not isinstance(plan, dict)
+        or set(plan) != expected_plan_keys
+        or plan.get("version") != "1"
+        or not isinstance(fingerprint, str)
+        or re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            fingerprint,
+        ) is None
+        or not _canonical_json_equal(
+            plan.get("createRequest"),
+            expected_create_request,
+        )
+    ):
+        invalid()
+
+    requested_scope = request.get("spatialScope")
+    expected_locale = (
+        requested_scope.get("locale")
+        if isinstance(requested_scope, dict)
+        and isinstance(requested_scope.get("locale"), str)
+        else None
+    )
+    _derived_spatial_scope(
+        plan["resolvedSpatialScope"],
+        data=data,
+        label=label,
+        expected_locale=expected_locale,
+    )
+    query_probe = _query_plan_probe(
+        plan["queryPlanProbe"],
+        data=data,
+        label=label,
+    )
+    planning_probe = _query_planning_probe(
+        plan["queryPlanningProbe"],
+        data=data,
+        label=label,
+        require_within_limit=True,
+    )
+    access_probe = _access_path_probe(
+        plan["accessPathProbe"],
+        data=data,
+        label=label,
+        expected_sources=request["sources"],
+    )
+    query_guard = capabilities.get("queryGuard")
+    query_planning = capabilities.get("queryPlanning")
+    materialization_guard = capabilities.get("materializationGuard")
+    definition_planning = capabilities.get("definitionPlanning")
+    access_capability = (
+        definition_planning.get("accessPathProbe")
+        if isinstance(definition_planning, dict)
+        else None
+    )
+    h3_expansion = query_probe["h3Expansion"]
+    guard_h3 = (
+        query_guard.get("h3") if isinstance(query_guard, dict) else None
+    )
+    if (
+        not isinstance(query_guard, dict)
+        or not isinstance(query_planning, dict)
+        or not isinstance(materialization_guard, dict)
+        or not isinstance(access_capability, dict)
+        or query_probe["method"] != query_guard.get("method")
+        or not _canonical_json_equal(
+            query_probe["limits"],
+            query_guard.get("limits"),
+        )
+        or not isinstance(guard_h3, dict)
+        or not _canonical_json_equal(
+            h3_expansion["maxEstimatedScopeCells"],
+            guard_h3.get("maxEstimatedScopeCells"),
+        )
+        or not _canonical_json_equal(
+            h3_expansion["maxEstimatedExpandedCells"],
+            guard_h3.get("maxEstimatedExpandedCells"),
+        )
+        or not _canonical_json_equal(
+            h3_expansion["safetyMultiplier"],
+            guard_h3.get("scopeEstimateSafetyMultiplier"),
+        )
+        or not _canonical_json_equal(
+            h3_expansion["maxAllowedGridDistance"],
+            guard_h3.get("maxGridDistance"),
+        )
+        or planning_probe["version"] != query_planning.get("version")
+        or planning_probe["method"] != query_planning.get("method")
+        or not _canonical_json_equal(
+            planning_probe["maxAllowedNestedLoopPairRows"],
+            query_planning.get("maxNestedLoopPairRows"),
+        )
+        or access_probe["version"] != access_capability.get("version")
+        or access_probe["method"] != access_capability.get("method")
+        or not _canonical_json_equal(
+            access_probe["maxRelationScans"],
+            access_capability.get("maxRelationScans"),
+        )
+        or not _canonical_json_equal(
+            access_probe["maxWarnings"],
+            access_capability.get("maxWarnings"),
+        )
+        or planning_probe["nestedLoopCount"] > query_probe["planNodeCount"]
+        or access_probe["summary"]["relationScanCount"]
+        > query_probe["planNodeCount"]
+        or access_probe["summary"]["subPlanCount"]
+        > query_probe["planNodeCount"]
+        or any(
+            scan["estimatedRows"] > query_probe["maxIntermediateRows"]
+            for scan in access_probe["relationScans"]
+        )
+    ):
+        invalid()
+    if "materializationProbe" in plan:
+        materialization_probe = _materialization_probe(
+            plan["materializationProbe"],
+            data=data,
+            label=label,
+        )
+        if any(
+            not _canonical_json_equal(
+                materialization_probe[key],
+                materialization_guard.get(key),
+            )
+            for key in (
+                "method",
+                "maxEstimatedBytes",
+                "rowOverheadBytes",
+                "safetyMultiplier",
+            )
+        ) or (
+            materialization_probe["estimatedRows"]
+            != query_probe["estimatedFinalRows"]
+        ) or (
+            materialization_probe["estimatedRows"]
+            * materialization_probe["planRowWidthBytes"]
+            > query_probe["maxIntermediateBytes"]
+        ):
+            invalid()
 
 
 def _validate_area_weighted_h3_plan_response(
     data: dict[str, Any],
     *,
     request: dict[str, Any],
+    capability: dict[str, Any],
 ) -> None:
     label = "Area-weighted H3 recipe plan"
 
@@ -4889,10 +5874,13 @@ def _validate_area_weighted_h3_plan_response(
         or not isinstance(plan, dict)
         or not isinstance(recipe, dict)
         or recipe.get("name") != "area-weighted-h3"
-        or not _nonnegative_integer(recipe.get("version"))
-        or recipe["version"] == 0
-        or recipe.get("areaCrs") != "EPSG:27700"
-        or recipe.get("candidateContainment") != "overlapping"
+        or recipe.get("version") != capability.get("version")
+        or recipe.get("areaModel") != capability.get("areaModel")
+        or recipe.get("geodeticSrid") != capability.get("geodeticSrid")
+        or recipe.get("useSpheroid") is not True
+        or recipe.get("useSpheroid") != capability.get("useSpheroid")
+        or recipe.get("candidateContainment")
+        != capability.get("candidateContainment")
         or not isinstance(create_request, dict)
         or not nonempty_text(request.get("name"))
         or create_request.get("name") != request.get("name")
@@ -4930,7 +5918,7 @@ def _validate_area_weighted_h3_plan_response(
         or output.get("idColumn") != create_request.get("idColumn")
         or output.get("resolutionColumn") != "h3_resolution"
         or output.get("geometryColumn") != create_request.get("geometryColumn")
-        or output.get("geometryType") != "Polygon"
+        or output.get("geometryType") != "MultiPolygon"
         or output.get("srid") != 3857
         or not isinstance(assumptions, list)
         or not assumptions
@@ -4973,9 +5961,14 @@ def _validate_area_weighted_h3_plan_response(
         or not _nonnegative_integer(geometry_column.get("srid"))
         or geometry_column["srid"] == 0
         or not isinstance(metric_geometry, dict)
-        or metric_geometry.get("srid") != 27700
+        or set(metric_geometry) != {"type", "srid", "mode", "useSpheroid"}
+        or metric_geometry.get("type") != "geography"
+        or metric_geometry.get("srid") != 4326
+        or metric_geometry.get("useSpheroid") is not True
         or metric_geometry.get("mode") != (
-            "native" if geometry_column.get("srid") == 27700 else "transform"
+            "cast"
+            if geometry_column.get("srid") == 4326
+            else "transform-and-cast"
         )
         or (
             "assetVersion" in source
@@ -5050,14 +6043,28 @@ def _validate_area_weighted_h3_plan_response(
         require_within_limit=True,
     )
 
+    # Older recipe-capable servers did not return this additive probe. When
+    # present, apply the same closed, bounded validation as generic planning.
+    if "accessPathProbe" in plan:
+        _access_path_probe(
+            plan["accessPathProbe"],
+            data=data,
+            label=label,
+            expected_sources=create_request["sources"],
+        )
+
     if kind == "materialized":
         if "materializationProbe" not in plan:
             invalid()
-        _materialization_probe(
+        materialization_probe = _materialization_probe(
             plan["materializationProbe"],
             data=data,
             label=label,
         )
+        if materialization_probe["estimatedRows"] != query_probe_core[
+            "estimatedFinalRows"
+        ]:
+            invalid()
     elif "materializationProbe" in plan:
         invalid()
 
@@ -8284,16 +9291,75 @@ def _run_authenticated(args, store: ConfigStore) -> dict[str, Any]:
                 label="Derived-layer map extent",
                 expected_locale=args.locale,
             )
+        elif args.action == "plan":
+            request_payload = input_object(args)
+            _validate_generic_derived_plan_request(request_payload)
+            capabilities = _derived_capabilities(
+                client.request(f"{base}/capabilities")
+            )
+            required_capabilities = {
+                "definitionPlanning",
+                "materializationGuard",
+                "queryGuard",
+                "queryPlanning",
+            }
+            missing_capabilities = sorted(
+                required_capabilities - set(capabilities)
+            )
+            if missing_capabilities:
+                raise CliError(
+                    "The server does not advertise the complete generic "
+                    "definition-planning contract.",
+                    EXIT_CONFLICT,
+                    details={
+                        "requiredCapabilities": sorted(required_capabilities),
+                        "missingCapabilities": missing_capabilities,
+                    },
+                    error_code="capability.missing",
+                )
+            try:
+                result = client.request(
+                    f"{base}/plan",
+                    method="POST",
+                    payload=request_payload,
+                )
+            except CliError as exc:
+                enriched = _with_derived_client_guidance(exc)
+                if enriched is not exc:
+                    raise enriched from exc
+                raise
+            _validate_generic_derived_plan_response(
+                result,
+                request=request_payload,
+                capabilities=capabilities,
+            )
         elif args.action == "plan-area-weighted-h3":
             request_payload = input_object(args)
-            result = client.request(
-                f"{base}/recipes/area-weighted-h3/plan",
-                method="POST",
-                payload=request_payload,
+            capabilities = _derived_capabilities(
+                client.request(f"{base}/capabilities")
             )
+            recipes = capabilities.get("recipes")
+            recipe_capability = _area_weighted_h3_recipe_capability(
+                recipes.get("areaWeightedH3")
+                if isinstance(recipes, dict)
+                else None,
+                data=capabilities,
+            )
+            try:
+                result = client.request(
+                    recipe_capability["planPath"],
+                    method="POST",
+                    payload=request_payload,
+                )
+            except CliError as exc:
+                enriched = _with_derived_client_guidance(exc)
+                if enriched is not exc:
+                    raise enriched from exc
+                raise
             _validate_area_weighted_h3_plan_response(
                 result,
                 request=request_payload,
+                capability=recipe_capability,
             )
         elif args.action == "show":
             result = client.request(f"{base}/{quote_segment(args.name)}")
@@ -9085,11 +10151,11 @@ def run(args, store: ConfigStore | None = None) -> dict[str, Any]:
         )
     if (
         args.command == "derived-layers"
-        and args.action == "plan-area-weighted-h3"
+        and args.action in {"plan", "plan-area-weighted-h3"}
         and not args.input
     ):
         raise CliError(
-            "Area-weighted H3 planning requires --input.",
+            "Derived-layer planning requires --input.",
             EXIT_USAGE,
             error_code="input.required",
         )
@@ -9099,7 +10165,7 @@ def run(args, store: ConfigStore | None = None) -> dict[str, Any]:
             "visual-plan", "visual-test", "screenshot",
         }
         or args.command == "derived-layers"
-        and args.action in {"create", "plan-area-weighted-h3"}
+        and args.action in {"create", "plan", "plan-area-weighted-h3"}
         or args.command == "proposals"
         and args.action in {
             "check", "create", "preview-plan", "preview-test",

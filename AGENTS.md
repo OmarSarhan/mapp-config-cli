@@ -380,6 +380,52 @@ relation does not add it to XYZ. Inspect the new catalog relation and use the
 normal revision-bound proposal and approval workflow for the workspace layer
 as a separate step.
 
+Before presenting any hand-authored definition, write the complete create
+request to a private JSON file and run the non-mutating generic planner:
+
+```sh
+config-cli derived-layers plan --input DRAFT_CREATE.json
+```
+
+Require `mutationApplied: false`, then review the replayable `createRequest`,
+`resolvedSpatialScope`, query and pair probes, materialization probe when
+present, and the bounded `accessPathProbe`. Treat its source estimate
+provenance, execution groups, relation scans, predicate-pushdown evidence,
+index inventory, and warnings as planning evidence rather than guarantees.
+Unknown or truncated evidence is a reason to narrow the query, not permission
+to assume an index. Treat `remote-with-local-filter` as residual coordinator
+work and `scan_evidence_unavailable` as uncertainty, not a clean scan.
+`tuple-condition` is a bounded PostgreSQL TID/TID-range access path, but it is
+not evidence of a reusable SQL index predicate or spatial index.
+`indexMetadata.reason: "expanded-relation"` means PostgreSQL planned through a
+view or nested foreign relation, so the wrapper cannot provide a trustworthy
+physical-index inventory. A passing plan is not authorization. After separate
+approval, submit the exact returned `derivedLayerPlan.createRequest` with
+`derived-layers create --input REVIEWED_CREATE.json --confirm`; do not rebuild
+it from the draft or discard its plan binding.
+That fingerprint binds the exact definition, resolved scope, and reviewed
+database plan/access-path evidence. Create rechecks that the declared semantic
+profiles are ready, but semantic asset versions and curated meaning are not
+part of the fingerprint. Reinspect and replan after any semantic-catalog change
+instead of claiming that meaning drift will automatically fail closed.
+The CLI requires `definitionPlanning` plus the companion `queryGuard`,
+`queryPlanning`, and `materializationGuard` capabilities before planning, and
+binds every returned probe method and limit to that fetched capability
+snapshot. Do not accept probe limits assembled from a different deployment or
+capability read.
+
+When the reviewed plan shows costly or federated work that remains within the
+server's admission limits, submit that exact create request with `--background`
+and let the CLI follow it. Use `--detach` only for a deliberate handoff to a
+separate monitor; never resubmit work while it is queued.
+
+Index discovery is bounded by a 5-second aggregate coordinator-catalog
+budget. Remote discovery is sequential, permits at most eight lookups, and is
+also bounded by 5 seconds per lookup and 15 seconds in aggregate.
+`indexMetadata.reason: "metadata-time-budget"` means the relevant aggregate
+budget was exhausted; treat that source's index state as unknown and narrow
+the query rather than retrying the plan in a loop.
+
 For additive polygon measures allocated into H3 cells by intersection-area
 share, prefer the supported read-only planner over hand-authored SQL:
 
@@ -390,6 +436,13 @@ config-cli derived-layers plan-area-weighted-h3 --input RECIPE.json
 The planner must report `mutationApplied: false`. It validates the ready
 PostgreSQL semantic profile and requested fields, resolves the fixed map scope,
 and returns query-plan, pair-planning, and materialization probes as applicable.
+Newer servers also return the generic planner's bounded `accessPathProbe`; the
+CLI validates it when present and agents must review it under the same rules.
+Require recipe capability and plan version `2`: it measures intersections as
+EPSG:4326 geography with the spheroid enabled, transforming non-4326 source
+geometry once after source-native candidate filtering. It normalizes H3 output
+to `geometry(MultiPolygon,3857)` so antimeridian-split cells retain every part.
+Do not treat the older regional planar recipe as equivalent.
 Review its source, measures, assumptions, generated query, canonical
 `createRequest`, full `resolvedSpatialScope`, and probes. Do not treat a passing
 plan as approval. Only after separate authorization, save the exact reviewed
@@ -399,9 +452,10 @@ plan as approval. Only after separate authorization, save the exact reviewed
 config-cli derived-layers create --input REVIEWED_CREATE.json --confirm
 ```
 
-Create authoritatively resolves the scope and preflights again, so stop on
-workspace, semantic-catalog, or plan drift rather than modifying or retrying
-the reviewed request automatically.
+Create resolves the current scope and repeats semantic readiness plus database
+preflight. The recipe request does not fingerprint a semantic asset version or
+curated meaning, so reinspect and replan after semantic-catalog or workspace
+changes instead of claiming that all such drift will automatically block.
 
 Store agent- or operator-generated derived-layer SQL drafts under the
 repository-local, git-ignored `tmp/` directory, for example
@@ -448,8 +502,9 @@ and materialized views; preserve the accepted
 `nested_loop_pair_work` and valid over-limit planning evidence receives
 additive `details.clientGuidance` from the CLI. Present the server's unchanged
 message, action, reasons, and probe first, then use that client guidance to
-rewrite the query: perform the selective candidate match on a native geometry
-or the exact prepared transform expression before materializing joined rows;
+rewrite the query: perform the selective candidate match on a native indexed
+geometry or an exact expression that current access-path evidence proves is
+indexed before materializing joined rows;
 aggregate pair-local metrics only after that match; compute compatible
 complete-input totals together in a single one-row aggregate referenced after the
 selective aggregation; preserve row-dependent window semantics; compute
@@ -510,30 +565,56 @@ reports HTTP `5xx`,
 inspect `derived-layers list|show` and the catalog before retrying because the
 database relation may already have committed.
 
-For UK metric area weighting, the bundled platform prepares the exact
-`ST_Transform(source.geom, 27700)` GiST expression. Put that expression in the
-selective `&&`/`ST_Intersects` candidate predicate before materializing matched
-pairs; a materialized CTE containing all transformed source rows hides the
-expression index. Transform each generated cell once, compute intersection and
-source areas once for accepted pairs, then aggregate pair-local metrics. Keep
-complete-input benchmarks in a separate one-row aggregate attached afterward.
+Never assume that a transformed geometry expression has an index. Use the
+generic plan's exact index and scan evidence. Bound every large source in its
+own execution group before a cross-source join, and keep the indexed geometry
+operand bare in source-local `&&`/`ST_Intersects` predicates. Use an indexed
+native geometry or EPSG:3857 path for coarse candidate selection when the plan
+proves that path. For globally scoped metre and area work, prefer EPSG:4326
+geography or explicit geodesic calculations when their semantics and access
+path are suitable. EPSG:4326 geometry itself still uses angular units, and
+EPSG:3857 distances and areas are distorted. A profiled local projected CRS is
+an option only when its area of use, units, distortion, and available index
+evidence fit the request; transform only the narrowed candidates and do not
+hardcode a regional CRS. Transform final output to EPSG:3857 when XYZ needs it.
+WGS84 geography supports worldwide and dateline-crossing metric work, but
+EPSG:3857 XYZ output is limited to the Web-Mercator latitude domain and cannot
+represent the polar caps.
+Compute each transform, intersection, and area once after the selective match,
+then aggregate pair-local metrics. Keep complete-input benchmarks in a
+separate one-row aggregate attached afterward.
 
 Lower-level H3 point input uses PostgreSQL point order `(longitude, latitude)`.
 When line-to-cell generation is required, segment endpoint traversal plus a
 bounded neighbouring-ring expansion can produce candidates, but every accepted
 cell must still pass the reviewed exact predicate against the source segment.
-Cast the published geometry to an explicit typmod such as
-`geometry(Polygon,3857)`; a transformed geometry with only a runtime SRID may
-fail derived-output validation. Resolution changes can alter feature counts and
-useful preview zooms by orders of magnitude, so materialize and visually test
-the requested resolution rather than treating it as a label-only change.
+Normalize cell boundaries to multipolygons and cast the published geometry to
+`geometry(MultiPolygon,3857)` so antimeridian-split cells retain every part and
+the relation has an explicit type and SRID. A transformed geometry with only a
+runtime SRID may fail derived-output validation. Resolution changes can alter
+feature counts and useful preview zooms by orders of magnitude, so materialize
+and visually test the requested resolution rather than treating it as a
+label-only change.
 
-For several reviewed slow mutations, inspect `derived-layers jobs`, submit
-each with `--background --detach`, retain every returned operation ID, and use
-`operations wait OPERATION_ID --progress --wait-timeout 1860`. A
-`waiting-for-worker` stage is already admitted durable work; do not submit it
-again. A local timeout or interruption does not cancel it or authorize an
-automatic retry.
+For one reviewed slow mutation, use `--background` without `--detach`: the CLI
+follows the durable operation to a terminal state by default and writes safe
+status/stage transitions to stderr while preserving final JSON on stdout.
+There is no fixed queue wait deadline unless `--wait-timeout SECONDS` is
+supplied. During following, the CLI may retry only the idempotent operation
+status GET across a bounded transient connectivity/HTTP 408/429/5xx outage; it
+never resubmits the mutation POST. For several deliberately detached jobs,
+inspect `derived-layers jobs`, retain every operation ID, and run `operations
+wait OPERATION_ID` for each; add `--progress` when explicitly following an
+older detached operation. A `waiting-for-worker` stage is already admitted
+durable work and is not permission to submit it again. A local timeout,
+prolonged polling outage, or interruption does not cancel the operation or
+authorize an automatic mutation retry.
+For create and replace, `source-revalidation` rechecks semantic source
+readiness after the queue wait. Only a fingerprinted create can then report
+`plan-revalidation`, which reruns its reviewed database plan binding. Refresh
+advances from the queue directly to `database-transaction`. The revalidation
+stages are preflight and make no database change; `database-transaction` is
+the mutation boundary.
 
 A durable background operation can report a terminal serialization or result-
 reporting failure after its database transaction committed. Audit

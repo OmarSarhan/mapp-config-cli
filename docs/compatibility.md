@@ -197,7 +197,19 @@ The area-weighted H3 planner likewise requires the exact
 `derived-layers.plan-area-weighted-h3` explicitly for its current request,
 risk, route, and scope schema. Its successful response must remain non-mutating
 and include a replayable create request plus resolved scope and preflight
-evidence.
+evidence. The CLI also fetches the derived-layer recipe capability before
+planning and requires version `2`, the WGS84 spheroid model with
+`geodeticSrid: 4326` and `useSpheroid: true`, and the matching plan response.
+It does not silently accept the older regional plan contract.
+Hand-authored definition planning separately requires the exact
+`derived-layers plan` command. `derived-layers capabilities` must advertise the
+closed `definitionPlanning` version, non-mutating route, access-path method,
+evidence caps, and warning vocabulary. The CLI validates the bounded
+`derivedLayerPlan` response and will not substitute the recipe-specific route
+or infer generic planning support from API major compatibility alone. Version
+1 definition planning also requires the companion `queryGuard`,
+`queryPlanning`, and `materializationGuard` sections, and the success probes
+must match the methods and limits from that same capability read.
 
 ## Upgrade procedure
 

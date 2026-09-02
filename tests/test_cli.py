@@ -252,6 +252,15 @@ def materialization_probe() -> dict:
     }
 
 
+def materialization_guard() -> dict:
+    return {
+        "method": "postgresql-explain",
+        "maxEstimatedBytes": 1024 ** 3,
+        "rowOverheadBytes": 32,
+        "safetyMultiplier": 1.2,
+    }
+
+
 def query_plan_limits() -> dict:
     return {
         "maxTotalCost": 50_000_000,
@@ -354,6 +363,213 @@ def query_planning_probe(*, estimated_pair_rows: int = 2_000_000) -> dict:
     }
 
 
+def generic_derived_plan_request(*, kind: str = "materialized") -> dict:
+    return {
+        "name": "bounded_population",
+        "kind": kind,
+        "query": (
+            "SELECT area_id, population, geom_3857 "
+            "FROM census.output_areas WHERE geom_3857 && "
+            "ST_MakeEnvelope(-250000, 7000000, -50000, 7300000, 3857)"
+        ),
+        "sources": ["census.output_areas"],
+        "idColumn": "area_id",
+        "geometryColumn": "geom_3857",
+        "spatialScope": {
+            "type": "workspace-map-extent",
+            "locale": "city-centre",
+        },
+    }
+
+
+def access_path_probe(*, relation: str = "census.output_areas") -> dict:
+    return {
+        "version": "1",
+        "method": "postgresql-explain-access-paths",
+        "maxRelationScans": 64,
+        "maxWarnings": 64,
+        "sources": [{
+            "relation": relation,
+            "relationKind": "foreign-table",
+            "statisticsKnown": True,
+            "plannerEstimateSource": "remote-explain",
+            "executionGroup": "foreign-1",
+            "indexMetadata": {
+                "status": "available",
+                "source": "remote-catalog",
+                "maxIndexes": 32,
+                "indexes": [{
+                    "method": "gist",
+                    "valid": True,
+                    "ready": True,
+                    "unique": False,
+                    "primary": False,
+                    "partial": False,
+                    "keys": [{"kind": "column", "name": "geom_3857"}],
+                    "operatorClasses": [{
+                        "name": "gist_geometry_ops_2d",
+                        "supportsKnn": True,
+                    }],
+                    "supportsKnn": True,
+                }],
+                "truncated": False,
+                "relationEstimatedRows": 178_605,
+                "lastAnalyze": "2026-09-01T12:00:00+00:00",
+            },
+        }],
+        "sourcesTruncated": False,
+        "relationScans": [{
+            "relation": relation,
+            "scanType": "Foreign Scan",
+            "estimatedRows": 2_500,
+            "indexBacked": None,
+            "predicatePushdown": "remote-with-local-filter",
+            "statisticsKnown": True,
+            "executionGroup": "foreign-1",
+        }],
+        "relationScansTruncated": False,
+        "summary": {
+            "relationScanCount": 1,
+            "indexBackedScanCount": 0,
+            "sequentialScanCount": 0,
+            "foreignScanCount": 1,
+            "subPlanCount": 0,
+            "executionGroupCount": 1,
+            "transformedPredicate": False,
+        },
+        "warnings": [{
+            "code": "foreign_predicate_not_pushed_down",
+            "message": "A foreign scan retains a coordinator-side filter.",
+            "suggestedAction": "Move the bounded predicate into the source scan.",
+            "relation": relation,
+        }],
+        "warningsTruncated": False,
+    }
+
+
+def definition_planning_capability() -> dict:
+    return {
+        "version": "1",
+        "path": "/api/derived-layers/plan",
+        "mutationApplied": False,
+        "accessPathProbe": {
+            "version": "1",
+            "method": "postgresql-explain-access-paths",
+            "maxRelationScans": 64,
+            "maxWarnings": 64,
+            "indexMetadata": {
+                "maxIndexes": 32,
+                "maxKeysPerIndex": 32,
+                "maxExpressionCharacters": 256,
+                "maxRemoteCatalogLookups": 8,
+                "coordinatorCatalogTimeBudgetSeconds": 5,
+                "remoteCatalogTimeBudgetSeconds": 15,
+                "maxRemoteCatalogLookupSeconds": 5,
+                "unavailableReasons": [
+                    "alias-not-active",
+                    "catalog-unavailable",
+                    "expanded-relation",
+                    "federation-not-configured",
+                    "metadata-limit",
+                    "metadata-time-budget",
+                    "relation-not-found",
+                    "relation-not-registered",
+                    "remote-catalog-required",
+                ],
+            },
+            "warningCodes": [
+                "correlated_subplan_risk",
+                "cross_federation_join",
+                "foreign_predicate_not_pushed_down",
+                "scan_evidence_unavailable",
+                "transformed_predicate_not_index_backed",
+                "unbounded_relation_scan",
+                "unknown_statistics",
+            ],
+        },
+    }
+
+
+def generic_planning_capabilities() -> dict:
+    return {
+        "configured": True,
+        "schema": "derived_layers",
+        "kinds": ["view", "materialized"],
+        "materializationGuard": materialization_guard(),
+        "queryGuard": query_guard(),
+        "queryPlanning": query_planning(),
+        "definitionPlanning": definition_planning_capability(),
+    }
+
+
+def area_weighted_h3_recipe_capability() -> dict:
+    return {
+        "name": "area-weighted-h3",
+        "version": 2,
+        "available": True,
+        "planPath": "/api/derived-layers/recipes/area-weighted-h3/plan",
+        "maxMeasures": 32,
+        "resolution": {"minimum": 0, "maximum": 15},
+        "spatialScopeType": "workspace-map-extent",
+        "areaModel": "wgs84-spheroid",
+        "geodeticSrid": 4326,
+        "useSpheroid": True,
+        "candidateContainment": "overlapping",
+        "mutationAppliedByPlan": False,
+    }
+
+
+def area_weighted_h3_capabilities() -> dict:
+    return {
+        "configured": True,
+        "schema": "derived_layers",
+        "kinds": ["view", "materialized"],
+        "recipes": {
+            "areaWeightedH3": area_weighted_h3_recipe_capability(),
+        },
+    }
+
+
+def generic_derived_plan_response(*, kind: str = "materialized") -> dict:
+    request = generic_derived_plan_request(kind=kind)
+    fingerprint = "sha256:" + "a" * 64
+    plan = {
+        "version": "1",
+        "createRequest": {**request, "planFingerprint": fingerprint},
+        "resolvedSpatialScope": map_extent_scope("city-centre"),
+        "queryPlanProbe": query_plan_probe(),
+        "queryPlanningProbe": query_planning_probe(),
+        "accessPathProbe": access_path_probe(),
+        "planFingerprint": fingerprint,
+    }
+    if kind == "materialized":
+        storage_probe = materialization_probe()
+        storage_probe["estimatedRows"] = plan["queryPlanProbe"][
+            "estimatedFinalRows"
+        ]
+        storage_probe["estimatedBytes"] = 12_000_000
+        plan["materializationProbe"] = storage_probe
+    return {"derivedLayerPlan": plan, "mutationApplied": False}
+
+
+def local_tid_derived_plan_response() -> dict:
+    response = generic_derived_plan_response()
+    access_probe = response["derivedLayerPlan"]["accessPathProbe"]
+    source = access_probe["sources"][0]
+    source["relationKind"] = "table"
+    source["plannerEstimateSource"] = "local-statistics"
+    source["catalogEstimatedRows"] = 178_605
+    source["executionGroup"] = "local"
+    source["indexMetadata"]["source"] = "coordinator-catalog"
+    scan = access_probe["relationScans"][0]
+    scan["scanType"] = "Tid Scan"
+    scan["predicatePushdown"] = "tuple-condition"
+    scan["executionGroup"] = "local"
+    access_probe["summary"]["foreignScanCount"] = 0
+    access_probe["warnings"] = []
+    return response
+
+
 def area_weighted_h3_request(*, kind: str = "materialized") -> dict:
     return {
         "name": "population_h3_r9",
@@ -389,8 +605,10 @@ def area_weighted_h3_response(*, kind: str = "materialized") -> dict:
     plan = {
         "recipe": {
             "name": "area-weighted-h3",
-            "version": 1,
-            "areaCrs": "EPSG:27700",
+            "version": 2,
+            "areaModel": "wgs84-spheroid",
+            "geodeticSrid": 4326,
+            "useSpheroid": True,
             "candidateContainment": "overlapping",
             "futureRecipeField": True,
         },
@@ -428,7 +646,12 @@ def area_weighted_h3_response(*, kind: str = "materialized") -> dict:
                 "geometryType": "MULTIPOLYGON",
                 "srid": 4326,
             },
-            "metricGeometry": {"srid": 27700, "mode": "transform"},
+            "metricGeometry": {
+                "type": "geography",
+                "srid": 4326,
+                "mode": "cast",
+                "useSpheroid": True,
+            },
         },
         "resolution": 9,
         "measures": [{
@@ -445,7 +668,7 @@ def area_weighted_h3_response(*, kind: str = "materialized") -> dict:
             "idColumn": "h3_id",
             "resolutionColumn": "h3_resolution",
             "geometryColumn": "geom_3857",
-            "geometryType": "Polygon",
+            "geometryType": "MultiPolygon",
             "srid": 3857,
         },
         "assumptions": [
@@ -454,11 +677,17 @@ def area_weighted_h3_response(*, kind: str = "materialized") -> dict:
         ],
         "queryPlanProbe": plan_probe,
         "queryPlanningProbe": planning_probe,
+        "accessPathProbe": access_path_probe(
+            relation=request["source"]["relation"],
+        ),
         "futurePlanField": {"accepted": True},
     }
     if kind == "materialized":
+        storage_probe = materialization_probe()
+        storage_probe["estimatedRows"] = plan_probe["estimatedFinalRows"]
+        storage_probe["estimatedBytes"] = 12_000_000
         plan["materializationProbe"] = {
-            **materialization_probe(),
+            **storage_probe,
             "futureEstimate": 1,
         }
     return {
@@ -865,6 +1094,10 @@ class CliTests(unittest.TestCase):
             return 200, response_payload
 
         routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            area_weighted_h3_capabilities(),
+        )
         routes[(
             "POST", "/api/derived-layers/recipes/area-weighted-h3/plan"
         )] = plan
@@ -898,9 +1131,432 @@ class CliTests(unittest.TestCase):
             payload["recipePlan"]["queryPlanProbe"]["futureEvidence"]["accepted"]
         )
 
+    def test_generic_derived_planner_posts_closed_request_and_preserves_evidence(self):
+        captured = {}
+        request_payload = generic_derived_plan_request()
+        response_payload = generic_derived_plan_response()
+
+        def plan(request):
+            captured["body"] = request["body"]
+            return 200, response_payload
+
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            generic_planning_capabilities(),
+        )
+        routes[("POST", "/api/derived-layers/plan")] = plan
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "derived-plan.json"
+            input_file.write_text(json.dumps(request_payload), encoding="utf-8")
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "plan", "--input", str(input_file)],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(request_payload, captured["body"])
+        payload = json.loads(stdout)
+        self.assertFalse(payload["mutationApplied"])
+        plan_payload = payload["derivedLayerPlan"]
+        self.assertEqual(
+            {
+                **request_payload,
+                "planFingerprint": "sha256:" + "a" * 64,
+            },
+            plan_payload["createRequest"],
+        )
+        self.assertEqual(
+            "postgresql-explain-access-paths",
+            plan_payload["accessPathProbe"]["method"],
+        )
+        self.assertEqual(
+            "sha256:" + "a" * 64,
+            plan_payload["planFingerprint"],
+        )
+
+    def test_generic_derived_planner_requires_exact_definition_capability(self):
+        missing = {
+            "configured": True,
+            "schema": "derived_layers",
+            "kinds": ["view", "materialized"],
+        }
+        drifted = generic_planning_capabilities()
+        drifted["definitionPlanning"]["accessPathProbe"][
+            "maxRelationScans"
+        ] = 65
+        missing_companion = generic_planning_capabilities()
+        missing_companion.pop("queryPlanning")
+        for label, capability_response, expected_code, expected_exit in (
+            ("missing", missing, "capability.missing", EXIT_CONFLICT),
+            (
+                "missing companion guard",
+                missing_companion,
+                "capability.missing",
+                EXIT_CONFLICT,
+            ),
+            (
+                "drifted",
+                drifted,
+                "derived_layer.invalid_response",
+                EXIT_CONNECTIVITY,
+            ),
+        ):
+            with self.subTest(label=label):
+                routes = standard_routes()
+                routes[("GET", "/api/derived-layers/capabilities")] = (
+                    200,
+                    capability_response,
+                )
+                routes[("POST", "/api/derived-layers/plan")] = (
+                    500,
+                    {"error": "Plan POST must not be reached."},
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    input_file = Path(directory) / "derived-plan.json"
+                    input_file.write_text(
+                        json.dumps(generic_derived_plan_request()),
+                        encoding="utf-8",
+                    )
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        [
+                            "derived-layers",
+                            "plan",
+                            "--input",
+                            str(input_file),
+                        ],
+                        store,
+                    )
+                    plan_posts = [
+                        request
+                        for request in server.requests
+                        if (
+                            request["method"] == "POST"
+                            and request["path"] == "/api/derived-layers/plan"
+                        )
+                    ]
+
+                self.assertEqual(expected_exit, code)
+                self.assertEqual("", stdout)
+                self.assertEqual(expected_code, json.loads(stderr)["code"])
+                self.assertEqual([], plan_posts)
+
+    def test_generic_derived_planner_enriches_safe_pair_work_rejection(self):
+        error = {
+            "error": "The query plan exceeds the pair-work limit.",
+            "code": "derived_layer.query_too_expensive",
+            "blocked": True,
+            "failurePhase": "preflight",
+            "stateUnchanged": True,
+            "safeState": "No derived layer was created.",
+            "reasons": [{
+                "code": "nested_loop_pair_work",
+                "message": "Estimated pair work is too high.",
+                "suggestedAction": "Narrow the candidate match.",
+            }],
+            "queryPlanningProbe": query_planning_probe(
+                estimated_pair_rows=200_000_000,
+            ),
+        }
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            generic_planning_capabilities(),
+        )
+        routes[("POST", "/api/derived-layers/plan")] = (409, error)
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "derived-plan.json"
+            input_file.write_text(
+                json.dumps(generic_derived_plan_request()),
+                encoding="utf-8",
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "plan", "--input", str(input_file)],
+                store,
+            )
+
+        self.assertEqual(EXIT_CONFLICT, code)
+        self.assertEqual("", stdout)
+        failure = json.loads(stderr)
+        self.assertEqual("derived_layer.query_too_expensive", failure["code"])
+        self.assertEqual(
+            "nested-loop-pair-work",
+            failure["details"]["clientGuidance"]["topic"],
+        )
+        for key, value in error.items():
+            self.assertEqual(value, failure["details"][key])
+
+    def test_generic_derived_planner_rejects_open_input_before_request(self):
+        request_payload = {
+            **generic_derived_plan_request(),
+            "confirmed": True,
+        }
+        routes = standard_routes()
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "derived-plan.json"
+            input_file.write_text(json.dumps(request_payload), encoding="utf-8")
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "plan", "--input", str(input_file)],
+                store,
+            )
+            plan_requests = [
+                request
+                for request in server.requests
+                if request["path"] == "/api/derived-layers/plan"
+            ]
+
+        self.assertEqual(EXIT_USAGE, code)
+        self.assertEqual("", stdout)
+        failure = json.loads(stderr)
+        self.assertEqual("derived_layer.invalid_plan_input", failure["code"])
+        self.assertEqual(["confirmed"], failure["details"]["unknown"])
+        self.assertEqual([], plan_requests)
+
+    def test_generic_derived_planner_rejects_unbounded_or_drifting_response(self):
+        cases = {}
+        open_plan = generic_derived_plan_response()
+        open_plan["derivedLayerPlan"]["unexpected"] = True
+        cases["open plan"] = open_plan
+        too_many_warnings = generic_derived_plan_response()
+        warning = {
+            "code": "missing-index-path",
+            "message": "The scan has no visible index condition.",
+            "suggestedAction": "Bound the source before joining it.",
+        }
+        too_many_warnings["derivedLayerPlan"]["accessPathProbe"]["warnings"] = [
+            warning for _ in range(65)
+        ]
+        too_many_warnings["derivedLayerPlan"]["accessPathProbe"][
+            "warningsTruncated"
+        ] = True
+        cases["warning overflow"] = too_many_warnings
+        unknown_warning = generic_derived_plan_response()
+        unknown_warning["derivedLayerPlan"]["accessPathProbe"]["warnings"] = [{
+            "code": "future_unadvertised_warning",
+            "message": "This warning is not in the version-one capability.",
+            "suggestedAction": "Upgrade the client contract first.",
+        }]
+        cases["unknown warning"] = unknown_warning
+        changed_request = generic_derived_plan_response()
+        changed_request["derivedLayerPlan"]["createRequest"]["name"] = "other"
+        cases["request drift"] = changed_request
+        query_limit_drift = generic_derived_plan_response()
+        query_limit_drift["derivedLayerPlan"]["queryPlanProbe"]["limits"][
+            "maxTotalCost"
+        ] -= 1
+        cases["query limit capability drift"] = query_limit_drift
+        h3_safety_drift = generic_derived_plan_response()
+        h3_safety_drift["derivedLayerPlan"]["queryPlanProbe"]["h3Expansion"][
+            "safetyMultiplier"
+        ] = 1.6
+        cases["H3 safety capability drift"] = h3_safety_drift
+        planning_limit_drift = generic_derived_plan_response()
+        planning_limit_drift["derivedLayerPlan"]["queryPlanningProbe"][
+            "maxAllowedNestedLoopPairRows"
+        ] -= 1
+        cases["pair limit capability drift"] = planning_limit_drift
+        materialization_guard_drift = generic_derived_plan_response()
+        materialization = materialization_guard_drift["derivedLayerPlan"][
+            "materializationProbe"
+        ]
+        materialization["rowOverheadBytes"] = 31
+        materialization["estimatedBytes"] = 11_880_000
+        cases["materialization guard drift"] = materialization_guard_drift
+        mismatched_source = generic_derived_plan_response()
+        source_probe = mismatched_source["derivedLayerPlan"]["accessPathProbe"]
+        source_probe["sources"][0]["relation"] = "census.other_areas"
+        source_probe["relationScans"][0]["relation"] = "census.other_areas"
+        source_probe["warnings"][0]["relation"] = "census.other_areas"
+        cases["request source drift"] = mismatched_source
+        duplicate_source = generic_derived_plan_response()
+        duplicate_probe = duplicate_source["derivedLayerPlan"][
+            "accessPathProbe"
+        ]
+        duplicate_probe["sources"].append(dict(duplicate_probe["sources"][0]))
+        cases["duplicate source evidence"] = duplicate_source
+        undeclared_scan = generic_derived_plan_response()
+        undeclared_scan["derivedLayerPlan"]["accessPathProbe"][
+            "relationScans"
+        ][0]["relation"] = "census.other_areas"
+        cases["undeclared scanned relation"] = undeclared_scan
+        statistics_drift = generic_derived_plan_response()
+        statistics_drift["derivedLayerPlan"]["accessPathProbe"][
+            "relationScans"
+        ][0]["statisticsKnown"] = False
+        cases["scan statistics drift"] = statistics_drift
+        group_drift = generic_derived_plan_response()
+        group_drift["derivedLayerPlan"]["accessPathProbe"][
+            "relationScans"
+        ][0]["executionGroup"] = "foreign-2"
+        cases["scan execution group drift"] = group_drift
+        impossible_foreign_index = generic_derived_plan_response()
+        impossible_foreign_index["derivedLayerPlan"]["accessPathProbe"][
+            "relationScans"
+        ][0]["indexBacked"] = True
+        cases["foreign index attribution"] = impossible_foreign_index
+        foreign_local_inventory = generic_derived_plan_response()
+        foreign_local_inventory["derivedLayerPlan"]["accessPathProbe"][
+            "sources"
+        ][0]["indexMetadata"]["source"] = "coordinator-catalog"
+        cases["foreign coordinator inventory"] = foreign_local_inventory
+        local_remote_inventory = generic_derived_plan_response()
+        local_source = local_remote_inventory["derivedLayerPlan"][
+            "accessPathProbe"
+        ]["sources"][0]
+        local_source["relationKind"] = "table"
+        local_source["plannerEstimateSource"] = "local-statistics"
+        local_source["executionGroup"] = "local"
+        cases["local remote inventory"] = local_remote_inventory
+        missing_local_estimate = local_tid_derived_plan_response()
+        missing_local_estimate["derivedLayerPlan"]["accessPathProbe"][
+            "sources"
+        ][0].pop("catalogEstimatedRows")
+        cases["missing local catalog estimate"] = missing_local_estimate
+        contradictory_local_estimate = local_tid_derived_plan_response()
+        contradictory_local_estimate["derivedLayerPlan"]["accessPathProbe"][
+            "sources"
+        ][0]["indexMetadata"]["relationEstimatedRows"] += 1
+        cases["contradictory local estimates"] = contradictory_local_estimate
+        unknown_warning_relation = generic_derived_plan_response()
+        unknown_warning_relation["derivedLayerPlan"]["accessPathProbe"][
+            "warnings"
+        ][0]["relation"] = "census.other_areas"
+        cases["undeclared warning relation"] = unknown_warning_relation
+        missing_warning_relation = generic_derived_plan_response()
+        missing_warning_relation["derivedLayerPlan"]["accessPathProbe"][
+            "warnings"
+        ][0].pop("relation")
+        cases["relation warning without relation"] = missing_warning_relation
+        global_warning_relation = generic_derived_plan_response()
+        global_warning_relation["derivedLayerPlan"]["accessPathProbe"][
+            "warnings"
+        ][0]["code"] = "transformed_predicate_not_index_backed"
+        cases["global warning with relation"] = global_warning_relation
+        summary_drift = generic_derived_plan_response()
+        summary_drift["derivedLayerPlan"]["accessPathProbe"]["summary"][
+            "foreignScanCount"
+        ] = 0
+        cases["scan summary drift"] = summary_drift
+        short_truncated_scans = generic_derived_plan_response()
+        short_truncated_scans["derivedLayerPlan"]["accessPathProbe"][
+            "relationScansTruncated"
+        ] = True
+        cases["short truncated scans"] = short_truncated_scans
+        short_truncated_warnings = generic_derived_plan_response()
+        short_truncated_warnings["derivedLayerPlan"]["accessPathProbe"][
+            "warningsTruncated"
+        ] = True
+        cases["short truncated warnings"] = short_truncated_warnings
+        short_truncated_indexes = generic_derived_plan_response()
+        short_truncated_indexes["derivedLayerPlan"]["accessPathProbe"][
+            "sources"
+        ][0]["indexMetadata"]["truncated"] = True
+        cases["short truncated index inventory"] = short_truncated_indexes
+        excessive_scan_estimate = generic_derived_plan_response()
+        excessive_scan_estimate["derivedLayerPlan"]["accessPathProbe"][
+            "relationScans"
+        ][0]["estimatedRows"] = 250_001
+        cases["scan exceeds query evidence"] = excessive_scan_estimate
+        excessive_nested_loops = generic_derived_plan_response()
+        excessive_nested_loops["derivedLayerPlan"]["queryPlanningProbe"][
+            "nestedLoopCount"
+        ] = 13
+        cases["nested loops exceed plan nodes"] = excessive_nested_loops
+        materialization_row_drift = generic_derived_plan_response()
+        row_drift_probe = materialization_row_drift["derivedLayerPlan"][
+            "materializationProbe"
+        ]
+        row_drift_probe["estimatedRows"] -= 1
+        row_drift_probe["estimatedBytes"] = 11_999_880
+        cases["materialization row drift"] = materialization_row_drift
+
+        for name, response_payload in cases.items():
+            with self.subTest(name=name):
+                routes = standard_routes()
+                routes[("GET", "/api/derived-layers/capabilities")] = (
+                    200,
+                    generic_planning_capabilities(),
+                )
+                routes[("POST", "/api/derived-layers/plan")] = (
+                    200,
+                    response_payload,
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    input_file = Path(directory) / "derived-plan.json"
+                    input_file.write_text(
+                        json.dumps(generic_derived_plan_request()),
+                        encoding="utf-8",
+                    )
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        [
+                            "derived-layers",
+                            "plan",
+                            "--input",
+                            str(input_file),
+                        ],
+                        store,
+                    )
+
+                self.assertEqual(EXIT_CONNECTIVITY, code)
+                self.assertEqual("", stdout)
+                self.assertEqual(
+                    "derived_layer.invalid_response",
+                    json.loads(stderr)["code"],
+                )
+
+    def test_generic_derived_planner_accepts_tid_tuple_condition(self):
+        response_payload = local_tid_derived_plan_response()
+        access_probe = response_payload["derivedLayerPlan"]["accessPathProbe"]
+        source = access_probe["sources"][0]
+        index = source["indexMetadata"]["indexes"][0]
+        index["method"] = " quoted method "
+        index["keys"][0]["name"] = " quoted geometry "
+        index["operatorClasses"][0]["name"] = " quoted opclass "
+
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            generic_planning_capabilities(),
+        )
+        routes[("POST", "/api/derived-layers/plan")] = (200, response_payload)
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "derived-plan.json"
+            input_file.write_text(
+                json.dumps(generic_derived_plan_request()),
+                encoding="utf-8",
+            )
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "plan", "--input", str(input_file)],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            "tuple-condition",
+            json.loads(stdout)["derivedLayerPlan"]["accessPathProbe"][
+                "relationScans"
+            ][0]["predicatePushdown"],
+        )
+
     def test_area_weighted_h3_planner_accepts_global_input_position(self):
         request_payload = area_weighted_h3_request()
         routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            area_weighted_h3_capabilities(),
+        )
         routes[(
             "POST", "/api/derived-layers/recipes/area-weighted-h3/plan"
         )] = (200, area_weighted_h3_response())
@@ -920,6 +1576,43 @@ class CliTests(unittest.TestCase):
         self.assertEqual(request_payload, server.requests[-1]["body"])
         self.assertFalse(json.loads(stdout)["mutationApplied"])
 
+    def test_area_weighted_h3_planner_accepts_projected_source_transform(self):
+        request_payload = area_weighted_h3_request()
+        response_payload = area_weighted_h3_response()
+        source = response_payload["recipePlan"]["source"]
+        source["geometryColumn"].update({
+            "type": "geometry(MultiPolygon,3857)",
+            "srid": 3857,
+        })
+        source["metricGeometry"]["mode"] = "transform-and-cast"
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            area_weighted_h3_capabilities(),
+        )
+        routes[(
+            "POST", "/api/derived-layers/recipes/area-weighted-h3/plan"
+        )] = (200, response_payload)
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "recipe.json"
+            input_file.write_text(json.dumps(request_payload), encoding="utf-8")
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers", "plan-area-weighted-h3",
+                    "--input", str(input_file),
+                ],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            "transform-and-cast",
+            json.loads(stdout)["recipePlan"]["source"]["metricGeometry"][
+                "mode"
+            ],
+        )
+
     def test_area_weighted_h3_planner_requires_input_before_connecting(self):
         routes = standard_routes()
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
@@ -933,6 +1626,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual("", stdout)
         self.assertEqual("input.required", json.loads(stderr)["code"])
         self.assertEqual([], server.requests)
+
+    def test_generic_derived_planner_requires_input_before_connecting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "plan"],
+                ConfigStore(Path(directory) / "config"),
+            )
+
+        self.assertEqual(EXIT_USAGE, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("input.required", json.loads(stderr)["code"])
 
     def test_derived_create_accepts_reviewed_planner_request_input(self):
         create_request = area_weighted_h3_response()["recipePlan"]["createRequest"]
@@ -976,6 +1680,135 @@ class CliTests(unittest.TestCase):
             json.loads(stdout)["derivedLayer"]["name"],
         )
 
+    def test_derived_create_preserves_generic_plan_binding(self):
+        plan = generic_derived_plan_response()["derivedLayerPlan"]
+        create_request = plan["createRequest"]
+        captured = {}
+
+        def create(request):
+            captured["body"] = request["body"]
+            return 201, {
+                "derivedLayer": {
+                    "name": create_request["name"],
+                    "kind": create_request["kind"],
+                    "spatialScope": map_extent_scope("city-centre"),
+                    "queryPlanProbe": query_plan_probe(),
+                    "queryPlanningProbe": query_planning_probe(),
+                    "sources": create_request["sources"],
+                    "accessPathProbe": access_path_probe(),
+                    "materializationProbe": materialization_probe(),
+                },
+            }
+
+        routes = standard_routes()
+        routes[("POST", "/api/derived-layers")] = create
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "generic-create-request.json"
+            input_file.write_text(json.dumps(create_request), encoding="utf-8")
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers",
+                    "create",
+                    "--input",
+                    str(input_file),
+                    "--confirm",
+                ],
+                store,
+            )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(create_request, captured["body"])
+        self.assertEqual(
+            plan["planFingerprint"],
+            captured["body"]["planFingerprint"],
+        )
+        self.assertEqual(
+            access_path_probe(),
+            json.loads(stdout)["derivedLayer"]["accessPathProbe"],
+        )
+
+    def test_derived_layer_responses_bind_access_paths_to_returned_sources(self):
+        request_payload = generic_derived_plan_request(kind="view")
+        response_payload = {
+            "derivedLayer": {
+                "name": request_payload["name"],
+                "kind": "view",
+                "sources": ["census.other_areas"],
+                "spatialScope": map_extent_scope("city-centre"),
+                "accessPathProbe": access_path_probe(),
+            },
+        }
+        cases = (
+            (
+                "show",
+                ["derived-layers", "show", request_payload["name"]],
+                (
+                    "GET",
+                    f"/api/derived-layers/{request_payload['name']}",
+                ),
+            ),
+            (
+                "create",
+                ["derived-layers", "create", "--confirm"],
+                ("POST", "/api/derived-layers"),
+            ),
+            (
+                "replace",
+                [
+                    "derived-layers", "replace", request_payload["name"],
+                    "--confirm",
+                ],
+                (
+                    "POST",
+                    f"/api/derived-layers/{request_payload['name']}/replace",
+                ),
+            ),
+        )
+        for label, arguments, route in cases:
+            with self.subTest(label=label):
+                routes = standard_routes()
+                routes[route] = (200, response_payload)
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    input_file = Path(directory) / "request.json"
+                    input_file.write_text(
+                        json.dumps(request_payload),
+                        encoding="utf-8",
+                    )
+                    store = self.configured_store(directory, server.endpoint)
+                    command = list(arguments)
+                    if label == "create":
+                        command = ["--input", str(input_file), *command]
+                    elif label == "replace":
+                        query_file = Path(directory) / "query.sql"
+                        query_file.write_text(
+                            request_payload["query"],
+                            encoding="utf-8",
+                        )
+                        command.extend([
+                            "--kind", "view",
+                            "--query-file", str(query_file),
+                            "--source", request_payload["sources"][0],
+                            "--id-column", request_payload["idColumn"],
+                            "--geometry-column",
+                            request_payload["geometryColumn"],
+                        ])
+                    code, stdout, stderr = self.invoke(command, store)
+
+                self.assertEqual(EXIT_CONNECTIVITY, code)
+                self.assertEqual("", stdout)
+                self.assertEqual(
+                    (
+                        "derived_layer.invalid_response"
+                        if label == "show"
+                        else "derived_layer.mutation_indeterminate"
+                    ),
+                    final_json_document(stderr)["code"],
+                )
+
     def test_derived_create_rejects_locale_conflicting_with_reviewed_input(self):
         create_request = area_weighted_h3_response()["recipePlan"]["createRequest"]
         routes = standard_routes()
@@ -1013,6 +1846,30 @@ class CliTests(unittest.TestCase):
                 ),
             ),
             (
+                "legacy recipe version",
+                lambda value: value["recipePlan"]["recipe"].__setitem__(
+                    "version", 1
+                ),
+            ),
+            (
+                "geodetic SRID drift",
+                lambda value: value["recipePlan"]["recipe"].__setitem__(
+                    "geodeticSrid", 3857
+                ),
+            ),
+            (
+                "area model drift",
+                lambda value: value["recipePlan"]["recipe"].__setitem__(
+                    "areaModel", "planar"
+                ),
+            ),
+            (
+                "recipe spheroid disabled",
+                lambda value: value["recipePlan"]["recipe"].__setitem__(
+                    "useSpheroid", False
+                ),
+            ),
+            (
                 "unsafe candidate containment",
                 lambda value: value["recipePlan"]["recipe"].__setitem__(
                     "candidateContainment", "center"
@@ -1027,8 +1884,23 @@ class CliTests(unittest.TestCase):
                 lambda value: value["recipePlan"].pop("queryPlanningProbe"),
             ),
             (
+                "unknown access-path warning",
+                lambda value: value["recipePlan"]["accessPathProbe"][
+                    "warnings"
+                ][0].__setitem__("code", "future_unadvertised_warning"),
+            ),
+            (
                 "missing materialization probe",
                 lambda value: value["recipePlan"].pop("materializationProbe"),
+            ),
+            (
+                "materialization row drift",
+                lambda value: value["recipePlan"][
+                    "materializationProbe"
+                ].update({
+                    "estimatedRows": 99_999,
+                    "estimatedBytes": 11_999_880,
+                }),
             ),
             (
                 "non-replayable create scope",
@@ -1067,7 +1939,25 @@ class CliTests(unittest.TestCase):
                 "metric geometry mode mismatch",
                 lambda value: value["recipePlan"]["source"][
                     "metricGeometry"
-                ].update({"mode": "native"}),
+                ].update({"mode": "transform-and-cast"}),
+            ),
+            (
+                "metric geometry type mismatch",
+                lambda value: value["recipePlan"]["source"][
+                    "metricGeometry"
+                ].update({"type": "geometry"}),
+            ),
+            (
+                "metric geography SRID mismatch",
+                lambda value: value["recipePlan"]["source"][
+                    "metricGeometry"
+                ].update({"srid": 3857}),
+            ),
+            (
+                "spheroid disabled",
+                lambda value: value["recipePlan"]["source"][
+                    "metricGeometry"
+                ].update({"useSpheroid": False}),
             ),
             (
                 "non-numeric measure source",
@@ -1094,6 +1984,10 @@ class CliTests(unittest.TestCase):
             return 200, current_response["value"]
 
         routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            area_weighted_h3_capabilities(),
+        )
         routes[(
             "POST", "/api/derived-layers/recipes/area-weighted-h3/plan"
         )] = plan
@@ -1121,6 +2015,39 @@ class CliTests(unittest.TestCase):
                         json.loads(stderr)["code"],
                     )
 
+    def test_area_weighted_h3_planner_rejects_legacy_capability_before_plan(self):
+        request_payload = area_weighted_h3_request()
+        capabilities = area_weighted_h3_capabilities()
+        capabilities["recipes"]["areaWeightedH3"].update({
+            "version": 1,
+        })
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            capabilities,
+        )
+        routes[(
+            "POST", "/api/derived-layers/recipes/area-weighted-h3/plan"
+        )] = (200, area_weighted_h3_response())
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            input_file = Path(directory) / "recipe.json"
+            input_file.write_text(json.dumps(request_payload), encoding="utf-8")
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                [
+                    "derived-layers", "plan-area-weighted-h3",
+                    "--input", str(input_file),
+                ],
+                store,
+            )
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("derived_layer.invalid_response", json.loads(stderr)["code"])
+        self.assertFalse(any(
+            request["method"] == "POST" for request in server.requests
+        ))
+
     def test_area_weighted_h3_planner_requires_object_input(self):
         called = []
 
@@ -1129,6 +2056,10 @@ class CliTests(unittest.TestCase):
             return 200, area_weighted_h3_response()
 
         routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            area_weighted_h3_capabilities(),
+        )
         routes[(
             "POST", "/api/derived-layers/recipes/area-weighted-h3/plan"
         )] = plan
@@ -1396,25 +2327,125 @@ class CliTests(unittest.TestCase):
             json.loads(stdout)["queryGuard"],
         )
 
-    def test_derived_layer_jobs_preserve_validated_active_summaries(self):
-        response = background_jobs_response()
-        response["meta"] = {"requestId": "request-jobs"}
+    def test_derived_layer_capabilities_validate_definition_planning(self):
+        capability = definition_planning_capability()
         routes = standard_routes()
-        routes[("GET", "/api/derived-layers/background-jobs")] = (
+        routes[("GET", "/api/derived-layers/capabilities")] = (
             200,
-            response,
+            {
+                "configured": True,
+                "schema": "derived_layers",
+                "kinds": ["view", "materialized"],
+                "definitionPlanning": capability,
+            },
         )
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
             store = self.configured_store(directory, server.endpoint)
             code, stdout, stderr = self.invoke(
-                ["derived-layers", "jobs"],
+                ["derived-layers", "capabilities"],
                 store,
             )
 
         self.assertEqual(0, code, stderr)
-        payload = json.loads(stdout)
-        self.assertEqual(response["backgroundJobs"], payload["backgroundJobs"])
-        self.assertEqual("request-jobs", payload["meta"]["requestId"])
+        self.assertEqual(
+            capability,
+            json.loads(stdout)["definitionPlanning"],
+        )
+
+    def test_derived_layer_capabilities_reject_definition_planning_drift(self):
+        capability = definition_planning_capability()
+        capability["accessPathProbe"]["indexMetadata"][
+            "coordinatorCatalogTimeBudgetSeconds"
+        ] = 6
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            {
+                "configured": True,
+                "schema": "derived_layers",
+                "kinds": ["view", "materialized"],
+                "definitionPlanning": capability,
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "capabilities"],
+                store,
+            )
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(
+            "derived_layer.invalid_response",
+            json.loads(stderr)["code"],
+        )
+
+    def test_derived_capabilities_validate_embedded_background_jobs(self):
+        malformed = background_jobs_response()
+        malformed["backgroundJobs"]["maxActiveJobs"] = 5
+        routes = standard_routes()
+        routes[("GET", "/api/derived-layers/capabilities")] = (
+            200,
+            {
+                "configured": True,
+                "schema": "derived_layers",
+                "kinds": ["view", "materialized"],
+                **malformed,
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:
+            store = self.configured_store(directory, server.endpoint)
+            code, stdout, stderr = self.invoke(
+                ["derived-layers", "capabilities"],
+                store,
+            )
+
+        self.assertEqual(EXIT_CONNECTIVITY, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(
+            "derived_layer.invalid_response",
+            json.loads(stderr)["code"],
+        )
+
+    def test_derived_layer_jobs_preserve_validated_active_summaries(self):
+        for action, stage in (
+            ("create", "source-revalidation"),
+            ("replace", "source-revalidation"),
+            ("create", "plan-revalidation"),
+        ):
+            with self.subTest(action=action, stage=stage):
+                response = background_jobs_response()
+                operation = response["backgroundJobs"]["activeOperations"][0]
+                operation["kind"] = f"derived-layer.{action}"
+                operation["target"]["action"] = action
+                operation["stage"] = stage
+                response["meta"] = {"requestId": "request-jobs"}
+                routes = standard_routes()
+                routes[("GET", "/api/derived-layers/background-jobs")] = (
+                    200,
+                    response,
+                )
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    JsonServer(routes) as server,
+                ):
+                    store = self.configured_store(directory, server.endpoint)
+                    code, stdout, stderr = self.invoke(
+                        ["derived-layers", "jobs"],
+                        store,
+                    )
+
+                self.assertEqual(0, code, stderr)
+                payload = json.loads(stdout)
+                self.assertEqual(
+                    response["backgroundJobs"],
+                    payload["backgroundJobs"],
+                )
+                self.assertEqual(
+                    "request-jobs",
+                    payload["meta"]["requestId"],
+                )
 
     def test_derived_layer_jobs_allow_a_transient_missing_summary(self):
         response = background_jobs_response()
@@ -1450,6 +2481,10 @@ class CliTests(unittest.TestCase):
         unknown_job_field["backgroundJobs"]["futureCapacity"] = 1
         cases["closed-job-envelope"] = unknown_job_field
 
+        unknown_response_field = background_jobs_response()
+        unknown_response_field["debug"] = True
+        cases["closed-response-envelope"] = unknown_response_field
+
         leaked_summary_field = background_jobs_response()
         leaked_summary_field["backgroundJobs"]["activeOperations"][0][
             "actor"
@@ -1479,6 +2514,25 @@ class CliTests(unittest.TestCase):
             "updated"
         ] = " "
         cases["blank-timestamp"] = blank_timestamp
+
+        excessive_capacity = background_jobs_response()
+        excessive_capacity["backgroundJobs"]["maxActiveJobs"] = 5
+        cases["unsupported-capacity"] = excessive_capacity
+
+        refresh_preflight = background_jobs_response()
+        refresh_preflight["backgroundJobs"]["activeOperations"][0][
+            "stage"
+        ] = "source-revalidation"
+        cases["refresh-source-revalidation"] = refresh_preflight
+
+        replace_plan = background_jobs_response()
+        replace_operation = replace_plan["backgroundJobs"][
+            "activeOperations"
+        ][0]
+        replace_operation["kind"] = "derived-layer.replace"
+        replace_operation["target"]["action"] = "replace"
+        replace_operation["stage"] = "plan-revalidation"
+        cases["replace-plan-revalidation"] = replace_plan
 
         routes = standard_routes()
         with tempfile.TemporaryDirectory() as directory, JsonServer(routes) as server:

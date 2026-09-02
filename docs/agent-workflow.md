@@ -614,17 +614,72 @@ result to XYZ is a second operation: inspect it in the catalog, create a
 revision-bound workspace proposal, present that diff, and wait for its own
 approval before applying.
 
+For every hand-authored derived query, save the complete draft create
+definition and run the read-only generic planner before requesting approval:
+
+```sh
+config-cli derived-layers plan --input tmp/draft-create.json
+```
+
+Require `mutationApplied: false`. Review the returned
+`derivedLayerPlan.createRequest`, `resolvedSpatialScope`, query and pair probes,
+the materialization probe when applicable, and the bounded `accessPathProbe`.
+The access-path evidence reports source estimate provenance, execution groups,
+relation scans, predicate pushdown, available index expressions, correlated
+subplans, and bounded warnings. Treat unknown or truncated evidence as
+uncertainty, not as proof that a source is small or indexed. A passing plan
+does not authorize a database change. A `remote-with-local-filter` scan still
+has coordinator-side work, and `scan_evidence_unavailable` means no declared
+scan could be attributed safely—not that the source is cheap.
+`tuple-condition` is a real PostgreSQL TID/TID-range bound, but does not prove
+that a reusable SQL or spatial index predicate exists.
+`indexMetadata.reason: "expanded-relation"` means a view or nested foreign
+relation was expanded, so its wrapper has no trustworthy physical-index
+inventory. After approval, submit the exact returned
+`derivedLayerPlan.createRequest` through `derived-layers create --input ...
+--confirm`; retain its plan binding and do not reconstruct it from the draft.
+The fingerprint binds the exact definition, resolved scope, and reviewed
+database plan/access-path evidence. Create rechecks semantic profile readiness,
+but semantic asset versions and curated meaning are not fingerprinted. After a
+semantic-catalog change, reinspect and replan rather than assuming meaning
+drift will fail closed.
+Generic planning requires the advertised `definitionPlanning`, `queryGuard`,
+`queryPlanning`, and `materializationGuard` capability sections. The CLI binds
+the returned query, pair, materialization, and access-path methods and limits
+to that same pre-POST capability snapshot; do not combine evidence from
+different capability reads or deployments.
+If the reviewed plan exposes costly or federated work that remains within
+admission limits, add `--background` to that exact create submission and let
+the CLI follow the durable operation. Detach only for an intentional handoff
+to a separate `operations wait` monitor; queued work must not be resubmitted.
+Coordinator index discovery has a 5-second aggregate budget. Remote discovery
+is sequential, permits at most eight lookups, and has a 5-second per-lookup
+and 15-second aggregate budget. `indexMetadata.reason:
+"metadata-time-budget"` means the relevant aggregate budget was exhausted;
+the source's index state remains unknown and the planner should narrow the
+query instead of repeatedly replanning it.
+
 For additive polygon measures allocated to H3 by intersection-area share, run
 `derived-layers plan-area-weighted-h3 --input RECIPE.json`. This read-only
 planner validates the ready semantic source profile, resolves the bounded map
 scope, generates overlap-mode candidates so coarse and boundary-intersecting
 cells are retained, prefilters source polygons in their native SRID, and
 completes query, pair-planning, and materialization preflight as applicable.
-Review the returned source, measures, assumptions,
+Recipe capability and plan version `2` calculate intersections as EPSG:4326
+geography with the spheroid enabled. A non-4326 source is transformed once
+after source-native candidate filtering. H3 output is normalized to
+`geometry(MultiPolygon,3857)` so antimeridian-split cells retain every part.
+The CLI rejects the older regional planar recipe rather than treating it as
+equivalent.
+When the additive bounded `accessPathProbe` is present, review it under the
+same rules as generic planning. Review the returned source, measures, assumptions,
 `createRequest`, full `resolvedSpatialScope`, and probes. After
 separate authorization, pass the exact reviewed `recipePlan.createRequest` to
 `derived-layers create --input REVIEWED.json --confirm`. Create re-resolves and
-preflights, so catalog or workspace drift remains a blocking result.
+preflights current readiness and database cost. The recipe request does not
+bind a semantic asset version or curated meaning; after semantic-catalog or
+workspace changes, reinspect and replan rather than assuming automatic drift
+rejection.
 
 The mandatory extent guard changes spatial scope only. Continue to use
 semantic catalog profiles as the authority for source and field meaning, and
@@ -642,8 +697,10 @@ materialized views. It exposes ordered AST/catalog/EXPLAIN `stages`,
 the complete hardened shape. Preserve the successful
 `derivedLayer.queryPlanProbe` in the review packet. If capabilities include the
 optional `queryPlanning` version `1` contract, also preserve the successful
-`derivedLayer.queryPlanningProbe`. Treat the server's failure
-taxonomy literally:
+`derivedLayer.queryPlanningProbe`. `definitionPlanning` advertises the generic
+non-mutating plan route and the closed access-path evidence bounds; require its
+version, method, limits, and warning vocabulary rather than guessing a route
+on an older server. Treat the server's failure taxonomy literally:
 
 - `derived_layer.query_invalid` (HTTP 400, `category: "invalid"`) means the
   input is not exactly one parseable `SELECT` statement; correct its syntax or
@@ -672,8 +729,9 @@ repair a dependency declaration.
 For `derived_layer.query_too_expensive` reason `nested_loop_pair_work`, a valid
 over-limit `queryPlanningProbe` lets the CLI add
 `details.clientGuidance` without changing the server error. Use its generic
-authoring steps: perform the selective candidate match on a native geometry or
-the exact prepared transform expression before materializing joined rows;
+authoring steps: perform the selective candidate match on a native indexed
+geometry or an exact expression that current access-path evidence proves is
+indexed before materializing joined rows;
 aggregate pair-local metrics after that match; compute compatible complete-input
 global totals together in a single one-row aggregate referenced after the selective
 aggregation while preserving row-dependent window semantics; compute
@@ -711,13 +769,23 @@ follow that with an exact `ST_Intersects` or other reviewed predicate against
 the complete original source geometry so the derived table semantics are clear.
 Do not substitute a subset when a layer-wide aggregate must use complete input.
 
-For UK metric area weighting, the bundled platform prepares the exact
-`ST_Transform(source.geom, 27700)` GiST expression. Put that expression in the
-selective `&&`/`ST_Intersects` candidate predicate before materializing matched
-pairs; a materialized CTE containing all transformed source rows hides the
-expression index. Transform each generated cell once, compute intersection and
-source areas once for accepted pairs, then aggregate pair-local metrics. Keep
-complete-input benchmarks in a separate one-row aggregate attached afterward.
+Do not infer a functional spatial index from an SRID or deployment name. Read
+the generic plan's exact index and scan evidence. Bound each large source
+inside its own execution group before joining across local or foreign sources,
+and leave an indexed geometry operand bare in the source-local candidate
+predicate. Use indexed native geometry or EPSG:3857 for coarse bounding and
+candidate selection when the plan proves that access path. For globally scoped
+distance and area work, prefer EPSG:4326 geography or explicit geodesic
+calculations when their semantics and access path fit the request. EPSG:4326
+geometry itself uses angular units, while EPSG:3857 distances and areas are
+distorted. A profiled local projected CRS is appropriate only when its area of
+use, units, distortion, and index evidence are suitable; transform only the
+narrowed rows and do not hardcode a regional CRS. Return final geometry in
+EPSG:3857 for XYZ. WGS84 geography supports worldwide and dateline-crossing
+metric work, but EPSG:3857 output is limited to the Web-Mercator latitude
+domain and cannot represent the polar caps. Compute each transform,
+intersection, and area once after the selective match, then aggregate
+pair-local metrics. Keep complete-input benchmarks separate.
 
 Do not attach that one-row aggregate with `CROSS JOIN` or `JOIN ... ON TRUE`:
 the derived-layer guard rejects those as Cartesian joins, even when the right
@@ -800,11 +868,12 @@ When using lower-level H3 functions, PostgreSQL points are ordered
 `(longitude, latitude)`. For lines, grid traversal between segment endpoint
 cells plus a bounded neighbour expansion is a candidate-generation technique,
 not final acceptance; retain only cells that pass exact intersection against
-the source segment. Publish a geometry with an explicit typmod such as
-`geometry(Polygon,3857)`, because `ST_Transform(...,3857)` alone may not satisfy
-the derived-output contract. Reinspect feature count, extent, and preview zoom
-after changing resolution; a coarser resolution is a different dataset, not a
-cosmetic configuration change.
+the source segment. Normalize cell boundaries to multipolygons and publish
+`geometry(MultiPolygon,3857)` so antimeridian-split cells retain every part and
+the relation has an explicit type and SRID. `ST_Transform(...,3857)` alone may
+not satisfy the derived-output contract. Reinspect feature count, extent, and
+preview zoom after changing resolution; a coarser resolution is a different
+dataset, not a cosmetic configuration change.
 
 A background operation may finish the database transaction and then fail while
 serializing or recording its result. Treat any late reporting failure as an

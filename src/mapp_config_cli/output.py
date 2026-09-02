@@ -135,6 +135,55 @@ def _semantic_generation(data: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _derived_layer_plan(data: dict[str, Any]) -> str:
+    plan = data.get("derivedLayerPlan")
+    if not isinstance(plan, dict):
+        return _human_json(data)
+    request = plan.get("createRequest")
+    access = plan.get("accessPathProbe")
+    lines = [
+        "Derived-layer plan",
+        f"mutationApplied: {_value(data.get('mutationApplied'))}",
+        f"version: {_value(plan.get('version'))}",
+        f"planFingerprint: {_value(plan.get('planFingerprint'))}",
+    ]
+    if isinstance(request, dict):
+        for field in ("name", "kind", "sources"):
+            if field in request:
+                lines.append(f"{field}: {_value(request[field])}")
+    if isinstance(access, dict):
+        summary = access.get("summary")
+        lines.append("Access paths:")
+        if isinstance(summary, dict):
+            for field in (
+                "relationScanCount",
+                "indexBackedScanCount",
+                "sequentialScanCount",
+                "foreignScanCount",
+                "subPlanCount",
+                "executionGroupCount",
+                "transformedPredicate",
+            ):
+                if field in summary:
+                    lines.append(f"  {field}: {_value(summary[field])}")
+        warnings = access.get("warnings")
+        if isinstance(warnings, list):
+            lines.append(f"  warnings: {len(warnings)}")
+            lines.extend(f"    - {_value(warning)}" for warning in warnings)
+        lines.append(f"  sources: {_value(access.get('sources'))}")
+        lines.append(f"  relationScans: {_value(access.get('relationScans'))}")
+    for field in (
+        "resolvedSpatialScope",
+        "queryPlanProbe",
+        "queryPlanningProbe",
+        "materializationProbe",
+        "createRequest",
+    ):
+        if field in plan:
+            lines.append(f"{field}: {_value(plan[field])}")
+    return "\n".join(lines) + "\n"
+
+
 def _json(data: Any) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
 
@@ -159,4 +208,6 @@ def render(data: Any, *, command: str, output: str = "json") -> str:
         return _proposal(data, command.split()[1])
     if command.startswith("semantic generate "):
         return _semantic_generation(data)
+    if command == "derived-layers plan":
+        return _derived_layer_plan(data)
     return _human_json(data)

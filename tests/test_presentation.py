@@ -160,6 +160,55 @@ class HumanOutputTests(unittest.TestCase):
         self.assertIn('"path":"/x"', output)
         self.assertIn("warnings: 1", output)
 
+    def test_derived_plan_human_output_surfaces_access_paths_and_replay(self):
+        data = {
+            "mutationApplied": False,
+            "derivedLayerPlan": {
+                "version": "1",
+                "planFingerprint": "sha256:" + "a" * 64,
+                "createRequest": {
+                    "name": "bounded_population",
+                    "kind": "materialized",
+                    "sources": ["census.output_areas"],
+                },
+                "resolvedSpatialScope": {"type": "workspace-map-extent"},
+                "queryPlanProbe": {"method": "postgresql-explain"},
+                "queryPlanningProbe": {"version": "1"},
+                "accessPathProbe": {
+                    "summary": {
+                        "relationScanCount": 1,
+                        "indexBackedScanCount": 0,
+                        "sequentialScanCount": 0,
+                        "foreignScanCount": 1,
+                        "subPlanCount": 0,
+                        "executionGroupCount": 1,
+                        "transformedPredicate": True,
+                    },
+                    "warnings": [{
+                        "code": "transformed_predicate_not_index_backed",
+                        "message": "A transformed predicate is not index-backed.",
+                        "suggestedAction": "Filter the source in its indexed CRS.",
+                    }],
+                    "sources": [{"relation": "census.output_areas"}],
+                    "relationScans": [{
+                        "scanType": "Foreign Scan",
+                        "predicatePushdown": "remote-with-local-filter",
+                    }],
+                },
+            },
+        }
+
+        output = render(
+            data,
+            command="derived-layers plan",
+            output="human",
+        )
+
+        self.assertIn("Derived-layer plan", output)
+        self.assertIn("mutationApplied: no", output)
+        self.assertIn("transformed_predicate_not_index_backed", output)
+        self.assertIn("createRequest:", output)
+
     def test_human_output_escapes_all_terminal_control_families(self):
         hostile = "safe\n\x1b]8;;https://evil.invalid\x07link\x1b\\\u009b31mred"
         data = {

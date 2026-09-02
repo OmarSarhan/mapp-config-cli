@@ -129,6 +129,7 @@ def standard_routes(
                     "derived-layers list",
                     "derived-layers show",
                     "derived-layers map-extent",
+                    "derived-layers plan",
                     "derived-layers plan-area-weighted-h3",
                     "derived-layers create",
                     "derived-layers refresh",
